@@ -8,6 +8,9 @@ import sys
 
 from . import __version__
 from .format import ColumnarFormatError, inspect_file
+from .query import QuerySyntaxError, QueryValidationError, query_file
+
+_QUERY_ERRORS = (QuerySyntaxError, QueryValidationError, ColumnarFormatError)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,6 +19,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("version", help="print the current version")
     inspect_parser = sub.add_parser("inspect", help="inspect a columnar file and print its metadata as JSON")
     inspect_parser.add_argument("path", help="path to the columnar file")
+    query_parser = sub.add_parser("query", help="query a columnar file with SQL and print JSON")
+    query_parser.add_argument("path", help="path to the columnar file")
+    query_parser.add_argument("sql", help="SELECT statement to run against the file")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -37,6 +43,34 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError):
             pass
         json.dump(metadata, out, ensure_ascii=False, separators=(",", ":"))
+        out.write("\n")
+        return 0
+
+    if args.command == "query":
+        try:
+            table = query_file(args.path, args.sql)
+        except _QUERY_ERRORS as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        payload = {
+            "columns": [
+                {"name": col.name, "type": col.type, "nullable": col.nullable}
+                for col in table.schema.columns
+            ],
+            "rows": [
+                [table._columns[c][r] for c in range(len(table.schema.columns))]
+                for r in range(table.row_count)
+            ],
+        }
+        out = sys.stdout
+        try:
+            out.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        json.dump(payload, out, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         out.write("\n")
         return 0
 

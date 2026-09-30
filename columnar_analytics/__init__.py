@@ -12,6 +12,11 @@ from .format import (
     read_file,
     write_file,
 )
+from .query import (
+    QuerySyntaxError,
+    QueryValidationError,
+    query_file,
+)
 
 __all__ = [
     "__version__",
@@ -23,4 +28,7 @@ __all__ = [
     "write_file",
     "read_file",
     "inspect_file",
+    "QuerySyntaxError",
+    "QueryValidationError",
+    "query_file",
 ]
