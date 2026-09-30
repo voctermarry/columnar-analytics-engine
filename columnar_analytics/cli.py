@@ -3,19 +3,41 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 from . import __version__
+from .format import ColumnarFormatError, inspect_file
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="columnar-analytics-engine", description="Columnar analytics engine with a SQL subset and vectorised execution")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("version", help="print the current version")
+    inspect_parser = sub.add_parser("inspect", help="inspect a columnar file and print its metadata as JSON")
+    inspect_parser.add_argument("path", help="path to the columnar file")
     args = parser.parse_args(argv)
 
     if args.command == "version":
         print(__version__)
+        return 0
+
+    if args.command == "inspect":
+        try:
+            metadata = inspect_file(args.path)
+        except ColumnarFormatError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        out = sys.stdout
+        try:
+            out.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+        json.dump(metadata, out, ensure_ascii=False, separators=(",", ":"))
+        out.write("\n")
         return 0
 
     parser.print_help()
