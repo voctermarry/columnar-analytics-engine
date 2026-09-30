@@ -1,0 +1,3 @@
+add_executable(version_test version_test.cpp)
+target_link_libraries(version_test PRIVATE columnar_analytics_core)
+add_test(NAME version_test COMMAND version_test)
