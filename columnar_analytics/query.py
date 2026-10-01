@@ -12,6 +12,9 @@ The accepted grammar (keywords case-insensitive)::
 
     query       := SELECT ('*' | ident (',' ident)*)
                    FROM ident [WHERE expr]
+                   [ORDER BY sort_item (',' sort_item)*]
+                   [LIMIT uint]
+    sort_item   := ident [ASC | DESC] [NULLS FIRST | NULLS LAST]
     expr       := or_expr
     or_expr     := and_expr (OR and_expr)*
     and_expr    := cmp_expr (AND cmp_expr)*
@@ -28,6 +31,13 @@ NULL is a postfix of its atom.  Comparison operands must be column
 references or literals.  WHERE follows SQL three-valued logic: a normal
 comparison against NULL yields UNKNOWN, UNKNOWN propagates through the
 logical operators, and only TRUE rows are returned.
+
+After WHERE, rows may be sorted by one or more columns (which need not
+appear in the projection): ASC is the default, NULLs sort last regardless
+of direction unless NULLS FIRST / NULLS LAST is given, and rows equal on
+every sort key keep their file order.  LIMIT then keeps the first N rows
+of the filtered, sorted stream.  Without ORDER BY the original row order
+is preserved.
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from functools import cmp_to_key
 from typing import Any
 
 from .format import Schema, Table, read_file
@@ -46,7 +57,26 @@ __all__ = [
 ]
 
 _KEYWORDS = frozenset(
-    ("select", "from", "where", "not", "and", "or", "is", "null", "true", "false")
+    (
+        "select",
+        "from",
+        "where",
+        "not",
+        "and",
+        "or",
+        "is",
+        "null",
+        "true",
+        "false",
+        "order",
+        "by",
+        "asc",
+        "desc",
+        "nulls",
+        "first",
+        "last",
+        "limit",
+    )
 )
 
 
@@ -229,12 +259,21 @@ def _parse_number(text: str) -> int | float:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _OrderItem:
+    name: str
+    descending: bool
+    nulls_first: bool | None  # None -> the default (NULLs last, either direction)
+
+
 @dataclass
 class _Select:
     columns: tuple[str, ...] | None  # None means '*'
     table: str
     table_quoted: bool
     where: tuple | None
+    order_by: tuple[_OrderItem, ...] | None
+    limit: int | None
 
 
 class _Parser:
@@ -262,12 +301,59 @@ class _Parser:
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
+        order_by = None
+        if self._accept_keyword("order"):
+            self._expect_keyword("by")
+            items = [self._parse_order_item()]
+            while self._accept_op(","):
+                items.append(self._parse_order_item())
+            order_by = tuple(items)
+        limit = None
+        if self._accept_keyword("limit"):
+            limit = self._parse_limit()
         return _Select(
             columns=columns,
             table=table_tok.value,
             table_quoted=table_tok.kind == "qident",
             where=where,
+            order_by=order_by,
+            limit=limit,
         )
+
+    def _parse_order_item(self) -> _OrderItem:
+        name = self._expect_identifier_name()
+        descending = False
+        if self._accept_keyword("asc"):
+            descending = False
+        elif self._accept_keyword("desc"):
+            descending = True
+        nulls_first: bool | None = None
+        if self._accept_keyword("nulls"):
+            if self._accept_keyword("first"):
+                nulls_first = True
+            elif self._accept_keyword("last"):
+                nulls_first = False
+            else:
+                tok = self._peek()
+                raise QuerySyntaxError(
+                    f"expected FIRST or LAST after NULLS, got {tok.text!r}"
+                )
+        return _OrderItem(name, descending, nulls_first)
+
+    def _parse_limit(self) -> int:
+        tok = self._peek()
+        if (
+            tok.kind != "number"
+            or isinstance(tok.value, bool)
+            or not isinstance(tok.value, int)
+        ):
+            raise QuerySyntaxError("LIMIT requires an unsigned integer literal")
+        self._next()
+        if not (0 <= tok.value <= 2**63 - 1):
+            raise QuerySyntaxError(
+                f"LIMIT value {tok.value} is outside the allowed range"
+            )
+        return tok.value
 
     def _parse_projection(self) -> list[str]:
         names = [self._expect_identifier_name()]
@@ -420,7 +506,11 @@ class _Parser:
 # ---------------------------------------------------------------------------
 
 
-def _bind_select(select: _Select, schema: Schema) -> tuple[tuple[int, ...], tuple | None]:
+def _bind_select(
+    select: _Select, schema: Schema
+) -> tuple[
+    tuple[int, ...], tuple | None, tuple[tuple[int, bool, bool], ...] | None
+]:
     table_matches = (
         select.table == "input"
         if select.table_quoted
@@ -449,7 +539,26 @@ def _bind_select(select: _Select, schema: Schema) -> tuple[tuple[int, ...], tupl
             raise QueryValidationError(
                 f"WHERE clause must be boolean, got {type_name}"
             )
-    return indices, where
+    order_by = None
+    if select.order_by is not None:
+        bound: list[tuple[int, bool, bool]] = []
+        order_seen: set[str] = set()
+        for item in select.order_by:
+            if item.name in order_seen:
+                raise QueryValidationError(
+                    f"duplicate column in ORDER BY: {item.name!r}"
+                )
+            order_seen.add(item.name)
+            try:
+                col_index = schema.index(item.name)
+            except KeyError:
+                raise QueryValidationError(
+                    f"unknown ORDER BY column: {item.name!r}"
+                ) from None
+            nulls_first = item.nulls_first if item.nulls_first is not None else False
+            bound.append((col_index, item.descending, nulls_first))
+        order_by = tuple(bound)
+    return indices, where, order_by
 
 
 def _bind_expr(node: tuple, schema: Schema) -> tuple:
@@ -591,10 +700,13 @@ def query_file(path: Any, sql: str) -> Table:
     """Run ``sql`` against the single columnar file ``path``.
 
     Returns a :class:`~columnar_analytics.format.Table` with columns in
-    projection order and rows in the file's original order.  The statement is
-    parsed before the file is touched, so purely grammatical errors surface as
-    :class:`QuerySyntaxError` regardless of whether ``path`` exists.  Unknown
-    columns, the wrong table name or type-incompatible predicates raise
+    projection order.  Rows are filtered by WHERE, then (with ORDER BY)
+    stably sorted -- ties keep the file's relative order -- then capped by
+    LIMIT, then projected; without ORDER BY the file's original order is
+    kept.  The statement is parsed before the file is touched, so purely
+    grammatical errors surface as :class:`QuerySyntaxError` regardless of
+    whether ``path`` exists.  Unknown columns, duplicate ORDER BY columns,
+    the wrong table name or type-incompatible predicates raise
     :class:`QueryValidationError`; malformed files raise
     :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
     failures propagate as :class:`OSError`.
@@ -613,21 +725,55 @@ def query_table(table: Table, sql: str) -> Table:
 
 
 def _run_query(table: Table, select: _Select) -> Table:
-    indices, where = _bind_select(select, table.schema)
+    indices, where, order_by = _bind_select(select, table.schema)
 
     source_columns = table._columns
     row_count = table.row_count
     if where is None:
-        out_columns = [source_columns[index] for index in indices]
+        selected = list(range(row_count))
     else:
         selected = [
             i
             for i in range(row_count)
             if _eval(where, tuple(col[i] for col in source_columns)) is True
         ]
-        out_columns = [
-            tuple(source_columns[index][i] for i in selected) for index in indices
-        ]
 
+    if order_by is not None:
+        comparator = _make_comparator(source_columns, order_by)
+        selected = sorted(selected, key=cmp_to_key(comparator))
+
+    if select.limit is not None:
+        selected = selected[: select.limit]
+
+    out_columns = [
+        tuple(source_columns[index][i] for i in selected) for index in indices
+    ]
     out_schema = Schema([table.schema.columns[i] for i in indices])
     return Table._from_storage(out_schema, out_columns)
+
+
+def _make_comparator(
+    source_columns: tuple[tuple, ...],
+    order_by: tuple[tuple[int, bool, bool], ...],
+):
+    def compare(a: int, b: int) -> int:
+        for col_index, descending, nulls_first in order_by:
+            va = source_columns[col_index][a]
+            vb = source_columns[col_index][b]
+            if va is None or vb is None:
+                if va is None and vb is None:
+                    continue
+                # NULL placement follows NULLS FIRST / NULLS LAST alone; the
+                # default (and the explicit LAST spelling) keeps NULLs at the
+                # end for both ASC and DESC, so DESC must not flip this part.
+                none_before = -1 if nulls_first else 1
+                c = none_before if va is None else -none_before
+            else:
+                c = (va > vb) - (va < vb)
+                if descending:
+                    c = -c
+            if c:
+                return c
+        return 0
+
+    return compare

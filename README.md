@@ -3,7 +3,8 @@
 本项目是「列式分析型数据库引擎」的代码仓库，用于逐步实现该方向的列式存储、查询执行与结果对账能力。
 
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
-（`SELECT` 投影 + `WHERE` 过滤）；查询只读取文件、不修改文件。
+（`SELECT` 投影、`WHERE` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；
+查询只读取文件、不修改文件。
 
 ## 环境与安装
 
@@ -34,7 +35,8 @@ columnar-analytics-engine --help                        # 打印用法
 顶层键顺序固定为 `format_version`、`row_count`、`columns`，columns 保持 schema 顺序。
 格式错误时向标准错误输出消息并以码 2 退出；路径等系统错误以码 1 退出。
 
-`query` 对单个文件执行一条 `SELECT ... FROM input [WHERE ...]` 语句，以单行
+`query` 对单个文件执行一条
+`SELECT ... FROM input [WHERE ...] [ORDER BY ...] [LIMIT n]` 语句，以单行
 UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`columns` 按结果顺序
 列出每列的 `name`、`type`、`nullable`，`rows` 是同序值数组的数组。空结果保留列
 描述且 `rows` 为空；同一文件与 SQL 重复执行输出字节一致。语法错误
@@ -74,7 +76,10 @@ write_file("data.caef", table, compression="zlib", dictionary_encoding=["name"])
 restored = read_file("data.caef")                    # 保持列顺序
 subset = read_file("data.caef", columns=["name"])    # 按给定顺序投影
 
-hits = query_file("data.caef", "SELECT id FROM input WHERE name IS NOT NULL")
+hits = query_file(
+    "data.caef",
+    "SELECT id FROM input WHERE name IS NOT NULL ORDER BY id DESC LIMIT 10",
+)
 ```
 
 ## 单文件 SQL 查询
@@ -86,6 +91,8 @@ SQL 子集（关键字大小写不敏感）：
 SELECT * | 列名 [, 列名 ...]
 FROM input
 [WHERE 表达式]
+[ORDER BY 列名 [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...]]
+[LIMIT 无符号整数]
 ```
 
 - 投影只允许星号或逗号分隔的列名，不支持别名；重复列、未知列抛
@@ -99,9 +106,18 @@ FROM input
 - int64 与 float64 可互比，utf8 只与 utf8 比较，bool 只支持 `=`/`!=`；
   不兼容组合抛 `QueryValidationError`。
 - 遵循 SQL 三值逻辑：普通比较遇到 NULL 得 UNKNOWN，逻辑运算继续传播 UNKNOWN，
-  只有 TRUE 的行进入结果；省略 `WHERE` 保留全部行。结果列遵循投影顺序，行保持
-  文件原始顺序。
-- 语法不完整、非法字符或其他未支持的语法统一抛 `QuerySyntaxError`；文件损坏仍抛
+  只有 TRUE 的行进入结果；省略 `WHERE` 保留全部行。
+- `ORDER BY` 的排序项是一个或多个逗号分隔的列标识符（无需出现在投影中，
+  按 schema 精确匹配；未知列或同一 `ORDER BY` 中的重复列抛
+  `QueryValidationError`）。多列按书写顺序比较：int64/float64 按数值、
+  utf8 按 Unicode 码点、bool 按 `FALSE < TRUE`；全部排序键相等的行保持文件
+  中的相对顺序。省略方向为 `ASC`；省略 `NULLS` 时不论方向 NULL 都排在末尾，
+  显式 `NULLS FIRST`/`NULLS LAST` 覆盖默认值。
+- `LIMIT` 只接受 `0` 至 `9223372036854775807` 的无符号十进制整数，可独立出现；
+  `0` 返回保留列描述的空表，大于入选行数时返回全部行。执行顺序固定为
+  `WHERE` → 排序 → `LIMIT` → 投影；没有 `ORDER BY` 时保持文件原始行序。
+- 语法不完整、修饰词错位或重复、子句乱序或重复、`LIMIT` 缺值/负数/小数/越界
+  等统一抛 `QuerySyntaxError`，且在访问文件之前识别；文件损坏仍抛
   `ColumnarFormatError`，系统错误保留 `OSError`。
 
 ## 文件格式概览
@@ -115,5 +131,5 @@ FROM input
 ## 限制
 
 - SQL 仅支持单文件查询：`SELECT`（星号/列名投影）+ 固定表名 `input` + 可选
-  `WHERE`；不支持别名、表达式投影、连接、聚合、排序、`LIMIT` 等。
+  `WHERE`、`ORDER BY`、`LIMIT`；不支持别名、表达式投影、连接、聚合等。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
