@@ -55,7 +55,9 @@ other aggregates NULL); with GROUP BY it yields zero rows.
 from __future__ import annotations
 
 import math
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
@@ -66,6 +68,7 @@ __all__ = [
     "QuerySyntaxError",
     "QueryValidationError",
     "query_file",
+    "query_files",
 ]
 
 _KEYWORDS = frozenset(
@@ -91,6 +94,12 @@ _KEYWORDS = frozenset(
         "group",
     )
 )
+
+# JOIN-related words are *contextual*: they are NOT in ``_KEYWORDS``, so they
+# lex as ordinary identifiers and stay usable as column names (and, in
+# multi-table queries, table names).  The parser recognises them by their
+# case-folded text only in the FROM/JOIN positions where they are required;
+# ``_parse_optional_join`` enumerates the words directly.
 
 # Aggregate function names are ordinary (case-insensitive) identifiers that
 # gain call syntax only in the projection and ORDER BY.
@@ -174,12 +183,23 @@ def _tokenize(sql: str) -> list[_Token]:
             tokens.append(_token_from_word(value, quoted=True))
             i = new_i
             continue
-        if ch.isdigit() or ch == ".":
+        if ch == ".":
+            # ".5" stays a float literal; a lone dot is the qualifier in a
+            # qualified name "table.column" and is left to the parser, which
+            # rejects a stray dot as a syntax error.
+            match = _NUMBER_RE.match(sql, i)
+            if match and match.group(0) != ".":
+                text = match.group(0)
+                tokens.append(_Token("number", _parse_number(text), text))
+                i = match.end()
+                continue
+            tokens.append(_Token("op", ".", "."))
+            i += 1
+            continue
+        if ch.isdigit():
             match = _NUMBER_RE.match(sql, i)
             if match:
                 text = match.group(0)
-                if text == ".":
-                    raise QuerySyntaxError(f"unexpected character '.' at position {i}")
                 tokens.append(_Token("number", _parse_number(text), text))
                 i = match.end()
                 continue
@@ -283,6 +303,26 @@ def _parse_number(text: str) -> int | float:
 
 
 @dataclass(frozen=True)
+class _QName:
+    """A parsed column reference, optionally table-qualified (``table.column``)."""
+
+    table: str | None
+    name: str
+    table_quoted: bool = False
+
+
+@dataclass(frozen=True)
+class _Join:
+    """The single optional join clause of a multi-table query."""
+
+    join_type: str  # "inner" | "left"
+    right_table: str
+    right_quoted: bool
+    left_key: _QName
+    right_key: _QName
+
+
+@dataclass(frozen=True)
 class _RefItem:
     """One projection element or ORDER BY key as parsed."""
 
@@ -292,6 +332,12 @@ class _RefItem:
     arg: str | None = None  # aggregate column argument; "" stands for '*'
     descending: bool = False
     nulls_first: bool | None = None  # None -> default (NULLs last)
+    # Qualification, present only in multi-table (join) queries; ``None`` for
+    # the single-file grammar.  ``arg_table`` qualifies an aggregate argument.
+    table: str | None = None
+    table_quoted: bool = False
+    arg_table: str | None = None
+    arg_table_quoted: bool = False
 
 
 @dataclass
@@ -300,9 +346,10 @@ class _Select:
     table: str
     table_quoted: bool
     where: tuple | None
-    group_by: tuple[str, ...] | None
+    group_by: tuple[_QName, ...] | None
     order_by: tuple[_RefItem, ...] | None
     limit: int | None
+    join: _Join | None = None
 
     @property
     def star(self) -> bool:
@@ -323,6 +370,9 @@ class _Parser:
     def __init__(self, tokens: list[_Token]):
         self.tokens = tokens
         self.pos = 0
+        # Holds the most recently parsed aggregate argument as a _QName while
+        # _parse_column_or_agg builds its _RefItem; None stands for '*'.
+        self._agg_arg: _QName | None = None
 
     def parse(self) -> _Select:
         select = self._parse_select()
@@ -336,15 +386,16 @@ class _Parser:
         items = tuple(self._parse_projection())
         self._expect_keyword("from")
         table_tok = self._expect_table_name()
+        join = self._parse_optional_join()
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
         group_by = None
         if self._accept_keyword("group"):
             self._expect_keyword("by")
-            names = [self._expect_identifier_name()]
+            names = [self._parse_qname()]
             while self._accept_op(","):
-                names.append(self._expect_identifier_name())
+                names.append(self._parse_qname())
             group_by = tuple(names)
         order_by = None
         if self._accept_keyword("order"):
@@ -364,7 +415,96 @@ class _Parser:
             group_by=group_by,
             order_by=order_by,
             limit=limit,
+            join=join,
         )
+
+    def _is_join_word(self, tok: _Token, word: str) -> bool:
+        # Contextual recognition: a quoted "join"/"on"/... is an identifier,
+        # never a keyword.
+        return tok.kind == "ident" and tok.value.lower() == word
+
+    def _expect_join_word(self, word: str) -> None:
+        tok = self._peek()
+        if not self._is_join_word(tok, word):
+            raise QuerySyntaxError(f"expected {word.upper()}, got {tok.text!r}")
+        self._next()
+
+    def _parse_optional_join(self) -> _Join | None:
+        """Parse ``[INNER | LEFT] JOIN right ON left.col = right.col``.
+
+        Absent unless the token right after the left table is a contextual
+        JOIN word.  Everything grammatical about the join is decided here so
+        that a missing JOIN keyword, an illegal ON clause or a second join all
+        surface as :class:`QuerySyntaxError` before any file is read.
+        """
+        tok = self._peek()
+        if tok.kind == "eof":
+            return None
+        following = self.tokens[self.pos + 1]
+        is_join_word = (
+            tok.kind == "ident" and tok.value.lower() in ("inner", "left", "join")
+        )
+        # "INNER"/"LEFT" only starts a join when immediately followed by a bare
+        # JOIN word; otherwise it is an ordinary table name and single-file
+        # queries keep their historical (unknown-table) validation behaviour.
+        has_join_keyword = (
+            tok.kind == "ident" and tok.value.lower() == "join"
+        ) or (
+            is_join_word
+            and following.kind == "ident"
+            and following.value.lower() == "join"
+        )
+        if not is_join_word or not has_join_keyword:
+            return None
+        word = tok.value.lower()
+        if word == "inner":
+            self._next()
+            self._expect_join_word("join")
+            join_type = "inner"
+        elif word == "left":
+            self._next()
+            self._expect_join_word("join")
+            join_type = "left"
+        else:  # bare JOIN implies INNER
+            self._next()
+            join_type = "inner"
+        right_tok = self._expect_table_name()
+        self._expect_join_word("on")
+        left_key = self._parse_qname()
+        self._expect_op("=")
+        right_key = self._parse_qname()
+        # A second join leaves another JOIN word in the token stream; the
+        # clause parsers do not consume it and the trailing-input check in
+        # parse() reports it.  Detect it directly for a precise message.
+        extra = self._peek()
+        if extra.kind == "ident" and extra.value.lower() in ("inner", "left", "join"):
+            raise QuerySyntaxError("at most one JOIN is supported")
+        return _Join(
+            join_type=join_type,
+            right_table=right_tok.value,
+            right_quoted=right_tok.kind == "qident",
+            left_key=left_key,
+            right_key=right_key,
+        )
+
+    def _parse_qname(self) -> _QName:
+        """Parse ``identifier`` or ``identifier.identifier``."""
+        tok = self._peek()
+        if tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        self._next()
+        return self._qname_after_first(tok)
+
+    def _qname_after_first(self, tok: _Token) -> _QName:
+        if self._accept_op("."):
+            col = self._peek()
+            if col.kind not in ("ident", "qident"):
+                raise QuerySyntaxError(
+                    f"expected column name after '.', got {col.text!r}"
+                )
+            self._next()
+            return _QName(tok.value, col.value, tok.kind == "qident")
+        return _QName(None, tok.value)
 
     def _parse_projection(self) -> list[_RefItem]:
         items = [self._parse_select_item()]
@@ -419,12 +559,28 @@ class _Parser:
             arg=item.arg,
             descending=descending,
             nulls_first=nulls_first,
+            table=item.table,
+            table_quoted=item.table_quoted,
+            arg_table=item.arg_table,
+            arg_table_quoted=item.arg_table_quoted,
         )
 
     def _parse_column_or_agg(self) -> _RefItem:
         tok = self._peek()
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        nxt = self.tokens[self.pos + 1]
+        # ``name.column`` (or ``name.`` followed by something) is a qualified
+        # column reference, even when the first word is spelled like an
+        # aggregate function.
+        if nxt.kind == "op" and nxt.value == ".":
+            qname = self._parse_qname()
+            return _RefItem(
+                "column",
+                name=qname.name,
+                table=qname.table,
+                table_quoted=qname.table_quoted,
+            )
         # A quoted identifier, or a bare word not spelled like an aggregate,
         # can only be a plain column reference.
         if tok.kind == "qident" or tok.value.lower() not in _AGG_NAMES:
@@ -438,33 +594,42 @@ class _Parser:
             return _RefItem("column", name=tok.value)
         self._parse_aggregate_args(func)
         self._expect_op(")")
-        return _RefItem("agg", func=func.upper(), arg=self._agg_arg)
+        arg = self._agg_arg
+        return _RefItem(
+            "agg",
+            func=func.upper(),
+            arg=arg.name if arg is not None else "",
+            arg_table=arg.table if arg is not None else None,
+            arg_table_quoted=arg.table_quoted if arg is not None else False,
+        )
 
     def _parse_aggregate_args(self, func: str) -> None:
-        # Exactly one argument: '*' for COUNT, otherwise one identifier.
+        # Exactly one argument: '*' for COUNT, otherwise one (qualified) name.
         tok = self._peek()
         if tok.kind == "star":
             if func != "count":
                 raise QuerySyntaxError(f"{func.upper()} does not accept '*'")
             self._next()
-            self._agg_arg = ""
+            self._agg_arg = None
             return
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(
                 f"{func.upper()} requires one column argument, got {tok.text!r}"
             )
-        self._next()
+        qname = self._parse_qname()
+        # A nested call is only detectable once the (qualified) argument name
+        # has been consumed.
         nxt = self._peek()
         if nxt.kind == "op" and nxt.value == "(":
-            if tok.kind == "ident" and tok.value.lower() in _AGG_NAMES:
+            if qname.table is None and qname.name.lower() in _AGG_NAMES:
                 raise QueryValidationError(
                     f"aggregate functions must not be nested: "
-                    f"{func.upper()}({tok.value.upper()}(...))"
+                    f"{func.upper()}({qname.name.upper()}(...))"
                 )
             raise QuerySyntaxError(
                 f"{func.upper()} argument must be a column name, not a function call"
             )
-        self._agg_arg = tok.value
+        self._agg_arg = qname
 
     def _parse_limit(self) -> int:
         tok = self._peek()
@@ -486,13 +651,6 @@ class _Parser:
         if tok.kind in ("ident", "qident"):
             return self._next()
         raise QuerySyntaxError(f"expected table name, got {tok.text!r}")
-
-    def _expect_identifier_name(self) -> str:
-        tok = self._peek()
-        if tok.kind in ("ident", "qident"):
-            self._next()
-            return tok.value
-        raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
 
     # WHERE expression grammar ------------------------------------------------
 
@@ -572,18 +730,18 @@ class _Parser:
         if tok.kind in ("ident", "qident"):
             if sign == -1:
                 raise QuerySyntaxError("column reference cannot be negated")
-            nxt = self.tokens[self.pos + 1]
+            qname = self._parse_qname()
+            nxt = self._peek()
             if (
-                tok.kind == "ident"
-                and tok.value.lower() in _AGG_NAMES
+                qname.table is None
+                and qname.name.lower() in _AGG_NAMES
                 and nxt.kind == "op"
                 and nxt.value == "("
             ):
                 raise QueryValidationError(
-                    f"aggregate {tok.value.upper()}(...) is not allowed in WHERE"
+                    f"aggregate {qname.name.upper()}(...) is not allowed in WHERE"
                 )
-            self._next()
-            return ("column", tok.value, None, None, None)
+            return ("column", qname.table, qname.name, None, None, None)
         if tok.kind == "keyword":
             raise QuerySyntaxError(f"unexpected keyword {tok.text.upper()!r} in expression")
         raise QuerySyntaxError(f"unexpected token {tok.text!r} in expression")
@@ -652,16 +810,58 @@ class _BoundItem:
     nullable: bool = True
 
 
-def _bind_select(select: _Select, schema: Schema) -> dict:
+def _bind_select(select: _Select, schema: Schema, table_name: str = "input") -> dict:
     table_matches = (
-        select.table == "input"
+        select.table == table_name
         if select.table_quoted
-        else select.table.lower() == "input"
+        else select.table.lower() == table_name.lower()
     )
     if not table_matches:
-        raise QueryValidationError(f"unknown table {select.table!r}; only 'input' is supported")
+        raise QueryValidationError(
+            f"unknown table {select.table!r}; only {table_name!r} is available here"
+        )
+    return _bind_parsed(select, schema)
 
-    where = _bind_expr(select.where, schema) if select.where is not None else None
+
+def _select_has_qualification(select: _Select) -> bool:
+    """True if any column reference carries a ``table.`` prefix."""
+    if select.join is not None:
+        return True  # join selects take the multi-table path, never this one
+    for item in select.items:
+        if item.table is not None or item.arg_table is not None:
+            return True
+    for item in select.order_by or ():
+        if item.table is not None or item.arg_table is not None:
+            return True
+    for qname in select.group_by or ():
+        if qname.table is not None:
+            return True
+
+    def walk(node) -> bool:
+        if not isinstance(node, tuple):
+            return False
+        if node[0] == "column":
+            return node[1] is not None
+        return any(walk(child) for child in node[1:] if isinstance(child, tuple))
+
+    return select.where is not None and walk(select.where)
+
+
+def _bind_parsed(select: _Select, schema: Schema) -> dict:
+    def resolve(node):
+        # Single-file grammar: references are unqualified and resolve by name.
+        if node[1] is not None:
+            raise QueryValidationError(
+                f"qualified column {node[1]}.{node[2]} is only valid in a multi-table query"
+            )
+        try:
+            index = schema.index(node[2])
+        except KeyError:
+            raise QueryValidationError(f"unknown column: {node[2]!r}") from None
+        col = schema.columns[index]
+        return index, col
+
+    where = _bind_expr(select.where, resolve) if select.where is not None else None
     if where is not None and where[0] in ("literal", "column"):
         type_name = _operand_type(where)
         if type_name != "bool":
@@ -739,7 +939,8 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
     # duplicates / unknown columns are rejected here.
     group_indices: list[int] = []
     group_seen: set[str] = set()
-    for name in select.group_by or ():
+    for qname in select.group_by or ():
+        name = qname.name
         if name in group_seen:
             raise QueryValidationError(f"duplicate column in GROUP BY: {name!r}")
         group_seen.add(name)
@@ -919,30 +1120,25 @@ def _bind_aggregate_order_by(
     return tuple(bound_order)
 
 
-def _bind_expr(node: tuple, schema: Schema) -> tuple:
+def _bind_expr(node: tuple, resolve) -> tuple:
     tag = node[0]
     if tag == "literal":
         return node
     if tag == "column":
-        name = node[1]
-        try:
-            index = schema.index(name)
-        except KeyError:
-            raise QueryValidationError(f"unknown column: {name!r}") from None
-        col = schema.columns[index]
-        return ("column", name, index, col.type, col.nullable)
+        index, col = resolve(node)
+        return ("column", node[1], col.name, index, col.type, col.nullable)
     if tag == "not":
-        operand = _bind_expr(node[1], schema)
+        operand = _bind_expr(node[1], resolve)
         _require_boolean(operand, "NOT")
         return ("not", operand)
     if tag in ("and", "or"):
-        left = _bind_expr(node[1], schema)
-        right = _bind_expr(node[2], schema)
+        left = _bind_expr(node[1], resolve)
+        right = _bind_expr(node[2], resolve)
         _require_boolean(left, tag.upper())
         _require_boolean(right, tag.upper())
         return (tag, left, right)
     if tag == "isnull":
-        operand = _bind_expr(node[1], schema)
+        operand = _bind_expr(node[1], resolve)
         if operand[0] not in ("literal", "column"):
             raise QuerySyntaxError(
                 "IS NULL operand must be a column reference or a literal"
@@ -950,8 +1146,8 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
         return ("isnull", operand, node[2])
     if tag == "cmp":
         op = node[1]
-        left = _bind_expr(node[2], schema)
-        right = _bind_expr(node[3], schema)
+        left = _bind_expr(node[2], resolve)
+        right = _bind_expr(node[3], resolve)
         if left[0] not in ("literal", "column") or right[0] not in ("literal", "column"):
             raise QuerySyntaxError("comparison operands must be column references or literals")
         left_t = _operand_type(left)
@@ -977,13 +1173,13 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
 
 
 def _operand_type(node: tuple) -> str:
-    return node[2] if node[0] == "literal" else node[3]
+    return node[2] if node[0] == "literal" else node[4]
 
 
 def _require_boolean(node: tuple, context: str) -> None:
     if node[0] in ("cmp", "isnull", "not", "and", "or"):
         return
-    type_name = node[2] if node[0] == "literal" else node[3]
+    type_name = node[2] if node[0] == "literal" else node[4]
     if type_name != "bool":
         raise QueryValidationError(f"{context} requires a boolean operand, got {type_name}")
 
@@ -998,7 +1194,7 @@ def _eval(node: tuple, row: tuple) -> bool | None:
     if tag == "literal":
         return node[1]
     if tag == "column":
-        return row[node[2]]
+        return row[node[3]]
     if tag == "isnull":
         value = _eval(node[1], row)
         result = value is None
@@ -1118,18 +1314,344 @@ def query_file(path: Any, sql: str) -> Table:
     """
     tokens = _tokenize(sql)
     select = _Parser(tokens).parse()
+    _reject_single_file_join(select)
     table = read_file(path)
     return _run_query(table, select)
+
+
+def _reject_single_file_join(select: _Select) -> None:
+    """Reproduce the single-file grammar for statements a join could relax.
+
+    Before joins existed a stray dot was a lexical error and a JOIN clause was
+    an unexpected-trailing-input syntax error, both raised before the file was
+    read.  Keep that classification (and pre-read timing) for ``query_file``.
+    """
+    if select.join is not None:
+        raise QuerySyntaxError("JOIN is only supported by query_files")
+    if _select_has_qualification(select):
+        raise QuerySyntaxError("unexpected '.'; qualified columns require a JOIN")
+
+
+def query_files(sources: Mapping[str, Any], sql: str) -> Table:
+    """Run a two-file equi-join ``sql`` query against the files in ``sources``.
+
+    ``sources`` is a non-empty mapping of table name to file path (an
+    :class:`os.PathLike`).  The statement has the shape::
+
+        SELECT ... FROM left_t
+        ( INNER | LEFT ) JOIN right_t ON left_t.a = right_t.b
+        [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]
+
+    Apart from ``COUNT(*)`` every column reference must be qualified as
+    ``table.column``.  ``SELECT *`` outputs the left schema followed by the
+    right schema, with columns named ``table.column``.  Join rows are
+    expanded in left-file then right-file order before WHERE/GROUP BY/
+    aggregate/ORDER BY/LIMIT are applied with their single-file semantics.
+
+    The ``sources`` argument is validated (raising :class:`ValueError`) and
+    the statement is parsed (raising :class:`QuerySyntaxError`) before any
+    file is opened.  Unknown tables/columns, unqualified references,
+    duplicate tables, wrong-sourced or type-incompatible join keys and
+    duplicate result columns raise :class:`QueryValidationError`.
+    """
+    # Argument validation never touches the filesystem.
+    if not isinstance(sources, Mapping) or len(sources) == 0:
+        raise ValueError("sources must be a non-empty mapping of table name to path")
+    for key, value in sources.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("sources keys must be non-empty table-name strings")
+        if not isinstance(value, os.PathLike):
+            raise ValueError("sources values must be path objects")
+
+    tokens = _tokenize(sql)
+    select = _Parser(tokens).parse()
+    if select.join is None:
+        raise QueryValidationError(
+            "query_files requires a query with one INNER or LEFT JOIN"
+        )
+
+    join = select.join
+    left_name = _resolve_source_table(select.table, select.table_quoted, sources)
+    right_name = _resolve_source_table(
+        join.right_table, join.right_quoted, sources
+    )
+    if left_name == right_name:
+        raise QueryValidationError(
+            f"table {left_name!r} may be joined only once (aliases are not supported)"
+        )
+
+    left_table = read_file(sources[left_name])
+    right_table = read_file(sources[right_name])
+
+    wide, rewritten = _prepare_join(
+        select, left_name, left_table, join.join_type, right_name, right_table
+    )
+    return _run_query(wide, rewritten)
 
 
 def query_table(table: Table, sql: str) -> Table:
     """Apply ``sql`` (``FROM input``) to an in-memory table."""
     tokens = _tokenize(sql)
     select = _Parser(tokens).parse()
+    _reject_single_file_join(select)
     return _run_query(table, select)
 
 
+def _resolve_source_table(name: str, quoted: bool, sources: Mapping[str, str]) -> str:
+    """Map a SQL table spelling to the canonical key of ``sources``.
+
+    Quoted names match exactly; bare names match case-insensitively, as with
+    the fixed ``input`` table of single-file queries.
+    """
+    if quoted:
+        if name in sources:
+            return name
+        raise QueryValidationError(f"unknown table: {name!r}")
+    matches = [key for key in sources if key.lower() == name.lower()]
+    if not matches:
+        raise QueryValidationError(f"unknown table: {name!r}")
+    if len(matches) > 1:
+        raise QueryValidationError(
+            f"table name {name!r} is ambiguous among {sorted(matches)!r}"
+        )
+    return matches[0]
+
+
+def _prepare_join(
+    select: _Select,
+    left_name: str,
+    left_table: Table,
+    join_type: str,
+    right_name: str,
+    right_table: Table,
+) -> tuple[Table, _Select]:
+    """Validate the join against both schemas and materialise the wide table.
+
+    Returns the wide (joined) table and a rewritten single-table
+    :class:`_Select` whose unqualified names are the wide column names
+    (``table.column``), so the existing binder and runner apply unchanged.
+    """
+    join = select.join
+    left_cols = left_table.schema.columns
+    right_cols = right_table.schema.columns
+
+    def require_qualified(qname: _QName, context: str) -> None:
+        if qname.table is None:
+            raise QueryValidationError(
+                f"{context} column {qname.name!r} must be qualified as table.column"
+            )
+
+    def resolve_side(qname: _QName, context: str) -> tuple[str, int, ColumnSchema]:
+        require_qualified(qname, context)
+        if qname.table_quoted:
+            table_match = qname.table if qname.table in (left_name, right_name) else None
+        else:
+            table_matches = [
+                n for n in (left_name, right_name) if n.lower() == qname.table.lower()
+            ]
+            table_match = table_matches[0] if len(table_matches) == 1 else None
+            if len(table_matches) > 1:
+                raise QueryValidationError(
+                    f"table name {qname.table!r} is ambiguous"
+                )
+        if table_match is None:
+            raise QueryValidationError(f"unknown table: {qname.table!r}")
+        side_table = left_table if table_match == left_name else right_table
+        try:
+            col_index = side_table.schema.index(qname.name)
+        except KeyError:
+            raise QueryValidationError(
+                f"unknown column: {table_match}.{qname.name}"
+            ) from None
+        return table_match, col_index, side_table.schema.columns[col_index]
+
+    # --- join keys: left key must come from the left table, right key right -
+    l_side, l_idx, l_col = resolve_side(join.left_key, "join")
+    if l_side != left_name:
+        raise QueryValidationError(
+            f"left join key {join.left_key.table}.{join.left_key.name} "
+            f"must reference the left table {left_name!r}"
+        )
+    r_side, r_idx, r_col = resolve_side(join.right_key, "join")
+    if r_side != right_name:
+        raise QueryValidationError(
+            f"right join key {join.right_key.table}.{join.right_key.name} "
+            f"must reference the right table {right_name!r}"
+        )
+    if not _keys_compatible(l_col.type, r_col.type):
+        raise QueryValidationError(
+            f"join keys have incompatible types {l_col.type} and {r_col.type}"
+        )
+
+    # --- materialise the wide rows in left-then-right original order --------
+    left_storage = left_table._columns
+    right_storage = right_table._columns
+    n_right = len(right_cols)
+    l_key_col = left_storage[l_idx]
+    r_key_col = right_storage[r_idx]
+
+    # Index right rows by key for the common non-NULL case; NULL never matches
+    # and rows are emitted grouped by left row, so iterate per left row.
+    wide_rows: list[tuple] = []
+    for li in range(left_table.row_count):
+        lv = l_key_col[li]
+        left_vals = tuple(col[li] for col in left_storage)
+        if lv is None:
+            matches: list[int] = []
+        else:
+            matches = [
+                ri
+                for ri in range(right_table.row_count)
+                if (rv := r_key_col[ri]) is not None and _key_equal(lv, rv)
+            ]
+        if matches:
+            for ri in matches:
+                wide_rows.append(
+                    left_vals + tuple(col[ri] for col in right_storage)
+                )
+        elif join_type == "left":
+            wide_rows.append(left_vals + (None,) * n_right)
+
+    wide_schema = Schema(
+        tuple(
+            ColumnSchema(f"{left_name}.{c.name}", c.type, c.nullable)
+            for c in left_cols
+        )
+        + tuple(
+            ColumnSchema(
+                f"{right_name}.{c.name}",
+                c.type,
+                # Right-side columns of a LEFT JOIN can be NULL-padded.
+                True if join_type == "left" else c.nullable,
+            )
+            for c in right_cols
+        )
+    )
+    width = len(wide_schema.columns)
+    wide_storage = [
+        tuple(row[c] for row in wide_rows) for c in range(width)
+    ]
+    wide = Table._from_storage(wide_schema, wide_storage)
+
+    # --- rewrite the remaining clauses to wide, unqualified names -----------
+    def wide_name(qname: _QName, context: str) -> str:
+        side, col_index, col = resolve_side(qname, context)
+        return f"{side}.{col.name}"
+
+    rewritten_items = tuple(
+        _rewrite_ref_item(item, wide_name) for item in select.items
+    )
+    rewritten_group = (
+        tuple(
+            _QName(None, wide_name(qname, "GROUP BY"))
+            for qname in select.group_by
+        )
+        if select.group_by is not None
+        else None
+    )
+    rewritten_order = (
+        tuple(
+            _rewrite_ref_item(item, wide_name) for item in select.order_by
+        )
+        if select.order_by is not None
+        else None
+    )
+    rewritten_where = (
+        _rewrite_where(select.where, wide_name)
+        if select.where is not None
+        else None
+    )
+    rewritten = _Select(
+        items=rewritten_items,
+        table="input",
+        table_quoted=False,
+        where=rewritten_where,
+        group_by=rewritten_group,
+        order_by=rewritten_order,
+        limit=select.limit,
+        join=None,
+    )
+    return wide, rewritten
+
+
+def _keys_compatible(left_type: str, right_type: str) -> bool:
+    # Equal types always join; across types only int64/float64 may mix.
+    if left_type == right_type:
+        return True
+    return {left_type, right_type} == {"int64", "float64"}
+
+
+def _key_equal(left, right) -> bool:
+    # NULL is filtered by the caller.  int64/float64 compare numerically; the
+    # stored values are finite and the types are validated as comparable.
+    return left == right
+
+
+def _rewrite_ref_item(item: _RefItem, wide_name) -> _RefItem:
+    if item.kind == "star":
+        return item
+    if item.kind == "column":
+        qname = _QName(item.table, item.name, item.table_quoted)
+        return _RefItem(
+            "column",
+            name=wide_name(qname, "projection"),
+            descending=item.descending,
+            nulls_first=item.nulls_first,
+        )
+    # aggregate
+    if item.arg == "":
+        arg_name = ""
+        arg_table = None
+    else:
+        qname = _QName(item.arg_table, item.arg, item.arg_table_quoted)
+        arg_name = wide_name(qname, "aggregate argument")
+        arg_table = None
+    return _RefItem(
+        "agg",
+        name=None,
+        func=item.func,
+        arg=arg_name,
+        descending=item.descending,
+        nulls_first=item.nulls_first,
+    )
+
+
+def _rewrite_where(node: tuple, wide_name) -> tuple:
+    tag = node[0]
+    if tag == "literal":
+        return node
+    if tag == "column":
+        qname = _QName(node[1], node[2])
+        return ("column", None, wide_name(qname, "WHERE"), None, None, None)
+    if tag in ("not",):
+        return ("not", _rewrite_where(node[1], wide_name))
+    if tag in ("and", "or"):
+        return (
+            tag,
+            _rewrite_where(node[1], wide_name),
+            _rewrite_where(node[2], wide_name),
+        )
+    if tag == "isnull":
+        return ("isnull", _rewrite_where(node[1], wide_name), node[2])
+    if tag == "cmp":
+        return (
+            "cmp",
+            node[1],
+            _rewrite_where(node[2], wide_name),
+            _rewrite_where(node[3], wide_name),
+        )
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
 def _run_query(table: Table, select: _Select) -> Table:
+    if select.join is not None:
+        raise QueryValidationError(
+            "JOIN queries must be run with query_files"
+        )
+    if _select_has_qualification(select):
+        # query_file already rejects this before reading; guard the in-memory
+        # entry point with the same historical classification.
+        raise QuerySyntaxError("unexpected '.'; qualified columns require a JOIN")
     bound = _bind_select(select, table.schema)
     source_columns = table._columns
     row_count = table.row_count
