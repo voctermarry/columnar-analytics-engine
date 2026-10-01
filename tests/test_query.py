@@ -370,7 +370,6 @@ def test_unicode_string_literal(path):
         "select * from input where id = '' 'x'",
         "select * from input where id = 'unterminated",
         "select * from input where id = \"unterminated",
-        "select * from input where id = 1 group by id",
         "INSERT INTO input VALUES (1)",
         "select * from input where id = 1 or",
         "select * from input where id == 1",
@@ -623,6 +622,582 @@ def test_order_limit_syntax_checked_before_file(tmp_path):
         query_file(missing, "select id from input order by bogus limit")
     with pytest.raises(QuerySyntaxError):
         query_file(missing, "select id from input order by limit 2")
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: scalar (no GROUP BY)
+# ---------------------------------------------------------------------------
+
+
+AGG_SCHEMA = Schema(
+    [
+        ColumnSchema("id", "int64"),
+        ColumnSchema("g", "utf8", nullable=True),
+        ColumnSchema("n", "int64", nullable=True),
+        ColumnSchema("f", "float64", nullable=True),
+        ColumnSchema("b", "bool"),
+    ]
+)
+
+AGG_DATA = {
+    "id": [1, 2, 3, 4, 5, 6],
+    "g": ["a", "b", None, "a", "c", "a"],
+    "n": [10, None, 30, 40, None, 10],
+    "f": [1.5, 2.5, None, -0.5, 10.0, 1.5],
+    "b": [True, False, True, False, True, False],
+}
+
+
+@pytest.fixture()
+def agg_path(tmp_path):
+    p = tmp_path / "agg.caef"
+    write_file(p, Table(AGG_SCHEMA, AGG_DATA), compression="zlib")
+    return p
+
+
+def _rows(table):
+    return [tuple(row) for row in zip(*table._columns)]
+
+
+def test_count_star_scalar(agg_path):
+    result = query_file(agg_path, "select count(*) from input")
+    assert result.column_names == ("COUNT(*)",)
+    assert result.schema.columns == (ColumnSchema("COUNT(*)", "int64"),)
+    assert result.column("COUNT(*)") == [6]
+
+
+def test_count_star_ignores_where_only(agg_path):
+    result = query_file(agg_path, "select count(*) from input where id > 3")
+    assert result.column("COUNT(*)") == [3]
+
+
+def test_count_column_ignores_nulls(agg_path):
+    result = query_file(agg_path, "select count(n), count(f), count(g) from input")
+    assert _rows(result) == [(4, 5, 5)]
+    # Every count column is a non-nullable int64.
+    assert result.schema.columns == (
+        ColumnSchema("COUNT(n)", "int64"),
+        ColumnSchema("COUNT(f)", "int64"),
+        ColumnSchema("COUNT(g)", "int64"),
+    )
+
+
+def test_sum_int_keeps_int_type(agg_path):
+    result = query_file(agg_path, "select sum(n) from input")
+    assert result.schema.columns == (ColumnSchema("SUM(n)", "int64", nullable=True),)
+    assert result.column("SUM(n)") == [90]
+
+
+def test_sum_float_returns_float(agg_path):
+    result = query_file(agg_path, "select sum(f) from input")
+    assert result.schema.columns == (ColumnSchema("SUM(f)", "float64", nullable=True),)
+    assert result.column("SUM(f)") == [15.0]
+
+
+def test_avg_always_float(agg_path):
+    result = query_file(agg_path, "select avg(n), avg(f) from input")
+    assert [c.type for c in result.schema.columns] == ["float64", "float64"]
+    assert result.column("AVG(n)") == [22.5]
+    assert result.column("AVG(f)") == [3.0]
+
+
+def test_min_max_all_types(agg_path):
+    result = query_file(agg_path, "select min(n), max(n), min(f), max(f), min(g), max(g), min(b), max(b) from input")
+    assert [(c.name, c.type, c.nullable) for c in result.schema.columns] == [
+        ("MIN(n)", "int64", True),
+        ("MAX(n)", "int64", True),
+        ("MIN(f)", "float64", True),
+        ("MAX(f)", "float64", True),
+        ("MIN(g)", "utf8", True),
+        ("MAX(g)", "utf8", True),
+        ("MIN(b)", "bool", True),
+        ("MAX(b)", "bool", True),
+    ]
+    assert _rows(result) == [(10, 40, -0.5, 10.0, "a", "c", False, True)]
+
+
+def test_function_names_case_insensitive_and_uppercased(agg_path):
+    result = query_file(agg_path, "select CoUnT(*) from input")
+    assert result.column_names == ("COUNT(*)",)
+    result = query_file(agg_path, 'select AvG("n") from input')
+    assert result.column_names == ("AVG(n)",)
+
+
+def test_scalar_aggregates_combine_in_select_order(agg_path):
+    result = query_file(agg_path, "select max(n), count(*), avg(f), min(g) from input")
+    assert result.column_names == ("MAX(n)", "COUNT(*)", "AVG(f)", "MIN(g)")
+    assert _rows(result) == [(40, 6, 3.0, "a")]
+
+
+def test_empty_filter_scalar_returns_one_row(agg_path):
+    result = query_file(
+        agg_path,
+        "select count(*), count(n), sum(n), avg(n), min(n), max(n), sum(f), avg(f) from input where id > 1000",
+    )
+    assert result.row_count == 1
+    assert _rows(result) == [(0, 0, None, None, None, None, None, None)]
+    # COUNT columns stay non-nullable; everything else is nullable.
+    assert [c.nullable for c in result.schema.columns] == [
+        False, False, True, True, True, True, True, True
+    ]
+
+
+def test_scalar_aggregation_on_empty_file(tmp_path):
+    p = tmp_path / "empty.caef"
+    write_file(p, Table(AGG_SCHEMA, {name: [] for name in AGG_SCHEMA.names}))
+    result = query_file(p, "select count(*), count(n), sum(n), avg(n), min(n), max(n) from input")
+    assert result.row_count == 1
+    assert _rows(result) == [(0, 0, None, None, None, None)]
+
+
+def test_no_group_by_plain_column_without_aggregate_unchanged(agg_path):
+    # No aggregate and no GROUP BY stays a plain projection.
+    result = query_file(agg_path, "select id from input where id <= 2 order by id desc")
+    assert result.column("id") == [2, 1]
+
+
+def test_no_group_by_rejects_plain_columns_with_aggregate(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select id, count(*) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, max(n), n from input")
+
+
+def test_no_group_by_requires_an_aggregate_when_aggregating(agg_path):
+    # A plain-only select is fine, but mixing is the forbidden case above.
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, n from input group by g")
+
+
+def test_aggregate_argument_types(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select sum(g) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select avg(g) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select sum(b) from input")
+    # MIN/MAX accept every type.
+    result = query_file(agg_path, "select min(g), max(b), min(f), max(n) from input")
+    assert result.row_count == 1
+
+
+def test_aggregate_unknown_column(agg_path):
+    for fn in ("count", "sum", "avg", "min", "max"):
+        with pytest.raises(QueryValidationError):
+            query_file(agg_path, f"select {fn}(missing) from input")
+
+
+def test_star_only_valid_for_count(agg_path):
+    for fn in ("sum", "avg", "min", "max"):
+        with pytest.raises(QuerySyntaxError):
+            query_file(agg_path, f"select {fn}(*) from input")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select count() from input",
+        "select count(a, b) from input",
+        "select count(*) over () from input",
+        "select count from input",
+        "select avg( ) from input",
+        "select count(1) from input",
+        "select count('x') from input",
+        "select min(n",
+        "select max n) from input",
+        "select count(*) , from input",
+        "select count(*) from input group by",
+        "select count(*) from input group by g,",
+        "select count(*) from input where id = 1 group",
+        "select count(*) from input where id = 1 group g",
+        "select count(*) from input order g",
+        "select count(*) from input group by g limit 1 order by g",
+        "select count(*) from input group by g group by n",
+    ],
+)
+def test_aggregate_syntax_errors(agg_path, sql):
+    with pytest.raises(QuerySyntaxError):
+        query_file(agg_path, sql)
+
+
+def test_aggregates_not_allowed_in_where(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select id from input where count(*) > 0")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input where sum(n) > 1")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input where n > min(n)")
+
+
+def test_nested_aggregates_rejected(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select sum(count(*)) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select max(sum(n)) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, count(*) from input group by g order by sum(count(*))")
+
+
+def test_aggregate_aliases_rejected_as_validation(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) as c from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) c from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select sum(n) total from input")
+
+
+def test_duplicate_aggregate_result_columns(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*), count(*) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select sum(n), avg(n), sum(n) from input")
+
+
+def test_duplicate_group_column(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input group by g, g")
+
+
+def test_unknown_group_by_column(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input group by missing")
+
+
+def test_int64_sum_overflow(tmp_path):
+    schema = Schema([ColumnSchema("n", "int64")])
+    p = tmp_path / "big.caef"
+    write_file(p, Table(schema, {"n": [2**63 - 1, 1]}))
+    with pytest.raises(QueryValidationError):
+        query_file(p, "select sum(n) from input")
+    # The boundary sum itself is representable.
+    p2 = tmp_path / "boundary.caef"
+    write_file(p2, Table(schema, {"n": [2**63 - 2, 1]}))
+    assert query_file(p2, "select sum(n) from input").column("SUM(n)") == [2**63 - 1]
+
+
+def test_int64_sum_negative_overflow(tmp_path):
+    schema = Schema([ColumnSchema("n", "int64")])
+    p = tmp_path / "neg.caef"
+    write_file(p, Table(schema, {"n": [-(2**63), -1]}))
+    with pytest.raises(QueryValidationError):
+        query_file(p, "select sum(n) from input")
+
+
+def test_float_sum_non_finite(tmp_path):
+    schema = Schema([ColumnSchema("f", "float64", nullable=True)])
+    p = tmp_path / "huge.caef"
+    write_file(p, Table(schema, {"f": [1e308, 1e308]}))
+    with pytest.raises(QueryValidationError):
+        query_file(p, "select sum(f) from input")
+    with pytest.raises(QueryValidationError):
+        query_file(p, "select avg(f) from input")
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: GROUP BY
+# ---------------------------------------------------------------------------
+
+
+def test_group_by_basic(agg_path):
+    result = query_file(agg_path, "select g, count(*), sum(n) from input group by g")
+    assert result.column_names == ("g", "COUNT(*)", "SUM(n)")
+    assert _rows(result) == [("a", 3, 60), ("b", 1, None), (None, 1, 30), ("c", 1, None)]
+
+
+def test_group_by_first_row_order(agg_path):
+    # g first appears as a(1), b(2), NULL(3), c(5); no ORDER BY keeps that order.
+    result = query_file(agg_path, "select g, count(*) from input group by g")
+    assert result.column("g") == ["a", "b", None, "c"]
+
+
+def test_null_key_is_one_group(agg_path):
+    result = query_file(
+        agg_path, "select n, count(*) from input group by n order by count(*) desc, n asc nulls first"
+    )
+    # n: 10, NULL, 30, 40, NULL, 10 -> NULL(2),10(2),30(1),40(1)
+    assert _rows(result) == [(None, 2), (10, 2), (30, 1), (40, 1)]
+
+
+def test_group_by_multiple_columns(agg_path):
+    result = query_file(
+        agg_path, "select g, b, count(*) from input group by g, b order by g nulls first, b"
+    )
+    assert _rows(result) == [
+        (None, True, 1),
+        ("a", False, 2),
+        ("a", True, 1),
+        ("b", False, 1),
+        ("c", True, 1),
+    ]
+
+
+def test_group_by_preserves_group_column_schema(agg_path):
+    result = query_file(agg_path, "select g, n, count(*) from input group by g, n")
+    by_name = {c.name: c for c in result.schema.columns}
+    assert (by_name["g"].type, by_name["g"].nullable) == ("utf8", True)
+    assert (by_name["n"].type, by_name["n"].nullable) == ("int64", True)
+
+
+def test_group_by_column_need_not_be_selected(agg_path):
+    result = query_file(agg_path, "select count(*) from input group by g")
+    assert result.column_names == ("COUNT(*)",)
+    assert result.column("COUNT(*)") == [3, 1, 1, 1]  # a, b, NULL, c first-row order
+
+
+def test_group_by_where_runs_first(agg_path):
+    result = query_file(
+        agg_path, "select g, count(*) from input where id >= 3 group by g"
+    )
+    # surviving rows: 3(NULL),4(a),5(c),6(a)
+    assert _rows(result) == [(None, 1), ("a", 2), ("c", 1)]
+
+
+def test_group_by_empty_filter_returns_zero_rows(agg_path):
+    result = query_file(
+        agg_path, "select g, count(*) from input where id > 1000 group by g"
+    )
+    assert result.row_count == 0
+    assert result.column_names == ("g", "COUNT(*)")
+    assert result.columns == {"g": [], "COUNT(*)": []}
+
+
+def test_grouped_plain_column_must_be_grouped(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, n, count(*) from input group by g")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select id, count(*) from input group by g")
+
+
+def test_star_cannot_mix_with_grouping(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select * from input group by g")
+    # SELECT *, aggregate is a syntax error (star cannot be followed by more items).
+    with pytest.raises(QuerySyntaxError):
+        query_file(agg_path, "select *, count(*) from input")
+
+
+def test_duplicate_grouped_result_columns(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, g from input group by g")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, g, count(*) from input group by g")
+
+
+def test_group_by_aggregate_within_group_nulls_ignored(agg_path):
+    # Group 'b' has n NULL only -> COUNT(n)=0 and other aggs NULL.
+    result = query_file(
+        agg_path,
+        "select g, count(n), sum(n), avg(n), min(n), max(n) from input group by g order by g nulls first",
+    )
+    rows = dict((row[0], row[1:]) for row in _rows(result))
+    assert rows["b"] == (0, None, None, None, None)
+    assert rows["a"] == (3, 60, 20.0, 10, 40)
+    assert rows[None] == (1, 30, 30.0, 30, 30)
+
+
+def test_group_by_int_overflow_per_group(tmp_path):
+    schema = Schema([
+        ColumnSchema("g", "utf8"),
+        ColumnSchema("n", "int64"),
+    ])
+    p = tmp_path / "g.caef"
+    write_file(
+        p,
+        Table(
+            schema,
+            {"g": ["a", "a", "b", "b"], "n": [2**63 - 1, 1, 1, 2]},
+        ),
+    )
+    with pytest.raises(QueryValidationError):
+        query_file(p, "select g, sum(n) from input group by g")
+    # Group 'b' alone aggregates fine.
+    result = query_file(p, "select g, sum(n) from input where g = 'b' group by g")
+    assert _rows(result) == [("b", 3)]
+
+
+def test_group_by_min_max_types(tmp_path):
+    schema = Schema([
+        ColumnSchema("g", "utf8"),
+        ColumnSchema("f", "float64", nullable=True),
+        ColumnSchema("b", "bool"),
+        ColumnSchema("s", "utf8", nullable=True),
+    ])
+    p = tmp_path / "m.caef"
+    write_file(
+        p,
+        Table(
+            schema,
+            {
+                "g": ["x", "x", "y"],
+                "f": [1.5, 0.25, -2.0],
+                "b": [True, False, True],
+                "s": ["z", "a", "m"],
+            },
+        ),
+    )
+    result = query_file(
+        p, "select g, min(f), max(f), min(b), max(b), min(s), max(s) from input group by g order by g"
+    )
+    assert _rows(result) == [
+        ("x", 0.25, 1.5, False, True, "a", "z"),
+        ("y", -2.0, -2.0, True, True, "m", "m"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: ORDER BY / LIMIT over results
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_order_by_grouped_column(agg_path):
+    result = query_file(
+        agg_path, "select g, count(*) from input group by g order by g nulls first"
+    )
+    assert result.column("g") == [None, "a", "b", "c"]
+
+
+def test_aggregate_order_by_aggregate(agg_path):
+    result = query_file(
+        agg_path, "select g, count(*) from input group by g order by count(*) desc, g"
+    )
+    assert _rows(result) == [("a", 3), ("b", 1), ("c", 1), (None, 1)]
+
+
+def test_aggregate_order_by_nulls_first_last(agg_path):
+    last = query_file(
+        agg_path, "select g, count(*) from input group by g order by g"
+    )
+    assert last.column("g") == ["a", "b", "c", None]
+    first = query_file(
+        agg_path, "select g, count(*) from input group by g order by g desc nulls first"
+    )
+    assert first.column("g") == [None, "c", "b", "a"]
+
+
+def test_aggregate_order_by_must_reference_selected_result(agg_path):
+    # A grouped column not projected cannot be ordered by.
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input group by g order by g")
+    # An aggregate not projected cannot be ordered by.
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, count(*) from input group by g order by sum(n)")
+    # Scalar aggregate ordering by a source column is invalid.
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select count(*) from input order by id")
+    # An aggregate in a plain (non-aggregate) query is not a selectable result.
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select id from input order by count(*)")
+
+
+def test_aggregate_order_by_repeats_selected_aggregate(agg_path):
+    # Same aggregate text resolves to the single projected column.
+    # SUM(n): a=60, b=NULL, NULL-key group=30, c=NULL.
+    result = query_file(
+        agg_path, "select sum(n) from input group by g order by sum(n) desc nulls first"
+    )
+    assert result.column_names == ("SUM(n)",)
+    assert result.column("SUM(n)") == [None, None, 60, 30]
+
+
+def test_aggregate_order_by_unknown_column(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, count(*) from input group by g order by missing")
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select g, count(*) from input group by g order by avg(missing)")
+
+
+def test_aggregate_order_by_duplicate(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(
+            agg_path, "select g, count(*) from input group by g order by g, g"
+        )
+    with pytest.raises(QueryValidationError):
+        query_file(
+            agg_path,
+            "select g, count(*) from input group by g order by count(*), count(*)",
+        )
+
+
+def test_aggregate_limit_after_sorting(agg_path):
+    result = query_file(
+        agg_path,
+        "select g, count(*) from input group by g order by g limit 2",
+    )
+    assert _rows(result) == [("a", 3), ("b", 1)]
+    result = query_file(
+        agg_path,
+        "select g, count(*) from input group by g order by count(*) desc, g limit 1",
+    )
+    assert _rows(result) == [("a", 3)]
+
+
+def test_scalar_aggregate_limit(agg_path):
+    result = query_file(agg_path, "select count(*) from input limit 0")
+    assert result.row_count == 0
+    assert result.column_names == ("COUNT(*)",)
+    result = query_file(agg_path, "select count(*) from input limit 5")
+    assert result.column("COUNT(*)") == [6]
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: determinism and CLI
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_result_deterministic_bytes(agg_path):
+    import contextlib
+    import io
+
+    sql = "select g, count(*), sum(n), avg(f) from input group by g order by g nulls first"
+    outs = set()
+    for _ in range(3):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert main(["query", str(agg_path), sql]) == 0
+        outs.add(buf.getvalue())
+    assert len(outs) == 1
+
+
+def test_cli_scalar_aggregate_json(tmp_path, capsys, agg_path):
+    code = main(["query", str(agg_path), "select count(*), avg(n) from input where g = 'a'"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["columns"] == [
+        {"name": "COUNT(*)", "type": "int64", "nullable": False},
+        {"name": "AVG(n)", "type": "float64", "nullable": True},
+    ]
+    assert payload["rows"] == [[3, 20.0]]
+
+
+def test_cli_grouped_empty_filter(tmp_path, capsys, agg_path):
+    code = main(
+        ["query", str(agg_path), "select g, count(*) from input where id > 9 group by g"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["columns"] == [
+        {"name": "g", "type": "utf8", "nullable": True},
+        {"name": "COUNT(*)", "type": "int64", "nullable": False},
+    ]
+    assert payload["rows"] == []
+
+
+def test_cli_aggregate_validation_error_exit_code(tmp_path, capsys, agg_path):
+    code = main(["query", str(agg_path), "select sum(g) from input"])
+    assert code == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_aggregate_syntax_error_exit_code(tmp_path, capsys, agg_path):
+    code = main(["query", str(agg_path), "select count(*) from input group by"])
+    assert code == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_star_with_group_by_is_validation_error(agg_path):
+    with pytest.raises(QueryValidationError):
+        query_file(agg_path, "select * from input where id = 1 group by id")
 
 
 # ---------------------------------------------------------------------------

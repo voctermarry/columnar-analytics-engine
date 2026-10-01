@@ -3,8 +3,8 @@
 本项目是「列式分析型数据库引擎」的代码仓库，用于逐步实现该方向的列式存储、查询执行与结果对账能力。
 
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
-（`SELECT` 投影、`WHERE` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；
-查询只读取文件、不修改文件。
+（`SELECT` 投影、聚合与 `GROUP BY` 分组、`WHERE` 过滤、`ORDER BY` 稳定排序与
+`LIMIT` Top-N）；查询只读取文件、不修改文件。
 
 ## 环境与安装
 
@@ -36,12 +36,14 @@ columnar-analytics-engine --help                        # 打印用法
 格式错误时向标准错误输出消息并以码 2 退出；路径等系统错误以码 1 退出。
 
 `query` 对单个文件执行一条
-`SELECT ... FROM input [WHERE ...] [ORDER BY ...] [LIMIT n]` 语句，以单行
-UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`columns` 按结果顺序
-列出每列的 `name`、`type`、`nullable`，`rows` 是同序值数组的数组。空结果保留列
-描述且 `rows` 为空；同一文件与 SQL 重复执行输出字节一致。语法错误
+`SELECT ... FROM input [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`
+语句，以单行 UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`columns`
+按结果顺序列出每列的 `name`、`type`、`nullable`，`rows` 是同序值数组的数组。
+空结果保留列描述且 `rows` 为空；同一文件与 SQL 重复执行输出字节一致。语法错误
 （`QuerySyntaxError`）、校验错误（`QueryValidationError`）与文件格式错误
 （`ColumnarFormatError`）向标准错误输出消息并以码 2 退出；系统错误以码 1 退出。
+无 `GROUP BY` 的聚合在筛选为空时仍返回一行（`COUNT` 为 0，其余为 `NULL`）；
+有 `GROUP BY` 时返回零行。
 
 ## Python 公开接口
 
@@ -88,17 +90,35 @@ hits = query_file(
 SQL 子集（关键字大小写不敏感）：
 
 ```sql
-SELECT * | 列名 [, 列名 ...]
+SELECT * | 投影项 [, 投影项 ...]
 FROM input
 [WHERE 表达式]
-[ORDER BY 列名 [ASC | DESC] [NULLS FIRST | NULLS LAST] [, ...]]
+[GROUP BY 列名 [, 列名 ...]]
+[ORDER BY 排序项 [, ...]]
 [LIMIT 无符号整数]
+
+投影项 := 列名 | 聚合
+聚合   := COUNT(*) | COUNT/SUM/AVG/MIN/MAX ( 列名 )
+排序项 := 列名 | 聚合，后接 [ASC | DESC] [NULLS FIRST | NULLS LAST]
 ```
 
-- 投影只允许星号或逗号分隔的列名，不支持别名；重复列、未知列抛
-  `QueryValidationError`。`FROM` 只接受固定表名 `input`（裸写大小写不敏感）。
-  列名与 schema 中的 Unicode 字符精确匹配；需要时可用双引号包裹标识符
+- 投影只允许星号或逗号分隔的列名/聚合，不支持别名（聚合上的别名抛
+  `QueryValidationError`）；结果列或分组列重复、未知列、普通列未分组、聚合参数
+  类型非法抛 `QueryValidationError`。`FROM` 只接受固定表名 `input`（裸写大小写
+  不敏感）。列名与 schema 中的 Unicode 字符精确匹配；需要时可用双引号包裹标识符
   （内部用 `""` 转义一个双引号）。
+- 无 `GROUP BY` 时投影只能包含聚合表达式（对全部入选行聚合成一行）；有 `GROUP BY`
+  时可额外选择分组列，普通列必须已在 `GROUP BY` 中；星号不得与聚合或分组混用。
+  不支持嵌套聚合，`WHERE` 内也不允许出现聚合，二者均抛 `QueryValidationError`。
+- `COUNT(*)` 计入选行数、`COUNT(列)` 忽略 `NULL`，二者都是非空 int64。`SUM`、
+  `AVG` 只接受 int64/float64 并忽略 `NULL`：`SUM` 保持入参类型（int64 求和越界抛
+  `QueryValidationError`），`AVG` 输出 float64；`MIN`、`MAX` 接受全部四种类型并
+  沿用既有比较规则。除 `COUNT` 外，聚合在没有非 `NULL` 输入时返回 `NULL`，结果列
+  nullable。聚合结果列名为大写函数名加括号（如 `COUNT(*)`、`SUM(n)`）。
+- `WHERE` 先按三值逻辑筛选，再按 `GROUP BY` 列顺序成键；`NULL` 键归为同一组。
+  没有 `ORDER BY` 时分组按各自首条入选行在文件中的顺序输出；筛选为空且无
+  `GROUP BY` 时仍返回一行（`COUNT` 为 0，其余聚合为 `NULL`），有 `GROUP BY` 时
+  返回零行。float64 聚合得到非有限值时抛 `QueryValidationError`。
 - `WHERE` 支持括号、`NOT`、`AND`、`OR`、`=`、`!=`、`<`、`<=`、`>`、`>=`、
   `IS NULL`、`IS NOT NULL`；优先级从高到低为 `NOT`、比较、`AND`、`OR`。
   操作数仅限列引用与字面量：`TRUE`/`FALSE`、int64 整数、有限 float64 数
@@ -106,19 +126,20 @@ FROM input
 - int64 与 float64 可互比，utf8 只与 utf8 比较，bool 只支持 `=`/`!=`；
   不兼容组合抛 `QueryValidationError`。
 - 遵循 SQL 三值逻辑：普通比较遇到 NULL 得 UNKNOWN，逻辑运算继续传播 UNKNOWN，
-  只有 TRUE 的行进入结果；省略 `WHERE` 保留全部行。
-- `ORDER BY` 的排序项是一个或多个逗号分隔的列标识符（无需出现在投影中，
-  按 schema 精确匹配；未知列或同一 `ORDER BY` 中的重复列抛
-  `QueryValidationError`）。多列按书写顺序比较：int64/float64 按数值、
-  utf8 按 Unicode 码点、bool 按 `FALSE < TRUE`；全部排序键相等的行保持文件
-  中的相对顺序。省略方向为 `ASC`；省略 `NULLS` 时不论方向 NULL 都排在末尾，
-  显式 `NULLS FIRST`/`NULLS LAST` 覆盖默认值。
-- `LIMIT` 只接受 `0` 至 `9223372036854775807` 的无符号十进制整数，可独立出现；
-  `0` 返回保留列描述的空表，大于入选行数时返回全部行。执行顺序固定为
-  `WHERE` → 排序 → `LIMIT` → 投影；没有 `ORDER BY` 时保持文件原始行序。
-- 语法不完整、修饰词错位或重复、子句乱序或重复、`LIMIT` 缺值/负数/小数/越界
-  等统一抛 `QuerySyntaxError`，且在访问文件之前识别；文件损坏仍抛
-  `ColumnarFormatError`，系统错误保留 `OSError`。
+  只有 TRUE 的行进入聚合/结果；省略 `WHERE` 保留全部行。
+- `ORDER BY` 的排序项是一个或多个逗号分隔的列标识符或聚合表达式。非聚合查询的
+  排序列无需出现在投影中（按 schema 精确匹配）；聚合查询只能引用已选择的分组列
+  或重复已选择的聚合表达式，否则抛 `QueryValidationError`。多列按书写顺序比较：
+  int64/float64 按数值、utf8 按 Unicode 码点、bool 按 `FALSE < TRUE`；全部排序键
+  相等的行保持既有相对顺序。省略方向为 `ASC`；省略 `NULLS` 时不论方向 NULL 都排
+  在末尾，显式 `NULLS FIRST`/`NULLS LAST` 覆盖默认值。
+- `LIMIT` 只接受 `0` 至 `9223372036854775807` 的无符号十进制整数，在排序之后
+  执行；`0` 返回保留列描述的空表，大于结果行数时返回全部行。非聚合查询执行顺序为
+  `WHERE` → 排序 → `LIMIT` → 投影，聚合查询为 `WHERE` → 分组/聚合 → 排序 →
+  `LIMIT`；没有 `ORDER BY` 时保持文件（或分组首行）顺序。
+- 语法不完整、函数括号或参数个数错误、`GROUP BY` 空列表、修饰词错位或重复、子句
+  乱序或重复、`LIMIT` 缺值/负数/小数/越界等统一抛 `QuerySyntaxError`，且在访问
+  文件之前识别；文件损坏仍抛 `ColumnarFormatError`，系统错误保留 `OSError`。
 
 ## 文件格式概览
 
@@ -130,6 +151,7 @@ FROM input
 
 ## 限制
 
-- SQL 仅支持单文件查询：`SELECT`（星号/列名投影）+ 固定表名 `input` + 可选
-  `WHERE`、`ORDER BY`、`LIMIT`；不支持别名、表达式投影、连接、聚合等。
+- SQL 仅支持单文件查询：`SELECT`（星号/列名/聚合投影）+ 固定表名 `input` + 可选
+  `WHERE`、`GROUP BY`、`ORDER BY`、`LIMIT`；不支持别名、表达式投影、连接，也不
+  支持嵌套聚合或 `WHERE` 内聚合。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
