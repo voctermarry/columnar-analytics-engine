@@ -6,15 +6,17 @@ Public API:
   against one columnar file and return a :class:`~columnar_analytics.format.Table`
 * :class:`QuerySyntaxError` -- lexical / grammatical errors
 * :class:`QueryValidationError` -- unknown columns, wrong table name,
-  type-incompatible comparisons
+  type-incompatible comparisons, invalid aggregate use
 
 The accepted grammar (keywords case-insensitive)::
 
-    query       := SELECT ('*' | ident (',' ident)*)
-                   FROM ident [WHERE expr]
-                   [ORDER BY sort_item (',' sort_item)*]
+    query       := SELECT select_item (',' select_item)*
+                   FROM ident [WHERE expr] [GROUP BY ident (',' ident)*]
+                   [ORDER BY order_item (',' order_item)*]
                    [LIMIT uint]
-    sort_item   := ident [ASC | DESC] [NULLS FIRST | NULLS LAST]
+    select_item := '*' | ident | agg_name '(' ('*' | ident) ')'
+    order_item  := (ident | agg_name '(' ('*' | ident) ')')
+                   [ASC | DESC] [NULLS FIRST | NULLS LAST]
     expr       := or_expr
     or_expr     := and_expr (OR and_expr)*
     and_expr    := cmp_expr (AND cmp_expr)*
@@ -26,18 +28,28 @@ The accepted grammar (keywords case-insensitive)::
     literal     := TRUE | FALSE | [+-]? int64 | [+-]? finite float64
                    | single-quoted utf8
 
+The supported aggregates are ``COUNT(*)``, ``COUNT(ident)`` and
+``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` applied to one column.  Without
+GROUP BY the projection may contain aggregate expressions only; with
+GROUP BY it may additionally contain the grouped columns.  A bare ``*``
+must not be mixed with aggregates or grouping.  Aggregates are not
+allowed inside WHERE, may not be nested, and aliases are not supported.
+
 Operator precedence (highest first) is NOT, comparison, AND, OR; IS [NOT]
 NULL is a postfix of its atom.  Comparison operands must be column
 references or literals.  WHERE follows SQL three-valued logic: a normal
 comparison against NULL yields UNKNOWN, UNKNOWN propagates through the
 logical operators, and only TRUE rows are returned.
 
-After WHERE, rows may be sorted by one or more columns (which need not
-appear in the projection): ASC is the default, NULLs sort last regardless
-of direction unless NULLS FIRST / NULLS LAST is given, and rows equal on
-every sort key keep their file order.  LIMIT then keeps the first N rows
-of the filtered, sorted stream.  Without ORDER BY the original row order
-is preserved.
+After WHERE, rows are grouped in GROUP BY column order (a NULL key forms
+its own group); without an explicit ORDER BY groups come out in the order
+of their first selected row.  ORDER BY may only name selected grouped
+columns or selected aggregate expressions; ASC is the default, NULLs sort
+last regardless of direction unless NULLS FIRST / NULLS LAST is given, and
+groups equal on every sort key keep that first-row order.  LIMIT then
+keeps the first N groups.  Without GROUP BY and aggregates an aggregate
+query over zero selected rows still yields one output row (COUNT 0, the
+other aggregates NULL); with GROUP BY it yields zero rows.
 """
 
 from __future__ import annotations
@@ -48,7 +60,7 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
 
-from .format import Schema, Table, read_file
+from .format import ColumnSchema, Schema, Table, read_file
 
 __all__ = [
     "QuerySyntaxError",
@@ -76,8 +88,15 @@ _KEYWORDS = frozenset(
         "first",
         "last",
         "limit",
+        "group",
     )
 )
+
+# Aggregate function names are ordinary (case-insensitive) identifiers that
+# gain call syntax only in the projection and ORDER BY.
+_AGG_NAMES = frozenset(("count", "sum", "avg", "min", "max"))
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 class QuerySyntaxError(Exception):
@@ -256,24 +275,46 @@ def _parse_number(text: str) -> int | float:
 #   ("not", operand)
 #   ("and"|"or", left, right)
 # Predicate nodes are boolean-typed (three-valued at evaluation time).
+#
+# Projection / ORDER BY reference items:
+#   ("column_ref", name)                 -- a plain column name
+#   ("agg", func_upper, arg_name|None)   -- an aggregate call; arg None = '*'
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class _OrderItem:
-    name: str
-    descending: bool
-    nulls_first: bool | None  # None -> the default (NULLs last, either direction)
+class _RefItem:
+    """One projection element or ORDER BY key as parsed."""
+
+    kind: str  # "star" | "column" | "agg"
+    name: str | None = None  # column name for kind == "column"
+    func: str | None = None  # uppercase function name for kind == "agg"
+    arg: str | None = None  # aggregate column argument; "" stands for '*'
+    descending: bool = False
+    nulls_first: bool | None = None  # None -> default (NULLs last)
 
 
 @dataclass
 class _Select:
-    columns: tuple[str, ...] | None  # None means '*'
+    items: tuple[_RefItem, ...]  # projection; may be a single ("star",) item
     table: str
     table_quoted: bool
     where: tuple | None
-    order_by: tuple[_OrderItem, ...] | None
+    group_by: tuple[str, ...] | None
+    order_by: tuple[_RefItem, ...] | None
     limit: int | None
+
+    @property
+    def star(self) -> bool:
+        return len(self.items) == 1 and self.items[0].kind == "star"
+
+    @property
+    def has_aggregate(self) -> bool:
+        return any(item.kind == "agg" for item in self.items)
+
+    @property
+    def is_aggregate_query(self) -> bool:
+        return self.has_aggregate or self.group_by is not None
 
 
 class _Parser:
@@ -292,36 +333,69 @@ class _Parser:
 
     def _parse_select(self) -> _Select:
         self._expect_keyword("select")
-        if self._accept("star"):
-            columns: tuple[str, ...] | None = None
-        else:
-            columns = tuple(self._parse_projection())
+        items = tuple(self._parse_projection())
         self._expect_keyword("from")
         table_tok = self._expect_table_name()
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
+        group_by = None
+        if self._accept_keyword("group"):
+            self._expect_keyword("by")
+            names = [self._expect_identifier_name()]
+            while self._accept_op(","):
+                names.append(self._expect_identifier_name())
+            group_by = tuple(names)
         order_by = None
         if self._accept_keyword("order"):
             self._expect_keyword("by")
-            items = [self._parse_order_item()]
+            order_items = [self._parse_order_item()]
             while self._accept_op(","):
-                items.append(self._parse_order_item())
-            order_by = tuple(items)
+                order_items.append(self._parse_order_item())
+            order_by = tuple(order_items)
         limit = None
         if self._accept_keyword("limit"):
             limit = self._parse_limit()
         return _Select(
-            columns=columns,
+            items=items,
             table=table_tok.value,
             table_quoted=table_tok.kind == "qident",
             where=where,
+            group_by=group_by,
             order_by=order_by,
             limit=limit,
         )
 
-    def _parse_order_item(self) -> _OrderItem:
-        name = self._expect_identifier_name()
+    def _parse_projection(self) -> list[_RefItem]:
+        items = [self._parse_select_item()]
+        while self._accept_op(","):
+            items.append(self._parse_select_item())
+        # Aliases are not supported; a trailing identifier (including the
+        # spelling "as") where FROM is expected names one.  Plain queries keep
+        # their historical QuerySyntaxError classification; aggregate queries
+        # treat the unsupported alias as a validation error.
+        tok = self._peek()
+        if tok.kind in ("ident", "qident"):
+            grouped_ahead = any(
+                t.kind == "keyword" and t.value == "group"
+                for t in self.tokens[self.pos :]
+            )
+            if any(item.kind == "agg" for item in items) or grouped_ahead:
+                raise QueryValidationError(
+                    f"aliases are not supported; unexpected {tok.text!r} after projection item"
+                )
+            raise QuerySyntaxError(f"expected FROM, got {tok.text!r}")
+        return items
+
+    def _parse_select_item(self) -> _RefItem:
+        tok = self._peek()
+        if tok.kind == "star":
+            self._next()
+            return _RefItem("star")
+        return self._parse_column_or_agg()
+
+    def _parse_order_item(self) -> _RefItem:
+        item = self._parse_column_or_agg()
         descending = False
         if self._accept_keyword("asc"):
             descending = False
@@ -338,7 +412,59 @@ class _Parser:
                 raise QuerySyntaxError(
                     f"expected FIRST or LAST after NULLS, got {tok.text!r}"
                 )
-        return _OrderItem(name, descending, nulls_first)
+        return _RefItem(
+            item.kind,
+            name=item.name,
+            func=item.func,
+            arg=item.arg,
+            descending=descending,
+            nulls_first=nulls_first,
+        )
+
+    def _parse_column_or_agg(self) -> _RefItem:
+        tok = self._peek()
+        if tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        # A quoted identifier, or a bare word not spelled like an aggregate,
+        # can only be a plain column reference.
+        if tok.kind == "qident" or tok.value.lower() not in _AGG_NAMES:
+            self._next()
+            return _RefItem("column", name=tok.value)
+        func = tok.value.lower()
+        self._next()  # consume the function name
+        if not self._accept_op("("):
+            # e.g. a column literally named "count" -- the name token is
+            # already consumed, so it is a plain column reference.
+            return _RefItem("column", name=tok.value)
+        self._parse_aggregate_args(func)
+        self._expect_op(")")
+        return _RefItem("agg", func=func.upper(), arg=self._agg_arg)
+
+    def _parse_aggregate_args(self, func: str) -> None:
+        # Exactly one argument: '*' for COUNT, otherwise one identifier.
+        tok = self._peek()
+        if tok.kind == "star":
+            if func != "count":
+                raise QuerySyntaxError(f"{func.upper()} does not accept '*'")
+            self._next()
+            self._agg_arg = ""
+            return
+        if tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(
+                f"{func.upper()} requires one column argument, got {tok.text!r}"
+            )
+        self._next()
+        nxt = self._peek()
+        if nxt.kind == "op" and nxt.value == "(":
+            if tok.kind == "ident" and tok.value.lower() in _AGG_NAMES:
+                raise QueryValidationError(
+                    f"aggregate functions must not be nested: "
+                    f"{func.upper()}({tok.value.upper()}(...))"
+                )
+            raise QuerySyntaxError(
+                f"{func.upper()} argument must be a column name, not a function call"
+            )
+        self._agg_arg = tok.value
 
     def _parse_limit(self) -> int:
         tok = self._peek()
@@ -354,12 +480,6 @@ class _Parser:
                 f"LIMIT value {tok.value} is outside the allowed range"
             )
         return tok.value
-
-    def _parse_projection(self) -> list[str]:
-        names = [self._expect_identifier_name()]
-        while self._accept_op(","):
-            names.append(self._expect_identifier_name())
-        return names
 
     def _expect_table_name(self) -> _Token:
         tok = self._peek()
@@ -452,6 +572,16 @@ class _Parser:
         if tok.kind in ("ident", "qident"):
             if sign == -1:
                 raise QuerySyntaxError("column reference cannot be negated")
+            nxt = self.tokens[self.pos + 1]
+            if (
+                tok.kind == "ident"
+                and tok.value.lower() in _AGG_NAMES
+                and nxt.kind == "op"
+                and nxt.value == "("
+            ):
+                raise QueryValidationError(
+                    f"aggregate {tok.value.upper()}(...) is not allowed in WHERE"
+                )
             self._next()
             return ("column", tok.value, None, None, None)
         if tok.kind == "keyword":
@@ -506,11 +636,23 @@ class _Parser:
 # ---------------------------------------------------------------------------
 
 
-def _bind_select(
-    select: _Select, schema: Schema
-) -> tuple[
-    tuple[int, ...], tuple | None, tuple[tuple[int, bool, bool], ...] | None
-]:
+@dataclass(frozen=True)
+class _BoundItem:
+    """A validated projection element."""
+
+    kind: str  # "column" | "agg"
+    output_name: str
+    # kind == "column":
+    col_index: int = -1
+    # kind == "agg":
+    func: str = ""
+    arg_index: int = -1  # -1 means COUNT(*)
+    arg_type: str = ""
+    out_type: str = ""
+    nullable: bool = True
+
+
+def _bind_select(select: _Select, schema: Schema) -> dict:
     table_matches = (
         select.table == "input"
         if select.table_quoted
@@ -518,12 +660,32 @@ def _bind_select(
     )
     if not table_matches:
         raise QueryValidationError(f"unknown table {select.table!r}; only 'input' is supported")
-    if select.columns is None:
+
+    where = _bind_expr(select.where, schema) if select.where is not None else None
+    if where is not None and where[0] in ("literal", "column"):
+        type_name = _operand_type(where)
+        if type_name != "bool":
+            raise QueryValidationError(
+                f"WHERE clause must be boolean, got {type_name}"
+            )
+
+    if not select.is_aggregate_query:
+        return _bind_plain(select, schema, where)
+    return _bind_aggregate(select, schema, where)
+
+
+def _bind_plain(select: _Select, schema: Schema, where) -> dict:
+    # Non-aggregate path: '*' or a comma-separated list of plain columns.
+    if select.star:
         indices = tuple(range(len(schema.columns)))
     else:
         seen: set[str] = set()
         indices_list: list[int] = []
-        for name in select.columns:
+        for item in select.items:
+            if item.kind == "star":
+                # A star mixed into a plain projection remains grammatical.
+                raise QuerySyntaxError("'*' cannot be mixed with other projection items")
+            name = item.name
             if name in seen:
                 raise QueryValidationError(f"duplicate column in projection: {name!r}")
             seen.add(name)
@@ -532,33 +694,229 @@ def _bind_select(
             except KeyError:
                 raise QueryValidationError(f"unknown column: {name!r}") from None
         indices = tuple(indices_list)
-    where = _bind_expr(select.where, schema) if select.where is not None else None
-    if where is not None and where[0] in ("literal", "column"):
-        type_name = _operand_type(where)
-        if type_name != "bool":
+    order_by = _bind_plain_order_by(select.order_by, schema)
+    return {
+        "mode": "plain",
+        "indices": indices,
+        "where": where,
+        "order_by": order_by,
+    }
+
+
+def _bind_plain_order_by(select_order_by, schema: Schema):
+    if select_order_by is None:
+        return None
+    bound: list[tuple[int, bool, bool]] = []
+    order_seen: set[str] = set()
+    for item in select_order_by:
+        if item.kind == "agg":
             raise QueryValidationError(
-                f"WHERE clause must be boolean, got {type_name}"
+                f"aggregate {item.func}({_arg_label(item)}) may appear in ORDER BY "
+                "only as part of an aggregate query"
             )
-    order_by = None
-    if select.order_by is not None:
-        bound: list[tuple[int, bool, bool]] = []
-        order_seen: set[str] = set()
-        for item in select.order_by:
-            if item.name in order_seen:
-                raise QueryValidationError(
-                    f"duplicate column in ORDER BY: {item.name!r}"
-                )
-            order_seen.add(item.name)
+        name = item.name
+        if name in order_seen:
+            raise QueryValidationError(
+                f"duplicate column in ORDER BY: {name!r}"
+            )
+        order_seen.add(name)
+        try:
+            col_index = schema.index(name)
+        except KeyError:
+            raise QueryValidationError(
+                f"unknown ORDER BY column: {name!r}"
+            ) from None
+        nulls_first = item.nulls_first if item.nulls_first is not None else False
+        bound.append((col_index, item.descending, nulls_first))
+    return tuple(bound)
+
+
+def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
+    if select.star:
+        raise QueryValidationError("'*' cannot be combined with aggregates or GROUP BY")
+
+    # Resolve GROUP BY columns first: order matters for the grouping key, and
+    # duplicates / unknown columns are rejected here.
+    group_indices: list[int] = []
+    group_seen: set[str] = set()
+    for name in select.group_by or ():
+        if name in group_seen:
+            raise QueryValidationError(f"duplicate column in GROUP BY: {name!r}")
+        group_seen.add(name)
+        try:
+            group_indices.append(schema.index(name))
+        except KeyError:
+            raise QueryValidationError(f"unknown GROUP BY column: {name!r}") from None
+    group_index_set = set(group_indices)
+
+    # Resolve the projection.  Plain columns must be grouped; output names
+    # (group column names and canonical "FUNC(arg)" labels) must be unique.
+    bound_items: list[_BoundItem] = []
+    output_seen: set[str] = set()
+    has_plain = False
+    for item in select.items:
+        if item.kind == "star":
+            raise QueryValidationError(
+                "'*' cannot be combined with aggregates or GROUP BY"
+            )
+        if item.kind == "column":
+            has_plain = True
+            name = item.name
             try:
-                col_index = schema.index(item.name)
+                col_index = schema.index(name)
             except KeyError:
+                raise QueryValidationError(f"unknown column: {name!r}") from None
+            if col_index not in group_index_set:
                 raise QueryValidationError(
-                    f"unknown ORDER BY column: {item.name!r}"
-                ) from None
-            nulls_first = item.nulls_first if item.nulls_first is not None else False
-            bound.append((col_index, item.descending, nulls_first))
-        order_by = tuple(bound)
-    return indices, where, order_by
+                    f"column {name!r} must appear in GROUP BY or be wrapped in an aggregate"
+                )
+            label = name
+            if label in output_seen:
+                raise QueryValidationError(f"duplicate result column: {name!r}")
+            output_seen.add(label)
+            col = schema.columns[col_index]
+            bound_items.append(
+                _BoundItem(
+                    "column",
+                    output_name=label,
+                    col_index=col_index,
+                    out_type=col.type,
+                    nullable=col.nullable,
+                )
+            )
+        else:
+            bound_items.append(_bind_agg_item(item, schema, output_seen))
+
+    if select.group_by is None and has_plain:
+        # No grouping: every projected column must be an aggregate.
+        raise QueryValidationError(
+            "without GROUP BY, the projection may contain aggregates only"
+        )
+
+    order_by = _bind_aggregate_order_by(
+        select.order_by, bound_items, schema
+    )
+    return {
+        "mode": "aggregate",
+        "group_indices": tuple(group_indices),
+        "items": tuple(bound_items),
+        "where": where,
+        "order_by": order_by,
+    }
+
+
+def _bind_agg_item(item: _RefItem, schema: Schema, output_seen: set[str]) -> _BoundItem:
+    func = item.func
+    if item.arg == "":
+        if func != "COUNT":
+            raise QuerySyntaxError(f"{func} does not accept '*'")
+        label = "COUNT(*)"
+        arg_index = -1
+        arg_col = None
+    else:
+        arg_name = item.arg
+        try:
+            arg_index = schema.index(arg_name)
+        except KeyError:
+            raise QueryValidationError(f"unknown column: {arg_name!r}") from None
+        arg_col = schema.columns[arg_index]
+        # The result label uses the column name as spelled in the schema.
+        label = f"{func}({arg_col.name})"
+    if label in output_seen:
+        raise QueryValidationError(f"duplicate result column: {label!r}")
+    output_seen.add(label)
+
+    if func == "COUNT":
+        out_type, nullable = "int64", False
+    elif func == "SUM":
+        if arg_col.type not in ("int64", "float64"):
+            raise QueryValidationError(
+                f"SUM requires an int64 or float64 argument, got {arg_col.type}"
+            )
+        out_type, nullable = arg_col.type, True
+    elif func == "AVG":
+        if arg_col.type not in ("int64", "float64"):
+            raise QueryValidationError(
+                f"AVG requires an int64 or float64 argument, got {arg_col.type}"
+            )
+        out_type, nullable = "float64", True
+    else:  # MIN / MAX accept all four existing types.
+        out_type, nullable = arg_col.type, True
+    return _BoundItem(
+        "agg",
+        output_name=label,
+        func=func,
+        arg_index=arg_index,
+        arg_type=arg_col.type if arg_col is not None else "",
+        out_type=out_type,
+        nullable=nullable,
+    )
+
+
+def _arg_label(item: _RefItem) -> str:
+    return "*" if item.arg == "" else item.arg
+
+
+def _bind_aggregate_order_by(
+    select_order_by,
+    bound_items: list[_BoundItem],
+    schema: Schema,
+):
+    if select_order_by is None:
+        return None
+
+    # Map every SELECT result to its output position.  ORDER BY in an
+    # aggregate query may only name those selected results.
+    selected: dict[tuple, int] = {}
+    for i, bound in enumerate(bound_items):
+        if bound.kind == "column":
+            selected[("column", schema.columns[bound.col_index].name)] = i
+        else:
+            arg_key = "*" if bound.arg_index == -1 else schema.columns[bound.arg_index].name
+            selected[("agg", f"{bound.func}|{arg_key}")] = i
+
+    bound_order: list[tuple[int, bool, bool]] = []
+    order_seen: set[str] = set()
+    for item in select_order_by:
+        if item.kind == "column":
+            key = ("column", item.name)
+            label = item.name
+            if key not in selected:
+                # Keep the same "unknown column" wording for names the schema
+                # does not know at all; anything else is an unselected result.
+                try:
+                    schema.index(item.name)
+                except KeyError:
+                    raise QueryValidationError(
+                        f"unknown ORDER BY column: {item.name!r}"
+                    ) from None
+                raise QueryValidationError(
+                    f"ORDER BY column {item.name!r} is not part of the selected results"
+                )
+        else:
+            if item.arg == "":
+                arg_key = "*"
+                label = "COUNT(*)"
+            else:
+                try:
+                    real_name = schema.columns[schema.index(item.arg)].name
+                except KeyError:
+                    raise QueryValidationError(
+                        f"unknown ORDER BY column: {item.arg!r}"
+                    ) from None
+                arg_key = real_name
+                label = f"{item.func}({real_name})"
+            key = ("agg", f"{item.func}|{arg_key}")
+            if key not in selected:
+                raise QueryValidationError(
+                    f"ORDER BY aggregate {label} is not part of the selected results"
+                )
+        if label in order_seen:
+            raise QueryValidationError(f"duplicate column in ORDER BY: {label!r}")
+        order_seen.add(label)
+        nulls_first = item.nulls_first if item.nulls_first is not None else False
+        bound_order.append((selected[key], item.descending, nulls_first))
+    return tuple(bound_order)
 
 
 def _bind_expr(node: tuple, schema: Schema) -> tuple:
@@ -692,6 +1050,52 @@ def _eval(node: tuple, row: tuple) -> bool | None:
 
 
 # ---------------------------------------------------------------------------
+# Aggregate computation
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_value(func: str, arg_index: int, arg_type: str, rows, source_columns):
+    if func == "COUNT":
+        if arg_index == -1:
+            return len(rows)
+        col = source_columns[arg_index]
+        return sum(1 for i in rows if col[i] is not None)
+
+    col = source_columns[arg_index]
+    values = [col[i] for i in rows if col[i] is not None]
+    if not values:
+        return None
+
+    if func == "MIN":
+        return min(values)
+    if func == "MAX":
+        return max(values)
+    if func == "SUM":
+        if arg_type == "int64":
+            # Python integers are unbounded; the int64 result is rejected only
+            # when the final total leaves the int64 range.
+            total = sum(values)
+            if not (_INT64_MIN <= total <= _INT64_MAX):
+                raise QueryValidationError("SUM overflowed the int64 range")
+            return total
+        try:
+            total = math.fsum(values)
+        except OverflowError:
+            raise QueryValidationError("SUM produced a non-finite float64 value") from None
+        if not math.isfinite(total):
+            raise QueryValidationError("SUM produced a non-finite float64 value")
+        return total
+    # AVG
+    try:
+        result = math.fsum(values) / len(values)
+    except OverflowError:
+        raise QueryValidationError("AVG produced a non-finite float64 value") from None
+    if not math.isfinite(result):
+        raise QueryValidationError("AVG produced a non-finite float64 value")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
@@ -700,16 +1104,17 @@ def query_file(path: Any, sql: str) -> Table:
     """Run ``sql`` against the single columnar file ``path``.
 
     Returns a :class:`~columnar_analytics.format.Table` with columns in
-    projection order.  Rows are filtered by WHERE, then (with ORDER BY)
-    stably sorted -- ties keep the file's relative order -- then capped by
-    LIMIT, then projected; without ORDER BY the file's original order is
-    kept.  The statement is parsed before the file is touched, so purely
-    grammatical errors surface as :class:`QuerySyntaxError` regardless of
-    whether ``path`` exists.  Unknown columns, duplicate ORDER BY columns,
-    the wrong table name or type-incompatible predicates raise
-    :class:`QueryValidationError`; malformed files raise
-    :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
-    failures propagate as :class:`OSError`.
+    projection order.  Rows are filtered by WHERE, then grouped (for
+    aggregate queries) or sorted by ORDER BY, then capped by LIMIT, then
+    projected; without ORDER BY the file's original row order (or the
+    first-selected-row group order) is kept.  The statement is parsed
+    before the file is touched, so purely grammatical errors surface as
+    :class:`QuerySyntaxError` regardless of whether ``path`` exists.
+    Unknown columns, duplicate result columns, the wrong table name,
+    type-incompatible predicates, ungrouped columns, illegal aggregate
+    arguments or int64 SUM overflow raise :class:`QueryValidationError`;
+    malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
+    other I/O failures propagate as :class:`OSError`.
     """
     tokens = _tokenize(sql)
     select = _Parser(tokens).parse()
@@ -725,10 +1130,11 @@ def query_table(table: Table, sql: str) -> Table:
 
 
 def _run_query(table: Table, select: _Select) -> Table:
-    indices, where, order_by = _bind_select(select, table.schema)
-
+    bound = _bind_select(select, table.schema)
     source_columns = table._columns
     row_count = table.row_count
+    where = bound["where"]
+
     if where is None:
         selected = list(range(row_count))
     else:
@@ -738,8 +1144,17 @@ def _run_query(table: Table, select: _Select) -> Table:
             if _eval(where, tuple(col[i] for col in source_columns)) is True
         ]
 
+    if bound["mode"] == "plain":
+        return _run_plain(table, select, bound, selected)
+    return _run_aggregate(table, select, bound, selected)
+
+
+def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Table:
+    indices = bound["indices"]
+    order_by = bound["order_by"]
+    source_columns = table._columns
     if order_by is not None:
-        comparator = _make_comparator(source_columns, order_by)
+        comparator = _make_row_comparator(source_columns, order_by)
         selected = sorted(selected, key=cmp_to_key(comparator))
 
     if select.limit is not None:
@@ -752,7 +1167,74 @@ def _run_query(table: Table, select: _Select) -> Table:
     return Table._from_storage(out_schema, out_columns)
 
 
-def _make_comparator(
+def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) -> Table:
+    group_indices = bound["group_indices"]
+    bound_items = bound["items"]
+    order_by = bound["order_by"]
+    source_columns = table._columns
+
+    out_schema = Schema(
+        [
+            ColumnSchema(item.output_name, item.out_type, nullable=item.nullable)
+            for item in bound_items
+        ]
+    )
+
+    if group_indices:
+        groups = _build_groups(selected, source_columns, group_indices)
+    else:
+        # Without GROUP BY the whole filtered stream is the single group; an
+        # empty stream still produces the one all-NULL/COUNT-0 row.
+        groups = [tuple(selected)]
+
+    # Materialise one output tuple per group, following the SELECT order.
+    materialised: list[tuple] = []
+    for rows in groups:
+        values = []
+        for item in bound_items:
+            if item.kind == "column":
+                values.append(source_columns[item.col_index][rows[0]])
+            else:
+                values.append(
+                    _aggregate_value(
+                        item.func, item.arg_index, item.arg_type, rows, source_columns
+                    )
+                )
+        materialised.append(tuple(values))
+
+    if order_by is not None:
+        comparator = _make_tuple_comparator(materialised, order_by)
+        order = sorted(range(len(materialised)), key=cmp_to_key(comparator))
+    else:
+        order = list(range(len(materialised)))
+
+    if select.limit is not None:
+        order = order[: select.limit]
+
+    width = len(bound_items)
+    out_columns = [tuple(materialised[r][c] for r in order) for c in range(width)]
+    return Table._from_storage(out_schema, out_columns)
+
+
+def _build_groups(
+    selected: list[int],
+    source_columns: tuple[tuple, ...],
+    group_indices: tuple[int, ...],
+) -> list[tuple[int, ...]]:
+    groups: dict[tuple, list[int]] = {}
+    order: list[tuple] = []
+    for row_index in selected:
+        key = tuple(source_columns[col][row_index] for col in group_indices)
+        bucket = groups.get(key)
+        if bucket is None:
+            bucket = []
+            groups[key] = bucket
+            order.append(key)
+        bucket.append(row_index)
+    return [tuple(groups[key]) for key in order]
+
+
+def _make_row_comparator(
     source_columns: tuple[tuple, ...],
     order_by: tuple[tuple[int, bool, bool], ...],
 ):
@@ -760,20 +1242,38 @@ def _make_comparator(
         for col_index, descending, nulls_first in order_by:
             va = source_columns[col_index][a]
             vb = source_columns[col_index][b]
-            if va is None or vb is None:
-                if va is None and vb is None:
-                    continue
-                # NULL placement follows NULLS FIRST / NULLS LAST alone; the
-                # default (and the explicit LAST spelling) keeps NULLs at the
-                # end for both ASC and DESC, so DESC must not flip this part.
-                none_before = -1 if nulls_first else 1
-                c = none_before if va is None else -none_before
-            else:
-                c = (va > vb) - (va < vb)
-                if descending:
-                    c = -c
+            c = _compare_scalar(va, vb, descending, nulls_first)
             if c:
                 return c
         return 0
 
     return compare
+
+
+def _make_tuple_comparator(
+    rows: list[tuple],
+    order_by: tuple[tuple[int, bool, bool], ...],
+):
+    def compare(a: int, b: int) -> int:
+        for col_index, descending, nulls_first in order_by:
+            va = rows[a][col_index]
+            vb = rows[b][col_index]
+            c = _compare_scalar(va, vb, descending, nulls_first)
+            if c:
+                return c
+        return 0
+
+    return compare
+
+
+def _compare_scalar(va, vb, descending: bool, nulls_first: bool) -> int:
+    if va is None or vb is None:
+        if va is None and vb is None:
+            return 0
+        # NULL placement follows NULLS FIRST / NULLS LAST alone; the
+        # default (and the explicit LAST spelling) keeps NULLs at the
+        # end for both ASC and DESC, so DESC must not flip this part.
+        none_before = -1 if nulls_first else 1
+        return none_before if va is None else -none_before
+    c = (va > vb) - (va < vb)
+    return -c if descending else c
