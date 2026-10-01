@@ -4,6 +4,10 @@ Public API:
 
 * :func:`query_file` -- run a ``SELECT ... FROM input [WHERE ...]`` query
   against one columnar file and return a :class:`~columnar_analytics.format.Table`
+* :func:`query_files` -- run a statement (optionally with one equi-join)
+  against a table-name to path mapping
+* :func:`explain_file` / :func:`explain_files` -- parse, bind and plan the
+  same statements without executing them; only file metadata is read
 * :class:`QuerySyntaxError` -- lexical / grammatical errors
 * :class:`QueryValidationError` -- unknown columns, wrong table name,
   type-incompatible comparisons, invalid aggregate use
@@ -113,11 +117,13 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
 
-from .format import ColumnSchema, Schema, Table, read_file
+from .format import ColumnSchema, Schema, Table, inspect_file, read_file
 
 __all__ = [
     "QuerySyntaxError",
     "QueryValidationError",
+    "explain_file",
+    "explain_files",
     "query_file",
     "query_files",
 ]
@@ -1759,25 +1765,30 @@ def _rewrite_expr(node: tuple, resolve) -> tuple:
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
-def _build_joined_table(
-    left_key: str, left: Table, right_key: str, right: Table, join: _Join
-) -> Table:
+def _build_joined_schema(
+    left_key: str,
+    left_schema: Schema,
+    right_key: str,
+    right_schema: Schema,
+    join: _Join,
+) -> Schema:
+    """Validate the ON keys and derive the combined post-join schema."""
     left_col = join.left_key[2]
     right_col = join.right_key[2]
     try:
-        left_idx = left.schema.index(left_col)
+        left_idx = left_schema.index(left_col)
     except KeyError:
         raise QueryValidationError(
             f"unknown column: {f'{left_key}.{left_col}'!r}"
         ) from None
     try:
-        right_idx = right.schema.index(right_col)
+        right_idx = right_schema.index(right_col)
     except KeyError:
         raise QueryValidationError(
             f"unknown column: {f'{right_key}.{right_col}'!r}"
         ) from None
-    left_type = left.schema.columns[left_idx].type
-    right_type = right.schema.columns[right_idx].type
+    left_type = left_schema.columns[left_idx].type
+    right_type = right_schema.columns[right_idx].type
     if left_type != right_type and not {left_type, right_type} <= {"int64", "float64"}:
         raise QueryValidationError(
             f"join key types are incompatible: {left_type} and {right_type}"
@@ -1787,19 +1798,29 @@ def _build_joined_table(
     # "table.column"; a LEFT JOIN makes every right-side column nullable.
     combined_columns = [
         ColumnSchema(f"{left_key}.{col.name}", col.type, col.nullable)
-        for col in left.schema.columns
+        for col in left_schema.columns
     ] + [
         ColumnSchema(
             f"{right_key}.{col.name}",
             col.type,
             True if join.kind == "left" else col.nullable,
         )
-        for col in right.schema.columns
+        for col in right_schema.columns
     ]
     names = [col.name for col in combined_columns]
     if len(set(names)) != len(names):
         raise QueryValidationError("joined tables produce duplicate column names")
-    schema = Schema(combined_columns)
+    return Schema(combined_columns)
+
+
+def _build_joined_table(
+    left_key: str, left: Table, right_key: str, right: Table, join: _Join
+) -> Table:
+    schema = _build_joined_schema(
+        left_key, left.schema, right_key, right.schema, join
+    )
+    left_idx = left.schema.index(join.left_key[2])
+    right_idx = right.schema.index(join.right_key[2])
     columns = _join_columns(left, right, left_idx, right_idx, join.kind)
     return Table._from_storage(schema, columns)
 
@@ -2017,3 +2038,354 @@ def _compare_scalar(va, vb, descending: bool, nulls_first: bool) -> int:
         return none_before if va is None else -none_before
     c = (va > vb) - (va < vb)
     return -c if descending else c
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN: parse, bind and plan without touching the data section
+# ---------------------------------------------------------------------------
+
+
+def explain_file(path: Any, sql: str) -> dict:
+    """Produce the query plan for ``sql`` against one columnar file.
+
+    Like :func:`query_file` for parsing and binding, but only the file
+    metadata is read: the data section is never read, decompressed or
+    decoded, so data CRCs and value-level statistics are not verified.
+    The returned value is a JSON-serialisable ordered dict with the fixed
+    top-level keys ``sources``, ``operators`` and ``output``.
+
+    :class:`QuerySyntaxError` is raised before the file is touched;
+    binding problems raise :class:`QueryValidationError`; malformed
+    metadata or a declared-size mismatch raise
+    :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
+    failures propagate as :class:`OSError`.
+    """
+    tokens = _tokenize(sql)
+    select = _Parser(tokens).parse()
+    metadata = inspect_file(path)
+    schema = _schema_from_metadata(metadata)
+    sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
+    bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
+    return _build_explain(sources, schema, select, bound, join=None)
+
+
+def explain_files(sources: Any, sql: str) -> dict:
+    """Produce the query plan for ``sql`` against the mapped tables.
+
+    Like :func:`query_files` for parsing, source resolution and binding,
+    but only the metadata of the referenced files is read: unreferenced
+    sources are never opened and no data section is ever touched.  The
+    returned value is a JSON-serialisable ordered dict with the fixed
+    top-level keys ``sources``, ``operators`` and ``output``.
+
+    A non-mapping or empty ``sources``, non-string keys or non-path
+    values raise :class:`ValueError` before any file is touched;
+    :class:`QuerySyntaxError` is raised before files are read as well.
+    Unknown tables or columns and other binding problems raise
+    :class:`QueryValidationError`; malformed metadata or a declared-size
+    mismatch raise :class:`~columnar_analytics.format.ColumnarFormatError`;
+    other I/O failures propagate as :class:`OSError`.
+    """
+    paths = _validate_sources(sources)
+    tokens = _tokenize(sql)
+    select = _Parser(tokens, allow_join=True).parse()
+    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
+    if select.join is None:
+        rewritten = _rewrite_select(select, _single_table_resolver(left_key))
+        left_metadata = inspect_file(paths[left_key])
+        left_schema = _schema_from_metadata(left_metadata)
+        sources = ((left_key, left_metadata, left_schema),)
+        bound = _bind_select(rewritten, left_schema, expected_table=None)
+        return _build_explain(sources, left_schema, rewritten, bound, join=None)
+
+    join = select.join
+    right_key = _resolve_table_ref(join.table, join.table_quoted, tuple(paths))
+    if right_key == left_key:
+        raise QueryValidationError(f"duplicate table {right_key!r} in join")
+    on_left = _resolve_table_ref(join.left_key[0], join.left_key[1], (left_key, right_key))
+    on_right = _resolve_table_ref(join.right_key[0], join.right_key[1], (left_key, right_key))
+    if on_left != left_key or on_right != right_key:
+        raise QueryValidationError(
+            "ON keys must reference the left and right tables respectively"
+        )
+    # Qualifier checks (unqualified / unknown-table column references) do
+    # not need the files and run before any metadata is read.
+    rewritten = _rewrite_select(select, _join_resolver(left_key, right_key))
+    left_metadata = inspect_file(paths[left_key])
+    right_metadata = inspect_file(paths[right_key])
+    left_schema = _schema_from_metadata(left_metadata)
+    right_schema = _schema_from_metadata(right_metadata)
+    combined_schema = _build_joined_schema(
+        left_key, left_schema, right_key, right_schema, join
+    )
+    sources = (
+        (left_key, left_metadata, left_schema),
+        (right_key, right_metadata, right_schema),
+    )
+    bound = _bind_select(rewritten, combined_schema, expected_table=None)
+    return _build_explain(
+        sources,
+        combined_schema,
+        rewritten,
+        bound,
+        join=(left_key, right_key, join),
+    )
+
+
+_SINGLE_TABLE_NAME = "input"
+
+
+def _schema_from_metadata(metadata: Mapping) -> Schema:
+    return Schema(
+        tuple(
+            ColumnSchema(entry["name"], entry["type"], entry["nullable"])
+            for entry in metadata["columns"]
+        )
+    )
+
+
+def _source_description(key: str, metadata: Mapping) -> dict:
+    return {
+        "name": key,
+        "row_count": metadata["row_count"],
+        "columns": [
+            {
+                "name": entry["name"],
+                "type": entry["type"],
+                "nullable": entry["nullable"],
+            }
+            for entry in metadata["columns"]
+        ],
+    }
+
+
+def _collect_expr_columns(node: tuple, indices: set) -> None:
+    tag = node[0]
+    if tag == "literal":
+        return
+    if tag == "column":
+        indices.add(node[2])
+        return
+    if tag in ("not", "isnull", "unary"):
+        _collect_expr_columns(node[1], indices)
+        return
+    if tag in ("and", "or"):
+        _collect_expr_columns(node[1], indices)
+        _collect_expr_columns(node[2], indices)
+        return
+    if tag == "arith":
+        _collect_expr_columns(node[2], indices)
+        _collect_expr_columns(node[3], indices)
+        return
+    if tag == "cmp":
+        _collect_expr_columns(node[2], indices)
+        _collect_expr_columns(node[3], indices)
+        return
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _collect_required_indices(bound: Mapping) -> set:
+    """Combined-schema column indices referenced anywhere in the query."""
+    indices: set = set(bound.get("group_indices", ()))
+    if bound["where"] is not None:
+        _collect_expr_columns(bound["where"], indices)
+    for item in bound["items"]:
+        if item.kind == "column":
+            indices.add(item.col_index)
+        elif item.kind == "agg":
+            if item.arg_index >= 0:
+                indices.add(item.arg_index)
+        else:  # "expr"
+            _collect_expr_columns(item.expr, indices)
+    for entry in bound["order_by"] or ():
+        if entry[0] == "col":
+            indices.add(entry[1])
+        elif entry[0] == "expr":
+            _collect_expr_columns(entry[1], indices)
+        # Aggregate ORDER BY entries index a selected output column, which
+        # is already covered by the projection scan above.
+    return indices
+
+
+def _expr_json(node: tuple) -> dict:
+    """Render a bound expression as a recursive JSON-serialisable tree.
+
+    Internal nodes carry ``kind`` / ``operator`` / ``operands``; leaves are
+    typed literals or bound column names.
+    """
+    tag = node[0]
+    if tag == "literal":
+        return {"kind": "literal", "type": node[2], "value": node[1]}
+    if tag == "column":
+        return {"kind": "column", "name": node[1]}
+    if tag == "unary":
+        operator = "-" if node[2] else "+"
+        return {
+            "kind": "unary",
+            "operator": operator,
+            "operands": [_expr_json(node[1])],
+        }
+    if tag == "arith":
+        return {
+            "kind": "arithmetic",
+            "operator": node[1],
+            "operands": [_expr_json(node[2]), _expr_json(node[3])],
+        }
+    if tag == "cmp":
+        return {
+            "kind": "comparison",
+            "operator": node[1],
+            "operands": [_expr_json(node[2]), _expr_json(node[3])],
+        }
+    if tag == "isnull":
+        return {
+            "kind": "is_null",
+            "operator": "IS NOT NULL" if node[2] else "IS NULL",
+            "operands": [_expr_json(node[1])],
+        }
+    if tag == "not":
+        return {
+            "kind": "not",
+            "operator": "NOT",
+            "operands": [_expr_json(node[1])],
+        }
+    if tag in ("and", "or"):
+        return {
+            "kind": "logic",
+            "operator": tag.upper(),
+            "operands": [_expr_json(node[1]), _expr_json(node[2])],
+        }
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _build_explain(
+    sources: tuple,
+    schema: Schema,
+    select: _Select,
+    bound: Mapping,
+    join: tuple | None,
+) -> dict:
+    referenced = _collect_required_indices(bound)
+    if join is not None:
+        # The ON keys feed the join even when neither is projected.
+        left_key, right_key, join_node = join
+        for key_name, column_name in (
+            (left_key, join_node.left_key[2]),
+            (right_key, join_node.right_key[2]),
+        ):
+            referenced.add(schema.index(f"{key_name}.{column_name}"))
+
+    operators: list = []
+    referenced_names = {schema.columns[i].name for i in referenced}
+    for key, _metadata, source_schema in sources:
+        if join is None:
+            required = [col.name for col in schema.columns if col.name in referenced_names]
+        else:
+            prefix = f"{key}."
+            required = [
+                col.name
+                for col in source_schema.columns
+                if f"{prefix}{col.name}" in referenced_names
+            ]
+        operators.append(
+            {"operator": "Scan", "source": key, "required_columns": required}
+        )
+
+    if join is not None:
+        operators.append(
+            {
+                "operator": "Join",
+                "type": join_node.kind.upper(),
+                "left": {"table": left_key, "column": join_node.left_key[2]},
+                "right": {"table": right_key, "column": join_node.right_key[2]},
+            }
+        )
+
+    if bound["where"] is not None:
+        operators.append({"operator": "Filter", "condition": _expr_json(bound["where"])})
+
+    if bound["mode"] == "aggregate":
+        operators.append(
+            {
+                "operator": "Aggregate",
+                "group_keys": [
+                    schema.columns[index].name for index in bound["group_indices"]
+                ],
+                "aggregates": [
+                    {
+                        "function": item.func,
+                        "argument": (
+                            None
+                            if item.arg_index < 0
+                            else schema.columns[item.arg_index].name
+                        ),
+                        "output": item.output_name,
+                    }
+                    for item in bound["items"]
+                    if item.kind == "agg"
+                ],
+            }
+        )
+
+    if bound["order_by"] is not None:
+        alias_by_expr = {
+            id(item.expr): item.output_name
+            for item in bound["items"]
+            if item.kind == "expr"
+        }
+        keys = []
+        for entry in bound["order_by"]:
+            if entry[0] == "col":
+                name = schema.columns[entry[1]].name
+                descending, nulls_first = entry[2], entry[3]
+            elif entry[0] == "expr":
+                name = alias_by_expr[id(entry[1])]
+                descending, nulls_first = entry[2], entry[3]
+            else:  # aggregate-query ORDER BY indexes a selected output column
+                name = bound["items"][entry[0]].output_name
+                descending, nulls_first = entry[1], entry[2]
+            keys.append(
+                {
+                    "column": name,
+                    "direction": "DESC" if descending else "ASC",
+                    "nulls": "FIRST" if nulls_first else "LAST",
+                }
+            )
+        operators.append({"operator": "Sort", "keys": keys})
+
+    if select.limit is not None:
+        operators.append({"operator": "Limit", "count": select.limit})
+
+    projections = []
+    for item in bound["items"]:
+        if item.kind == "column":
+            expression = {"kind": "column", "name": schema.columns[item.col_index].name}
+        elif item.kind == "agg":
+            expression = {
+                "kind": "aggregate",
+                "function": item.func,
+                "argument": (
+                    None
+                    if item.arg_index < 0
+                    else schema.columns[item.arg_index].name
+                ),
+            }
+        else:  # "expr"
+            expression = _expr_json(item.expr)
+        projections.append({"expression": expression, "output": item.output_name})
+    operators.append({"operator": "Project", "expressions": projections})
+
+    output = [
+        {
+            "name": item.output_name,
+            "type": item.out_type,
+            "nullable": item.nullable,
+        }
+        for item in bound["items"]
+    ]
+
+    return {
+        "sources": [_source_description(key, metadata) for key, metadata, _ in sources],
+        "operators": operators,
+        "output": output,
+    }

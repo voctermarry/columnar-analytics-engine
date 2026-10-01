@@ -15,6 +15,8 @@ from .format import (
 from .query import (
     QuerySyntaxError,
     QueryValidationError,
+    explain_file,
+    explain_files,
     query_file,
     query_files,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "inspect_file",
     "QuerySyntaxError",
     "QueryValidationError",
+    "explain_file",
+    "explain_files",
     "query_file",
     "query_files",
 ]
