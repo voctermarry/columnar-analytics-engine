@@ -12,6 +12,7 @@ from .format import (
     read_file,
     write_file,
 )
+from .explain import explain_file, explain_files
 from .query import (
     QuerySyntaxError,
     QueryValidationError,
@@ -33,4 +34,6 @@ __all__ = [
     "QueryValidationError",
     "query_file",
     "query_files",
+    "explain_file",
+    "explain_files",
 ]

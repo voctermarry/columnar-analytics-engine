@@ -30,6 +30,8 @@ columnar-analytics-engine version                       # 打印版本号
 columnar-analytics-engine inspect <path>                # 输出文件元数据 JSON
 columnar-analytics-engine query <path> "<sql>"          # 对单个文件执行 SQL，输出结果 JSON
 columnar-analytics-engine query-files <sources-json> "<sql>"   # 对映射的多表执行 SQL（可含一次连接）
+columnar-analytics-engine explain <path> "<sql>"        # 只解析并输出单文件查询计划 JSON（不执行）
+columnar-analytics-engine explain-files <sources-json> "<sql>" # 只解析并输出多表查询计划 JSON（不执行）
 columnar-analytics-engine --help                        # 打印用法
 ```
 
@@ -51,6 +53,17 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 输出格式与退出码约定同 `query`；sources-json 本身非法（不是 JSON 对象、键不是非空
 字符串、值不是路径）也以码 2 退出。
 
+`explain` / `explain-files` 分别与 `query` / `query-files` 接受相同的输入与 SQL 子集，
+但只解析、绑定并生成计划：不执行查询、不读取数据段，也不访问未被语句引用的 sources。
+输出为单行紧凑 UTF-8 JSON，顶层键固定为 `sources`、`operators`、`output`：`sources`
+按 FROM/JOIN 顺序给出表名、行数与列描述；`operators` 依次列出 Scan、Join、Filter、
+Aggregate、Sort、Limit、Project（缺少的阶段省略），其中 Scan 的 `required_columns`
+按源 schema 顺序列出引用列（仅 `COUNT(*)` 时为空），Filter 的 `condition` 是递归
+JSON 表达式；`output` 按结果顺序给出 `name`、`type`、`nullable`，与查询结果 schema
+一致。相同元数据与 SQL 重复解释输出字节一致；关键字大小写与多余空白不改变计划内容。
+退出码约定同 `query` / `query-files`（ValueError、查询错误与格式错误为码 2，系统
+错误为码 1，失败时标准输出为空）；数据段 CRC 或值级统计损坏因未读取而不报告。
+
 ## Python 公开接口
 
 包 `columnar_analytics` 导出：
@@ -61,6 +74,8 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 - `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
 - `query_files(sources, sql)`：对表名→路径映射执行 SQL（可含一次两表连接），成功返回 `Table`
+- `explain_file(path, sql)` / `explain_files(sources, sql)`：与对应查询入口相同的输入与
+  SQL 子集，但只解析、绑定并生成计划（不执行、不读数据段），返回可 JSON 序列化的有序字典
 - `ColumnarFormatError`：所有文件格式错误的统一异常；系统错误保留 `OSError` 语义
 - `QuerySyntaxError`：SQL 词法/语法错误；`QueryValidationError`：未知列、错误表名、类型不兼容
 - `FORMAT_VERSION`、`__version__`
