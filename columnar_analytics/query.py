@@ -15,6 +15,7 @@ The accepted grammar (keywords case-insensitive)::
                    [ORDER BY order_item (',' order_item)*]
                    [LIMIT uint]
     select_item := '*' | ident | agg_name '(' ('*' | ident) ')'
+                   | scalar_expr AS alias
     order_item  := (ident | agg_name '(' ('*' | ident) ')')
                    [ASC | DESC] [NULLS FIRST | NULLS LAST]
     expr       := or_expr
@@ -22,7 +23,10 @@ The accepted grammar (keywords case-insensitive)::
     and_expr    := cmp_expr (AND cmp_expr)*
     cmp_expr    := not_factor (cmp_op not_factor)?
     not_factor  := NOT not_factor | postfix
-    postfix     := atom (IS [NOT] NULL)?
+    postfix     := scalar_expr (IS [NOT] NULL)?
+    scalar_expr := term (('+' | '-') term)*
+    term        := factor (('*' | '/') factor)*
+    factor      := ('+' | '-') factor | atom
     atom        := '(' expr ')' | operand
     operand     := ident | literal
     literal     := TRUE | FALSE | [+-]? int64 | [+-]? finite float64
@@ -33,11 +37,37 @@ The supported aggregates are ``COUNT(*)``, ``COUNT(ident)`` and
 GROUP BY the projection may contain aggregate expressions only; with
 GROUP BY it may additionally contain the grouped columns.  A bare ``*``
 must not be mixed with aggregates or grouping.  Aggregates are not
-allowed inside WHERE, may not be nested, and aliases are not supported.
+allowed inside WHERE, may not be nested, and aliases are not supported
+for bare columns or aggregate calls.
+
+Scalar arithmetic (parentheses, unary ``+``/``-``, binary ``+`` ``-``
+``*`` ``/``; precedence: parentheses, unary, ``*``/``/``, ``+``/``-``)
+is available over int64 / float64 columns and numeric literals in SELECT
+and WHERE.  A computed SELECT expression must be named with ``AS`` (the
+alias follows the usual identifier rules and must be unique among the
+output names); bare columns and aggregate calls keep their existing
+result names.  int64 ``+``/``-``/``*`` on two int64 operands yields
+int64; any float64 operand or a division yields float64, and unary
+operators preserve the operand type.  Any NULL operand makes the result
+NULL; the output column is nullable iff a participating column is
+nullable (pure constants are not).  int64 overflow, division by zero and
+non-finite float64 results raise :class:`QueryValidationError`.  A
+numeric expression used directly as a boolean condition is rejected with
+:class:`QueryValidationError` as well.  Non-aggregate queries execute
+WHERE, then compute the sort keys, stably sort, apply LIMIT and only
+then evaluate the SELECT expressions, so filtered or truncated rows
+never trigger division-by-zero or overflow in the projection.  ORDER BY
+may name a SELECT alias (an alias shadows an input column of the same
+name) and sorts on the expression's result type with the usual NULL
+placement and stability rules.  Aggregate queries do not accept scalar
+expressions: GROUP BY keys and aggregate arguments stay plain column
+references, and mixing a scalar expression into an aggregate query
+raises :class:`QueryValidationError`.
 
 Operator precedence (highest first) is NOT, comparison, AND, OR; IS [NOT]
-NULL is a postfix of its atom.  Comparison operands must be column
-references or literals.  WHERE follows SQL three-valued logic: a normal
+NULL is a postfix of its scalar operand.  Comparison operands may be
+column references, literals or scalar arithmetic expressions.  WHERE
+follows SQL three-valued logic: a normal
 comparison against NULL yields UNKNOWN, UNKNOWN propagates through the
 logical operators, and only TRUE rows are returned.
 
@@ -97,6 +127,7 @@ _KEYWORDS = frozenset(
         "select",
         "from",
         "where",
+        "as",
         "not",
         "and",
         "or",
@@ -173,7 +204,7 @@ def _tokenize(sql: str) -> list[_Token]:
             tokens.append(_Token("star", None, ch))
             i += 1
             continue
-        if ch in ",()+-":
+        if ch in ",()+-/":
             tokens.append(_Token("op", ch, ch))
             i += 1
             continue
@@ -302,15 +333,21 @@ def _parse_number(text: str) -> int | float:
 #   ("literal", python_value, type_name)
 #   ("column", name, table|None, table_quoted)        -- as parsed
 #   ("column", name, index, type_name, nullable)      -- after binding
+#   ("arith", op, left_node, right_node)              -- as parsed (+ - * /)
+#   ("arith", op, left_node, right_node, type_name)   -- after binding
+#   ("unary", operand, negate)                        -- as parsed
+#   ("unary", operand, negate, type_name)             -- after binding
 #   ("cmp", op, left_node, right_node)
 #   ("isnull", operand, negate)
 #   ("not", operand)
 #   ("and"|"or", left, right)
-# Predicate nodes are boolean-typed (three-valued at evaluation time).
+# Predicate nodes are boolean-typed (three-valued at evaluation time);
+# "literal"/"column"/"arith"/"unary" nodes are value nodes.
 #
 # Projection / ORDER BY reference items:
 #   ("column_ref", name)                 -- a plain column name
 #   ("agg", func_upper, arg_name|None)   -- an aggregate call; arg None = '*'
+#   ("expr", alias)                      -- a computed scalar expression
 # ---------------------------------------------------------------------------
 
 
@@ -318,10 +355,11 @@ def _parse_number(text: str) -> int | float:
 class _RefItem:
     """One projection element or ORDER BY key as parsed."""
 
-    kind: str  # "star" | "column" | "agg"
-    name: str | None = None  # column name for kind == "column"
+    kind: str  # "star" | "column" | "agg" | "expr"
+    name: str | None = None  # column name, or the AS alias for kind == "expr"
     func: str | None = None  # uppercase function name for kind == "agg"
     arg: str | None = None  # aggregate column argument; "" stands for '*'
+    expr: tuple | None = None  # parsed scalar expression for kind == "expr"
     descending: bool = False
     nulls_first: bool | None = None  # None -> default (NULLs last)
     # Table qualifiers (two-table queries only; None when unqualified):
@@ -466,12 +504,16 @@ class _Parser:
         items = [self._parse_select_item()]
         while self._accept_op(","):
             items.append(self._parse_select_item())
-        # Aliases are not supported; a trailing identifier (including the
-        # spelling "as") where FROM is expected names one.  Plain queries keep
-        # their historical QuerySyntaxError classification; aggregate queries
-        # treat the unsupported alias as a validation error.
+        # Aliases are only supported for computed scalar expressions (which
+        # consume their own "AS alias" in _parse_select_item); a trailing
+        # identifier (including the spelling "as") where FROM is expected
+        # names one on a bare column or aggregate.  Plain queries keep their
+        # historical QuerySyntaxError classification; aggregate queries treat
+        # the unsupported alias as a validation error.
         tok = self._peek()
-        if tok.kind in ("ident", "qident"):
+        if tok.kind in ("ident", "qident") or (
+            tok.kind == "keyword" and tok.value == "as"
+        ):
             grouped_ahead = any(
                 t.kind == "keyword" and t.value == "group"
                 for t in self.tokens[self.pos :]
@@ -488,7 +530,40 @@ class _Parser:
         if tok.kind == "star":
             self._next()
             return _RefItem("star")
-        return self._parse_column_or_agg()
+        if (
+            tok.kind == "ident"
+            and tok.value.lower() in _AGG_NAMES
+            and self.tokens[self.pos + 1].kind == "op"
+            and self.tokens[self.pos + 1].value == "("
+        ):
+            item = self._parse_column_or_agg()
+            if self._arith_op_ahead():
+                raise QueryValidationError(
+                    "aggregate calls cannot be combined with scalar arithmetic"
+                )
+            return item
+        node = self._parse_arith()
+        if node[0] == "column":
+            # A bare (possibly parenthesised) column reference keeps its
+            # existing projection behaviour and needs no alias.
+            return _RefItem(
+                "column", name=node[1], table=node[2], table_quoted=node[3]
+            )
+        # A computed scalar expression must be named with AS.
+        self._expect_keyword("as")
+        alias = self._peek()
+        if alias.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(
+                f"AS requires a result name, got {alias.text!r}"
+            )
+        self._next()
+        return _RefItem("expr", name=alias.value, expr=node)
+
+    def _arith_op_ahead(self) -> bool:
+        tok = self._peek()
+        return tok.kind == "star" or (
+            tok.kind == "op" and tok.value in ("+", "-", "/")
+        )
 
     def _parse_order_item(self) -> _RefItem:
         item = self._parse_column_or_agg()
@@ -590,6 +665,7 @@ class _Parser:
                 raise QuerySyntaxError(
                     f"{func.upper()} argument must be a column name, not a function call"
                 )
+            self._reject_expression_in_agg_arg(func)
             return (item.name, item.table, item.table_quoted)
         self._next()
         nxt = self._peek()
@@ -602,7 +678,16 @@ class _Parser:
             raise QuerySyntaxError(
                 f"{func.upper()} argument must be a column name, not a function call"
             )
+        self._reject_expression_in_agg_arg(func)
         return (tok.value, None, False)
+
+    def _reject_expression_in_agg_arg(self, func: str) -> None:
+        # Aggregate arguments stay limited to plain column references; a
+        # scalar expression inside an aggregate query is a validation error.
+        if self._arith_op_ahead():
+            raise QueryValidationError(
+                f"{func.upper()} argument must be a column reference, not an expression"
+            )
 
     def _parse_limit(self) -> int:
         tok = self._peek()
@@ -632,9 +717,17 @@ class _Parser:
             raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
         if self._allow_join and self._qualifier_ahead():
             item = self._parse_qualified_column()
-            return (item.table, item.table_quoted, item.name)
-        self._next()
-        return (None, False, tok.value)
+            result = (item.table, item.table_quoted, item.name)
+        else:
+            self._next()
+            result = (None, False, tok.value)
+        # GROUP BY keeps accepting column references only; a scalar
+        # expression in an aggregate query is a validation error.
+        if self._arith_op_ahead():
+            raise QueryValidationError(
+                "GROUP BY only accepts column references, not expressions"
+            )
+        return result
 
     # WHERE expression grammar ------------------------------------------------
 
@@ -665,11 +758,79 @@ class _Parser:
         return self._parse_postfix()
 
     def _parse_postfix(self) -> tuple:
-        node = self._parse_atom()
+        node = self._parse_arith()
         if self._accept_keyword("is"):
             negate = self._accept_keyword("not")
             self._expect_keyword("null")
             node = ("isnull", node, negate)
+        return node
+
+    # Arithmetic expressions (numeric scalar operands) ------------------------
+    # Precedence (highest first): parentheses, unary +/-, * /, + -.
+
+    def _parse_arith(self) -> tuple:
+        node = self._parse_term()
+        while True:
+            tok = self._peek()
+            if tok.kind == "op" and tok.value in ("+", "-"):
+                self._next()
+                node = ("arith", tok.value, node, self._parse_term())
+            else:
+                return node
+
+    def _parse_term(self) -> tuple:
+        node = self._parse_factor()
+        while True:
+            tok = self._peek()
+            if tok.kind == "star":
+                self._next()
+                node = ("arith", "*", node, self._parse_factor())
+            elif tok.kind == "op" and tok.value == "/":
+                self._next()
+                node = ("arith", "/", node, self._parse_factor())
+            else:
+                return node
+
+    def _parse_factor(self) -> tuple:
+        tok = self._peek()
+        if tok.kind == "op" and tok.value in ("+", "-"):
+            negate = tok.value == "-"
+            self._next()
+            nxt = self._peek()
+            if nxt.kind == "number" and not isinstance(nxt.value, bool):
+                # A signed numeric literal is folded at parse time so the
+                # signed int64 range check keeps its historical meaning
+                # (-9223372036854775808 is valid, the bare magnitude is not).
+                self._next()
+                value = nxt.value
+                if isinstance(value, int):
+                    if negate:
+                        value = -value
+                    if not (-(2**63) <= value <= 2**63 - 1):
+                        raise QuerySyntaxError(
+                            "integer literal is outside the int64 range"
+                        )
+                    return ("literal", value, "int64")
+                if negate:
+                    value = -value
+                return ("literal", value, "float64")
+            if nxt.kind not in ("ident", "qident") and not (
+                nxt.kind == "op" and nxt.value == "("
+            ):
+                raise QuerySyntaxError(
+                    "sign must be followed by a numeric literal or expression"
+                )
+            return ("unary", self._parse_factor(), negate)
+        node = self._parse_atom()
+        if (
+            node[0] == "literal"
+            and isinstance(node[1], int)
+            and not isinstance(node[1], bool)
+            and node[1] > 2**63 - 1
+        ):
+            # The magnitude 2**63 is only reachable through an explicit
+            # negation; a bare literal must fit the signed int64 range.
+            raise QuerySyntaxError("integer literal is outside the int64 range")
         return node
 
     def _parse_atom(self) -> tuple:
@@ -677,43 +838,18 @@ class _Parser:
             node = self._parse_or()
             self._expect_op(")")
             return node
-        return self._parse_operand()
-
-    def _parse_operand(self) -> tuple:
-        sign = 1
         tok = self._peek()
-        if tok.kind == "op" and tok.value in ("+", "-"):
-            if tok.value == "-":
-                sign = -1
-            self._next()
-            tok = self._peek()
-            if tok.kind != "number" or isinstance(tok.value, bool):
-                raise QuerySyntaxError("sign must be followed by a numeric literal")
         if tok.kind == "number":
             self._next()
             value = tok.value
             if isinstance(value, bool):
-                if sign == -1:
-                    raise QuerySyntaxError("boolean literal cannot be negated")
                 return ("literal", value, "bool")
-            if isinstance(value, int):
-                value *= sign
-                if not (-(2**63) <= value <= 2**63 - 1):
-                    raise QuerySyntaxError("integer literal is outside the int64 range")
-            else:
-                value = math.copysign(value, sign) if sign == -1 else value
-                if not math.isfinite(value):
-                    raise QuerySyntaxError("float literal must be finite")
             type_name = "int64" if isinstance(value, int) else "float64"
             return ("literal", value, type_name)
         if tok.kind == "string":
-            if sign == -1:
-                raise QuerySyntaxError("string literal cannot be negated")
             self._next()
             return ("literal", tok.value, "utf8")
         if tok.kind in ("ident", "qident"):
-            if sign == -1:
-                raise QuerySyntaxError("column reference cannot be negated")
             if self._allow_join and self._qualifier_ahead():
                 item = self._parse_qualified_column()
                 return ("column", item.name, item.table, item.table_quoted)
@@ -725,7 +861,7 @@ class _Parser:
                 and nxt.value == "("
             ):
                 raise QueryValidationError(
-                    f"aggregate {tok.value.upper()}(...) is not allowed in WHERE"
+                    f"aggregate {tok.value.upper()}(...) is not allowed here"
                 )
             self._next()
             return ("column", tok.value, None, False)
@@ -785,7 +921,7 @@ class _Parser:
 class _BoundItem:
     """A validated projection element."""
 
-    kind: str  # "column" | "agg"
+    kind: str  # "column" | "agg" | "expr"
     output_name: str
     # kind == "column":
     col_index: int = -1
@@ -793,6 +929,8 @@ class _BoundItem:
     func: str = ""
     arg_index: int = -1  # -1 means COUNT(*)
     arg_type: str = ""
+    # kind == "expr":
+    expr: tuple | None = None  # bound scalar expression
     out_type: str = ""
     nullable: bool = True
 
@@ -810,8 +948,8 @@ def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dic
             )
 
     where = _bind_expr(select.where, schema) if select.where is not None else None
-    if where is not None and where[0] in ("literal", "column"):
-        type_name = _operand_type(where)
+    if where is not None and where[0] in ("literal", "column", "arith", "unary"):
+        type_name = _expr_type(where)
         if type_name != "bool":
             raise QueryValidationError(
                 f"WHERE clause must be boolean, got {type_name}"
@@ -823,38 +961,83 @@ def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dic
 
 
 def _bind_plain(select: _Select, schema: Schema, where) -> dict:
-    # Non-aggregate path: '*' or a comma-separated list of plain columns.
+    # Non-aggregate path: '*' or a comma-separated list of plain columns and
+    # computed scalar expressions (each named with AS).
+    bound_items: list[_BoundItem] = []
     if select.star:
-        indices = tuple(range(len(schema.columns)))
+        for i, col in enumerate(schema.columns):
+            bound_items.append(
+                _BoundItem(
+                    "column",
+                    output_name=col.name,
+                    col_index=i,
+                    out_type=col.type,
+                    nullable=col.nullable,
+                )
+            )
     else:
-        seen: set[str] = set()
-        indices_list: list[int] = []
+        output_seen: set[str] = set()
         for item in select.items:
             if item.kind == "star":
                 # A star mixed into a plain projection remains grammatical.
                 raise QuerySyntaxError("'*' cannot be mixed with other projection items")
-            name = item.name
-            if name in seen:
-                raise QueryValidationError(f"duplicate column in projection: {name!r}")
-            seen.add(name)
-            try:
-                indices_list.append(schema.index(name))
-            except KeyError:
-                raise QueryValidationError(f"unknown column: {name!r}") from None
-        indices = tuple(indices_list)
-    order_by = _bind_plain_order_by(select.order_by, schema)
+            if item.kind == "column":
+                name = item.name
+                if name in output_seen:
+                    raise QueryValidationError(
+                        f"duplicate column in projection: {name!r}"
+                    )
+                try:
+                    col_index = schema.index(name)
+                except KeyError:
+                    raise QueryValidationError(f"unknown column: {name!r}") from None
+                col = schema.columns[col_index]
+                output_seen.add(col.name)
+                bound_items.append(
+                    _BoundItem(
+                        "column",
+                        output_name=col.name,
+                        col_index=col_index,
+                        out_type=col.type,
+                        nullable=col.nullable,
+                    )
+                )
+            else:  # "expr"
+                expr = _bind_expr(item.expr, schema)
+                out_type = _expr_type(expr)
+                if out_type not in ("int64", "float64"):
+                    raise QueryValidationError(
+                        f"SELECT expression must be numeric, got {out_type}"
+                    )
+                alias = item.name
+                if alias in output_seen:
+                    raise QueryValidationError(f"duplicate result column: {alias!r}")
+                output_seen.add(alias)
+                bound_items.append(
+                    _BoundItem(
+                        "expr",
+                        output_name=alias,
+                        expr=expr,
+                        out_type=out_type,
+                        nullable=_expr_nullable(expr),
+                    )
+                )
+    aliases = {
+        item.output_name: item.expr for item in bound_items if item.kind == "expr"
+    }
+    order_by = _bind_plain_order_by(select.order_by, schema, aliases)
     return {
         "mode": "plain",
-        "indices": indices,
+        "items": tuple(bound_items),
         "where": where,
         "order_by": order_by,
     }
 
 
-def _bind_plain_order_by(select_order_by, schema: Schema):
+def _bind_plain_order_by(select_order_by, schema: Schema, aliases: dict):
     if select_order_by is None:
         return None
-    bound: list[tuple[int, bool, bool]] = []
+    bound: list[tuple] = []
     order_seen: set[str] = set()
     for item in select_order_by:
         if item.kind == "agg":
@@ -868,14 +1051,18 @@ def _bind_plain_order_by(select_order_by, schema: Schema):
                 f"duplicate column in ORDER BY: {name!r}"
             )
         order_seen.add(name)
+        nulls_first = item.nulls_first if item.nulls_first is not None else False
+        # A SELECT alias shadows an input column of the same name.
+        if name in aliases:
+            bound.append(("expr", aliases[name], item.descending, nulls_first))
+            continue
         try:
             col_index = schema.index(name)
         except KeyError:
             raise QueryValidationError(
                 f"unknown ORDER BY column: {name!r}"
             ) from None
-        nulls_first = item.nulls_first if item.nulls_first is not None else False
-        bound.append((col_index, item.descending, nulls_first))
+        bound.append(("col", col_index, item.descending, nulls_first))
     return tuple(bound)
 
 
@@ -908,6 +1095,10 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
         if item.kind == "star":
             raise QueryValidationError(
                 "'*' cannot be combined with aggregates or GROUP BY"
+            )
+        if item.kind == "expr":
+            raise QueryValidationError(
+                "scalar expressions are not supported in aggregate queries"
             )
         if item.kind == "column":
             has_plain = True
@@ -1093,19 +1284,45 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
         return (tag, left, right)
     if tag == "isnull":
         operand = _bind_expr(node[1], schema)
-        if operand[0] not in ("literal", "column"):
+        if operand[0] not in ("literal", "column", "arith", "unary"):
             raise QuerySyntaxError(
                 "IS NULL operand must be a column reference or a literal"
             )
         return ("isnull", operand, node[2])
+    if tag == "unary":
+        operand = _bind_expr(node[1], schema)
+        type_name = _expr_type(operand)
+        if type_name not in ("int64", "float64"):
+            raise QueryValidationError(
+                f"unary +/- requires a numeric operand, got {type_name}"
+            )
+        return ("unary", operand, node[2], type_name)
+    if tag == "arith":
+        left = _bind_expr(node[2], schema)
+        right = _bind_expr(node[3], schema)
+        left_t = _expr_type(left)
+        right_t = _expr_type(right)
+        if left_t not in ("int64", "float64") or right_t not in ("int64", "float64"):
+            raise QueryValidationError(
+                f"arithmetic requires numeric operands, got {left_t} and {right_t}"
+            )
+        op = node[1]
+        out_type = (
+            "float64"
+            if op == "/" or "float64" in (left_t, right_t)
+            else "int64"
+        )
+        return ("arith", op, left, right, out_type)
     if tag == "cmp":
         op = node[1]
         left = _bind_expr(node[2], schema)
         right = _bind_expr(node[3], schema)
-        if left[0] not in ("literal", "column") or right[0] not in ("literal", "column"):
+        if left[0] not in ("literal", "column", "arith", "unary") or right[0] not in (
+            "literal", "column", "arith", "unary"
+        ):
             raise QuerySyntaxError("comparison operands must be column references or literals")
-        left_t = _operand_type(left)
-        right_t = _operand_type(right)
+        left_t = _expr_type(left)
+        right_t = _expr_type(right)
         if "bool" in (left_t, right_t):
             if left_t != "bool" or right_t != "bool":
                 raise QueryValidationError(
@@ -1126,14 +1343,38 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
-def _operand_type(node: tuple) -> str:
-    return node[2] if node[0] == "literal" else node[3]
+def _expr_type(node: tuple) -> str:
+    """The static type of a bound value node."""
+    tag = node[0]
+    if tag == "literal":
+        return node[2]
+    if tag == "column":
+        return node[3]
+    if tag == "unary":
+        return node[3]
+    if tag == "arith":
+        return node[4]
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _expr_nullable(node: tuple) -> bool:
+    """Whether a bound value node can yield NULL (derived from its columns)."""
+    tag = node[0]
+    if tag == "literal":
+        return False
+    if tag == "column":
+        return node[4]
+    if tag == "unary":
+        return _expr_nullable(node[1])
+    if tag == "arith":
+        return _expr_nullable(node[2]) or _expr_nullable(node[3])
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
 def _require_boolean(node: tuple, context: str) -> None:
     if node[0] in ("cmp", "isnull", "not", "and", "or"):
         return
-    type_name = node[2] if node[0] == "literal" else node[3]
+    type_name = _expr_type(node)
     if type_name != "bool":
         raise QueryValidationError(f"{context} requires a boolean operand, got {type_name}")
 
@@ -1149,6 +1390,19 @@ def _eval(node: tuple, row: tuple) -> bool | None:
         return node[1]
     if tag == "column":
         return row[node[2]]
+    if tag == "unary":
+        value = _eval(node[1], row)
+        if value is None:
+            return None
+        if not node[2]:  # unary plus keeps the value
+            return value
+        return _negate_value(value)
+    if tag == "arith":
+        left = _eval(node[2], row)
+        right = _eval(node[3], row)
+        if left is None or right is None:
+            return None
+        return _arith_value(node[1], left, right)
     if tag == "isnull":
         value = _eval(node[1], row)
         result = value is None
@@ -1197,6 +1451,49 @@ def _eval(node: tuple, row: tuple) -> bool | None:
             result = left >= right
         return bool(result)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _negate_value(value):
+    # Unary minus: the type is preserved; only int64 can overflow.
+    if isinstance(value, int):
+        if value == _INT64_MIN:
+            raise QueryValidationError(
+                "negating the int64 minimum overflows the int64 range"
+            )
+        return -value
+    return -value
+
+
+def _arith_value(op: str, left, right):
+    # int64 op int64 stays int64 for + - *; any float64 operand or a
+    # division produces float64.  NULLs are handled by the caller.
+    if op == "/" or isinstance(left, float) or isinstance(right, float):
+        if op == "/" and right == 0:
+            raise QueryValidationError("division by zero")
+        a = float(left)
+        b = float(right)
+        if op == "+":
+            result = a + b
+        elif op == "-":
+            result = a - b
+        elif op == "*":
+            result = a * b
+        else:
+            result = a / b
+        if not math.isfinite(result):
+            raise QueryValidationError(
+                "float64 arithmetic produced a non-finite value"
+            )
+        return result
+    if op == "+":
+        result = left + right
+    elif op == "-":
+        result = left - right
+    else:
+        result = left * right
+    if not (_INT64_MIN <= result <= _INT64_MAX):
+        raise QueryValidationError("int64 arithmetic overflowed the int64 range")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1382,6 +1679,9 @@ def _join_resolver(left_key: str, right_key: str):
 def _rewrite_select(select: _Select, resolve) -> _Select:
     """Resolve every column reference to its canonical output name."""
     items = tuple(_rewrite_ref_item(item, resolve) for item in select.items)
+    # ORDER BY names that match a SELECT alias stay unresolved here; the
+    # binder resolves them against the aliased expressions first.
+    aliases = {item.name for item in items if item.kind == "expr"}
     group_by = None
     if select.group_by is not None:
         group_by = tuple(
@@ -1390,7 +1690,12 @@ def _rewrite_select(select: _Select, resolve) -> _Select:
         )
     order_by = None
     if select.order_by is not None:
-        order_by = tuple(_rewrite_ref_item(item, resolve) for item in select.order_by)
+        order_by = tuple(
+            item
+            if item.kind == "column" and item.table is None and item.name in aliases
+            else _rewrite_ref_item(item, resolve)
+            for item in select.order_by
+        )
     where = _rewrite_expr(select.where, resolve) if select.where is not None else None
     return _Select(
         items=items,
@@ -1406,6 +1711,14 @@ def _rewrite_select(select: _Select, resolve) -> _Select:
 def _rewrite_ref_item(item: _RefItem, resolve) -> _RefItem:
     if item.kind == "star":
         return item
+    if item.kind == "expr":
+        return _RefItem(
+            "expr",
+            name=item.name,
+            expr=_rewrite_expr(item.expr, resolve),
+            descending=item.descending,
+            nulls_first=item.nulls_first,
+        )
     if item.kind == "column":
         return _RefItem(
             "column",
@@ -1431,6 +1744,10 @@ def _rewrite_expr(node: tuple, resolve) -> tuple:
         return node
     if tag == "column":
         return ("column", resolve(node[2], node[3], node[1]), None, False)
+    if tag == "unary":
+        return ("unary", _rewrite_expr(node[1], resolve), node[2])
+    if tag == "arith":
+        return ("arith", node[1], _rewrite_expr(node[2], resolve), _rewrite_expr(node[3], resolve))
     if tag == "not":
         return ("not", _rewrite_expr(node[1], resolve))
     if tag in ("and", "or"):
@@ -1539,20 +1856,38 @@ def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
 
 
 def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Table:
-    indices = bound["indices"]
+    items = bound["items"]
     order_by = bound["order_by"]
     source_columns = table._columns
+    # Execution order: WHERE (done by the caller) -> sort keys -> stable sort
+    # -> LIMIT -> result expressions, so rows filtered out or cut by LIMIT
+    # never evaluate the SELECT expressions.
     if order_by is not None:
-        comparator = _make_row_comparator(source_columns, order_by)
+        comparator = _make_row_comparator(source_columns, order_by, selected)
         selected = sorted(selected, key=cmp_to_key(comparator))
 
     if select.limit is not None:
         selected = selected[: select.limit]
 
-    out_columns = [
-        tuple(source_columns[index][i] for i in selected) for index in indices
-    ]
-    out_schema = Schema([table.schema.columns[i] for i in indices])
+    out_columns = []
+    out_schema_columns = []
+    for item in items:
+        if item.kind == "column":
+            out_columns.append(
+                tuple(source_columns[item.col_index][i] for i in selected)
+            )
+            out_schema_columns.append(table.schema.columns[item.col_index])
+        else:  # "expr"
+            out_columns.append(
+                tuple(
+                    _eval(item.expr, _row_values(source_columns, i))
+                    for i in selected
+                )
+            )
+            out_schema_columns.append(
+                ColumnSchema(item.output_name, item.out_type, nullable=item.nullable)
+            )
+    out_schema = Schema(out_schema_columns)
     return Table._from_storage(out_schema, out_columns)
 
 
@@ -1623,15 +1958,31 @@ def _build_groups(
     return [tuple(groups[key]) for key in order]
 
 
+def _row_values(source_columns: tuple[tuple, ...], i: int) -> tuple:
+    return tuple(col[i] for col in source_columns)
+
+
 def _make_row_comparator(
     source_columns: tuple[tuple, ...],
-    order_by: tuple[tuple[int, bool, bool], ...],
+    order_by: tuple[tuple, ...],
+    selected: list[int],
 ):
+    # Sort keys are computed for every row that passed WHERE, before the
+    # stable sort and LIMIT; expression keys (SELECT aliases) are evaluated
+    # here, so their errors surface even for rows LIMIT would cut.
+    key_sources: list[tuple] = []
+    for entry in order_by:
+        if entry[0] == "col":
+            key_sources.append((source_columns[entry[1]], entry[2], entry[3]))
+        else:  # "expr"
+            values = {
+                i: _eval(entry[1], _row_values(source_columns, i)) for i in selected
+            }
+            key_sources.append((values, entry[2], entry[3]))
+
     def compare(a: int, b: int) -> int:
-        for col_index, descending, nulls_first in order_by:
-            va = source_columns[col_index][a]
-            vb = source_columns[col_index][b]
-            c = _compare_scalar(va, vb, descending, nulls_first)
+        for values, descending, nulls_first in key_sources:
+            c = _compare_scalar(values[a], values[b], descending, nulls_first)
             if c:
                 return c
         return 0

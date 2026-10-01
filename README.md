@@ -113,13 +113,28 @@ FROM input
 投影项 := 列名
         | COUNT (*)
         | COUNT | SUM | AVG | MIN | MAX (列名)
-排序项 := (列名 | 聚合调用) [ASC | DESC] [NULLS FIRST | NULLS LAST]
+        | 标量表达式 AS 别名
+排序项 := (列名 | 聚合调用 | SELECT 别名) [ASC | DESC] [NULLS FIRST | NULLS LAST]
+标量表达式 := 数值列 | 数值字面量 | (标量表达式)
+           | +标量表达式 | -标量表达式
+           | 标量表达式 + - * / 标量表达式   （优先级：括号、一元、乘除、加减）
 ```
 
-- 投影只允许星号、逗号分隔的列名或聚合调用，不支持别名与嵌套调用；重复列、未知列抛
-  `QueryValidationError`。`FROM` 只接受固定表名 `input`（裸写大小写不敏感）。
+- 投影允许星号、逗号分隔的列名、聚合调用或带 `AS` 别名的数值标量表达式；别名沿用
+  标识符规则（可用双引号包裹），且不得与其他输出名重复。裸列与聚合调用不支持别名、
+  名称保持不变；重复列、重复别名、重复输出名、未知列抛 `QueryValidationError`。
+  `FROM` 只接受固定表名 `input`（裸写大小写不敏感）。
   列名与 schema 中的 Unicode 字符精确匹配；需要时可用双引号包裹标识符
   （内部用 `""` 转义一个双引号）。
+- 标量表达式支持括号、一元 `+`/`-` 与二元 `+`、`-`、`*`、`/`，操作数为 int64/float64
+  列与数值字面量。两个 int64 相加/减/乘结果为 int64；任一操作数为 float64 或执行除法
+  时结果为 float64；一元运算保留类型。任一操作数为 NULL 时结果为 NULL；输出列的
+  nullable 由参与列推导，纯常量表达式非空。int64 运算越界、除零、float64 结果非有限
+  时抛 `QueryValidationError`。非聚合查询的执行顺序为 `WHERE` → 计算排序键 → 稳定排序
+  → `LIMIT` → 结果表达式，因此被过滤或截掉的行不会触发 SELECT 中的除零或溢出。
+  `ORDER BY` 可引用 SELECT 的显式别名（别名与输入列同名时优先解析别名），并按表达式
+  的结果类型、NULL 位置与稳定排序规则排序。聚合查询不扩展：GROUP BY 键与聚合参数仍只
+  接受列引用或 `COUNT(*)`，聚合查询混入标量表达式时抛 `QueryValidationError`。
 - 聚合函数为 `COUNT(*)`、`COUNT(列)`、`SUM(列)`、`AVG(列)`、`MIN(列)`、`MAX(列)`，
   函数名大小写不敏感，结果列名为大写函数名加括号（列引用使用 schema 真实名）。
   `COUNT(*)` 计入选行，`COUNT(列)` 忽略 NULL，二者均为非空 int64；`SUM`/`AVG`
@@ -143,8 +158,9 @@ FROM input
   `WHERE` → 分组/聚合 → 排序 → `LIMIT`。
 - `WHERE` 支持括号、`NOT`、`AND`、`OR`、`=`、`!=`、`<`、`<=`、`>`、`>=`、
   `IS NULL`、`IS NOT NULL`；优先级从高到低为 `NOT`、比较、`AND`、`OR`。
-  操作数仅限列引用与字面量：`TRUE`/`FALSE`、int64 整数、有限 float64 数
-  （均支持前导 `+`/`-`）、单引号 utf8 字符串（内部用 `''` 转义单引号）；
+  比较两侧可使用列引用、字面量或数值标量表达式：字面量为 `TRUE`/`FALSE`、int64 整数、
+  有限 float64 数（均支持前导 `+`/`-`）、单引号 utf8 字符串（内部用 `''` 转义单引号）；
+  数值表达式直接充当布尔条件抛 `QueryValidationError`；
   WHERE 内不允许聚合（抛 `QueryValidationError`）。
 - int64 与 float64 可互比，utf8 只与 utf8 比较，bool 只支持 `=`/`!=`；
   不兼容组合抛 `QueryValidationError`。
@@ -193,8 +209,9 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
 
 ## 限制
 
-- 单文件 SQL 查询：`SELECT`（星号/列名/单层聚合投影）+ 固定表名 `input` + 可选
-  `WHERE`、`GROUP BY`、`ORDER BY`、`LIMIT`；不支持别名、聚合嵌套、WHERE 内聚合、
-  非聚合表达式投影、连接等。两文件入口额外支持一次 `INNER JOIN` / `LEFT JOIN`
-  等值连接（无别名、无复合 ON、无第二次连接）。
+- 单文件 SQL 查询：`SELECT`（星号/列名/单层聚合/带 `AS` 别名的数值标量表达式）+
+  固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`ORDER BY`、`LIMIT`；不支持裸列或聚合的
+  别名、聚合嵌套、WHERE 内聚合、聚合查询中的标量表达式、连接等。两文件入口额外支持一次
+  `INNER JOIN` / `LEFT JOIN` 等值连接（无别名、无复合 ON、无第二次连接），连接查询中
+  标量表达式的列引用同样必须限定表名。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
