@@ -307,6 +307,154 @@ def test_logical_operands_must_be_boolean(path):
 
 
 # ---------------------------------------------------------------------------
+# ORDER BY
+# ---------------------------------------------------------------------------
+
+
+def test_order_by_asc_default_nulls_last(path):
+    # n = 10, NULL, 30, 40, NULL
+    assert query_file(path, "select id from input order by n").column("id") == [1, 3, 4, 2, 5]
+
+
+def test_order_by_desc_keeps_nulls_last_by_default(path):
+    assert query_file(path, "select id from input order by n desc").column("id") == [4, 3, 1, 2, 5]
+
+
+def test_order_by_nulls_first_and_last_explicit(path):
+    assert query_file(path, "select id from input order by n asc nulls first").column("id") == [2, 5, 1, 3, 4]
+    assert query_file(path, "select id from input order by n desc nulls first").column("id") == [2, 5, 4, 3, 1]
+    assert query_file(path, "select id from input order by n asc nulls last").column("id") == [1, 3, 4, 2, 5]
+    assert query_file(path, "select id from input order by n desc nulls last").column("id") == [4, 3, 1, 2, 5]
+
+
+def test_order_by_keywords_case_insensitive(path):
+    sql = "select id from input order by n AsC NuLlS fIrSt"
+    assert query_file(path, sql).column("id") == [2, 5, 1, 3, 4]
+    assert query_file(
+        path, "select id from input ORDER BY n DESC LIMIT 2"
+    ).column("id") == [4, 3]
+
+
+def test_order_by_each_type(path):
+    # float64 numeric order, NULL last: f = 1.5, 2.5, NULL, -0.5, 10.0
+    assert query_file(path, "select id from input order by f").column("id") == [4, 1, 2, 5, 3]
+    # utf8 Unicode code point order, ties keep file order: s = a, b, NULL, a, c
+    assert query_file(path, "select id from input order by s").column("id") == [1, 4, 2, 5, 3]
+    assert query_file(path, "select id from input order by s desc").column("id") == [5, 2, 1, 4, 3]
+    # bool: FALSE < TRUE: flag = T, F, T, F, T
+    assert query_file(path, "select id from input order by flag, id").column("id") == [2, 4, 1, 3, 5]
+    # nullable bool, NULL last: flag_n = T, F, NULL, T, NULL
+    assert query_file(path, "select id from input order by flag_n, id").column("id") == [2, 1, 4, 3, 5]
+
+
+def test_order_by_unicode_and_quoted_identifier(path):
+    # い U+3044, ろ U+308D, NULL, は U+306F, へ U+3078
+    assert query_file(path, "select id from input order by 名前").column("id") == [1, 4, 5, 2, 3]
+    assert query_file(path, 'select id from input order by "名前" desc nulls first').column("id") == [3, 2, 5, 4, 1]
+
+
+def test_order_by_multiple_keys(path):
+    # FALSE rows 2,4 by descending id, then TRUE rows 1,3,5 by descending id
+    assert query_file(
+        path, "select id from input order by flag asc, id desc"
+    ).column("id") == [4, 2, 5, 3, 1]
+
+
+def test_order_by_column_need_not_be_projected(path):
+    result = query_file(path, "select id from input order by s asc nulls first, id asc")
+    assert result.column_names == ("id",)
+    assert result.column("id") == [3, 1, 4, 2, 5]
+
+
+def test_order_by_ties_keep_file_order(path):
+    # All sort keys equal -> original order; partial ties also stay stable.
+    assert query_file(path, "select id from input order by flag").column("id") == [2, 4, 1, 3, 5]
+    assert query_file(path, "select id from input where id >= 2 order by s").column("id") == [4, 2, 5, 3]
+
+
+def test_order_by_runs_after_where(path):
+    result = query_file(
+        path, "select id from input where id >= 3 order by s asc nulls first"
+    )
+    # qualifying rows 3 (s NULL), 4 ('a'), 5 ('c')
+    assert result.column("id") == [3, 4, 5]
+
+
+def test_order_by_unknown_column_is_validation_error(path):
+    with pytest.raises(QueryValidationError):
+        query_file(path, "select id from input order by missing")
+    with pytest.raises(QueryValidationError):
+        query_file(path, 'select id from input order by "order"')
+
+
+def test_order_by_duplicate_column_is_validation_error(path):
+    with pytest.raises(QueryValidationError):
+        query_file(path, "select id from input order by id, id")
+    with pytest.raises(QueryValidationError):
+        query_file(path, "select id from input order by n asc, n desc")
+
+
+def test_order_by_multiple_keys_with_nulls(path):
+    # FALSE group: id 2 (n NULL), id 4 (n 40) -> NULLS FIRST then DESC: 2, 4
+    # TRUE group:  id 5 (n NULL), id 3 (n 30), id 1 (n 10): 5, 3, 1
+    result = query_file(
+        path, "select id from input order by flag asc, n desc nulls first, id asc"
+    )
+    assert result.column("id") == [2, 4, 5, 3, 1]
+
+
+def test_order_by_does_not_change_columns(path):
+    result = query_file(path, "select s, id from input order by id desc limit 2")
+    assert result.column_names == ("s", "id")
+    assert result.column("s") == ["c", "a"]
+    assert result.column("id") == [5, 4]
+
+
+# ---------------------------------------------------------------------------
+# LIMIT
+# ---------------------------------------------------------------------------
+
+
+def test_limit_standalone(path):
+    assert query_file(path, "select id from input limit 2").column("id") == [1, 2]
+    assert query_file(path, "select id from input limit 0").column("id") == []
+
+
+def test_limit_after_where_keeps_file_order(path):
+    assert query_file(
+        path, "select id from input where id >= 2 limit 2"
+    ).column("id") == [2, 3]
+
+
+def test_limit_after_order_by(path):
+    assert query_file(
+        path, "select id from input order by id desc limit 3"
+    ).column("id") == [5, 4, 3]
+
+
+def test_limit_zero_preserves_columns(path):
+    result = query_file(path, "select id, s, flag from input order by n limit 0")
+    assert result.column_names == ("id", "s", "flag")
+    assert result.row_count == 0
+    assert result.columns == {"id": [], "s": [], "flag": []}
+
+
+def test_limit_larger_than_rows(path):
+    assert query_file(path, "select id from input limit 100").column("id") == [1, 2, 3, 4, 5]
+    assert query_file(
+        path, "select id from input order by id limit 9223372036854775807"
+    ).column("id") == [1, 2, 3, 4, 5]
+
+
+def test_limit_on_empty_file(tmp_path):
+    p = tmp_path / "empty.caef"
+    write_file(p, Table(SCHEMA, {name: [] for name in SCHEMA.names}))
+    result = query_file(p, "select id from input order by id limit 5")
+    assert result.column_names == ("id",)
+    assert result.row_count == 0
+
+
+# ---------------------------------------------------------------------------
 # Literals
 # ---------------------------------------------------------------------------
 
@@ -372,7 +520,6 @@ def test_unicode_string_literal(path):
         "select * from input where id = \"unterminated",
         "select * from input where id = 1 group by id",
         "INSERT INTO input VALUES (1)",
-        "select * from input limit 1",
         "select * from input where id = 1 or",
         "select * from input where id == 1",
         "select * from input where id =! 1",
@@ -380,6 +527,32 @@ def test_unicode_string_literal(path):
         "select * from input where id = 1e",
         "select * from 'input'",
         "select '' from input",
+        "select * from input order",
+        "select * from input order by",
+        "select * from input order by id,",
+        "select * from input order by ,id",
+        "select * from input order by id asc asc",
+        "select * from input order by id asc desc",
+        "select * from input order by id desc nulls",
+        "select * from input order by id nulls first asc",
+        "select * from input order by id asc nulls first nulls last",
+        "select * from input order by id asc nulls middle",
+        "select * from input order by id asc, n desc,",
+        "select * from input limit",
+        "select * from input limit -1",
+        "select * from input limit +1",
+        "select * from input limit 1.5",
+        "select * from input limit .5",
+        "select * from input limit 1e2",
+        "select * from input limit 0x1",
+        "select * from input limit 9223372036854775808",
+        "select * from input limit true",
+        "select * from input limit '1'",
+        "select * from input limit 1 order by id",
+        "select * from input where id = 1 limit 2 order by id",
+        "select * from input order by id order by n",
+        "select * from input limit 1 limit 2",
+        "select * from input where id = 1 group by id limit 1",
     ],
 )
 def test_syntax_errors(path, sql):
@@ -447,6 +620,10 @@ def test_syntax_checked_before_file_is_read(tmp_path, path):
     missing = tmp_path / "nope.caef"
     with pytest.raises(QuerySyntaxError):
         query_file(missing, "this is not sql")
+    with pytest.raises(QuerySyntaxError):
+        query_file(missing, "select * from input order by limit 3")
+    with pytest.raises(QuerySyntaxError):
+        query_file(missing, "select * from input limit -1")
     # With valid SQL, a missing file surfaces as an OSError.
     with pytest.raises(FileNotFoundError):
         query_file(missing, "select * from input")
@@ -507,6 +684,45 @@ def test_cli_query_deterministic_bytes(tmp_path, path):
             assert main(["query", str(path), sql]) == 0
         outs.add(buf.getvalue())
     assert len(outs) == 1
+
+
+def test_cli_query_order_and_limit(tmp_path, capsys, path):
+    sql = "select s from input where id >= 2 order by id desc nulls first limit 2"
+    assert main(["query", str(path), sql]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["columns"] == [{"name": "s", "type": "utf8", "nullable": True}]
+    assert payload["rows"] == [["c"], ["a"]]
+
+
+def test_cli_query_limit_zero_preserves_columns(tmp_path, capsys, path):
+    assert main(["query", str(path), "select n from input order by n limit 0"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["columns"] == [{"name": "n", "type": "int64", "nullable": True}]
+    assert payload["rows"] == []
+
+
+def test_cli_query_order_syntax_error_exit_code(tmp_path, capsys, path):
+    code = main(["query", str(path), "select id from input order by id desc asc"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err.strip()
+
+
+def test_cli_query_limit_out_of_range_exit_code(tmp_path, capsys, path):
+    code = main(["query", str(path), "select id from input limit 99999999999999999999"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err.strip()
+
+
+def test_cli_query_unknown_sort_column_exit_code(tmp_path, capsys, path):
+    code = main(["query", str(path), "select id from input order by missing"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err.strip()
 
 
 def test_cli_query_syntax_error(tmp_path, capsys, path):
