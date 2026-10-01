@@ -5,6 +5,7 @@
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
 （`SELECT` 投影、`WHERE` 过滤、`GROUP BY` 分组与 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
 聚合、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
+另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` 等值连接。
 
 ## 环境与安装
 
@@ -28,6 +29,7 @@ python -m pytest
 columnar-analytics-engine version                       # 打印版本号
 columnar-analytics-engine inspect <path>                # 输出文件元数据 JSON
 columnar-analytics-engine query <path> "<sql>"          # 对单个文件执行 SQL，输出结果 JSON
+columnar-analytics-engine query-files <sources-json> "<sql>"   # 对映射的多表执行 SQL（可含一次连接）
 columnar-analytics-engine --help                        # 打印用法
 ```
 
@@ -44,6 +46,11 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 （`QuerySyntaxError`）、校验错误（`QueryValidationError`）与文件格式错误
 （`ColumnarFormatError`）向标准错误输出消息并以码 2 退出；系统错误以码 1 退出。
 
+`query-files` 的 `<sources-json>` 是一个 JSON 对象，把表名映射到列式文件路径，例如
+`'{"l": "left.caef", "r": "right.caef"}'`；SQL 中的 `FROM`/`JOIN` 表名即取这些键。
+输出格式与退出码约定同 `query`；sources-json 本身非法（不是 JSON 对象、键不是非空
+字符串、值不是路径）也以码 2 退出。
+
 ## Python 公开接口
 
 包 `columnar_analytics` 导出：
@@ -53,6 +60,7 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 - `read_file(path, *, columns=None)`：读回表；`columns` 按调用方顺序投影部分列
 - `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
+- `query_files(sources, sql)`：对表名→路径映射执行 SQL（可含一次两表连接），成功返回 `Table`
 - `ColumnarFormatError`：所有文件格式错误的统一异常；系统错误保留 `OSError` 语义
 - `QuerySyntaxError`：SQL 词法/语法错误；`QueryValidationError`：未知列、错误表名、类型不兼容
 - `FORMAT_VERSION`、`__version__`
@@ -147,6 +155,34 @@ FROM input
   缺值/负数/小数/越界等统一抛 `QuerySyntaxError`，且在访问文件之前识别；
   文件损坏仍抛 `ColumnarFormatError`，系统错误保留 `OSError`。
 
+## 两文件连接查询
+
+`query_files(sources, sql)` 与 `columnar-analytics-engine query-files <sources-json> <sql>`
+在单文件语法基础上支持一次等值连接；`sources` 是表名到文件路径的非空映射
+（命令行用同一结构的 JSON 对象），只有被语句引用的表对应的文件会被读取：
+
+```sql
+SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.列
+[WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]
+```
+
+- 不支持别名、复合 `ON`、其他连接类型或第二次连接；词法错误、连接关键字缺失、
+  非法 `ON`、超过一次连接抛 `QuerySyntaxError`，且在读取任何源文件之前判定。
+- 连接查询中除 `COUNT(*)` 外的列引用都必须写成 `表名.列名`（两部分都可用双引号
+  标识符，延续精确匹配与 `""` 转义语义）；未限定列、未知表或列、重复表、连接键
+  来源错误（左右颠倒或来自同一表）、键类型不兼容、重复结果列抛
+  `QueryValidationError`。非连接查询沿用单表语义，列可限定也可不限定。
+- `SELECT *` 按左、右 schema 顺序输出，列名为 `表名.列名`；显式投影保留限定名，
+  聚合结果列名沿用大写函数格式并含限定参数（如 `SUM(r.x)`）。
+- 连接键类型须相同，或一为 int64 一为 float64；NULL 键永不匹配。`INNER JOIN`
+  输出全部匹配组合；`LEFT JOIN` 还输出未匹配左行并把右侧值置为 NULL，
+  右侧结果列 nullable 为 true。结果按左文件原始行序、同一左行内按右文件原始行序
+  展开，之后 `WHERE`、`GROUP BY`、聚合、`ORDER BY`、`LIMIT` 按单文件语义处理；
+  没有显式排序时相同输入与 SQL 重复执行输出字节一致。
+- `sources` 非映射或为空、键不是非空字符串、值不是路径对象时抛 `ValueError`，
+  且不会访问任何文件；已引用文件损坏仍抛 `ColumnarFormatError`，系统错误保留
+  `OSError`。
+
 ## 文件格式概览
 
 小端字节序：魔数 `CAEF` + 单字节格式版本 + uint32 头长度 + UTF-8 JSON 元数据头
@@ -157,7 +193,8 @@ FROM input
 
 ## 限制
 
-- SQL 仅支持单文件查询：`SELECT`（星号/列名/单层聚合投影）+ 固定表名 `input` + 可选
+- 单文件 SQL 查询：`SELECT`（星号/列名/单层聚合投影）+ 固定表名 `input` + 可选
   `WHERE`、`GROUP BY`、`ORDER BY`、`LIMIT`；不支持别名、聚合嵌套、WHERE 内聚合、
-  非聚合表达式投影、连接等。
+  非聚合表达式投影、连接等。两文件入口额外支持一次 `INNER JOIN` / `LEFT JOIN`
+  等值连接（无别名、无复合 ON、无第二次连接）。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。

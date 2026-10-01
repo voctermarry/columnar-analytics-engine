@@ -50,12 +50,35 @@ groups equal on every sort key keep that first-row order.  LIMIT then
 keeps the first N groups.  Without GROUP BY and aggregates an aggregate
 query over zero selected rows still yields one output row (COUNT 0, the
 other aggregates NULL); with GROUP BY it yields zero rows.
+
+Two-file queries (:func:`query_files`) add one equi-join to the grammar::
+
+    query := SELECT ... FROM left_table [join_kind JOIN right_table
+             ON left_table.column = right_table.column] ...
+    join_kind := INNER | LEFT
+
+``sources`` maps table names to file paths; only the tables referenced by
+the statement are read.  Aliases, compound ON conditions, other join types
+and a second join are rejected as syntax errors before any file is opened.
+In a join query every column reference outside ``COUNT(*)`` must be
+qualified as ``table.column`` (either part may be a double-quoted
+identifier).  ``SELECT *`` emits the left schema followed by the right
+schema with ``table.column`` names; explicit projections keep their
+qualified names and aggregates keep the uppercase ``FUNC(table.column)``
+labels.  Join keys may share a type or mix int64 with float64; NULL keys
+never match.  INNER JOIN emits every matching combination, LEFT JOIN also
+emits unmatched left rows with the right-side values set to NULL (the
+right result columns are nullable).  Rows expand in left-file order, and
+within one left row in right-file order, before WHERE / GROUP BY /
+ORDER BY / LIMIT apply with their usual semantics.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
@@ -66,6 +89,7 @@ __all__ = [
     "QuerySyntaxError",
     "QueryValidationError",
     "query_file",
+    "query_files",
 ]
 
 _KEYWORDS = frozenset(
@@ -89,6 +113,10 @@ _KEYWORDS = frozenset(
         "last",
         "limit",
         "group",
+        "inner",
+        "left",
+        "join",
+        "on",
     )
 )
 
@@ -178,11 +206,14 @@ def _tokenize(sql: str) -> list[_Token]:
             match = _NUMBER_RE.match(sql, i)
             if match:
                 text = match.group(0)
-                if text == ".":
-                    raise QuerySyntaxError(f"unexpected character '.' at position {i}")
                 tokens.append(_Token("number", _parse_number(text), text))
                 i = match.end()
                 continue
+            # A '.' that does not start a number is the qualifier separator
+            # used by two-table queries ("table.column").
+            tokens.append(_Token("op", ".", ch))
+            i += 1
+            continue
         match = _IDENT_RE.match(sql, i)
         if match:
             text = match.group(0)
@@ -269,7 +300,8 @@ def _parse_number(text: str) -> int | float:
 #
 # Node tuples:
 #   ("literal", python_value, type_name)
-#   ("column", name, index, type_name, nullable)
+#   ("column", name, table|None, table_quoted)        -- as parsed
+#   ("column", name, index, type_name, nullable)      -- after binding
 #   ("cmp", op, left_node, right_node)
 #   ("isnull", operand, negate)
 #   ("not", operand)
@@ -292,6 +324,22 @@ class _RefItem:
     arg: str | None = None  # aggregate column argument; "" stands for '*'
     descending: bool = False
     nulls_first: bool | None = None  # None -> default (NULLs last)
+    # Table qualifiers (two-table queries only; None when unqualified):
+    table: str | None = None
+    table_quoted: bool = False
+    arg_table: str | None = None
+    arg_table_quoted: bool = False
+
+
+@dataclass(frozen=True)
+class _Join:
+    """The single optional equi-join of a two-table query."""
+
+    kind: str  # "inner" | "left"
+    table: str  # right table name as spelled
+    table_quoted: bool
+    left_key: tuple  # (table, table_quoted, column)
+    right_key: tuple  # (table, table_quoted, column)
 
 
 @dataclass
@@ -300,9 +348,11 @@ class _Select:
     table: str
     table_quoted: bool
     where: tuple | None
-    group_by: tuple[str, ...] | None
+    # GROUP BY entries are (table|None, table_quoted, name) triples.
+    group_by: tuple[tuple, ...] | None
     order_by: tuple[_RefItem, ...] | None
     limit: int | None
+    join: _Join | None = None
 
     @property
     def star(self) -> bool:
@@ -320,9 +370,13 @@ class _Select:
 class _Parser:
     _CMP_OPS = frozenset(("=", "!=", "<", "<=", ">", ">="))
 
-    def __init__(self, tokens: list[_Token]):
+    def __init__(self, tokens: list[_Token], allow_join: bool = False):
         self.tokens = tokens
         self.pos = 0
+        # Two-table statements (qualified names + one JOIN clause) are only
+        # enabled for query_files; single-file entry points keep rejecting
+        # them as syntax errors.
+        self._allow_join = allow_join
 
     def parse(self) -> _Select:
         select = self._parse_select()
@@ -336,15 +390,23 @@ class _Parser:
         items = tuple(self._parse_projection())
         self._expect_keyword("from")
         table_tok = self._expect_table_name()
+        join = None
+        if self._allow_join:
+            if self._accept_keyword("inner"):
+                self._expect_keyword("join")
+                join = self._parse_join("inner")
+            elif self._accept_keyword("left"):
+                self._expect_keyword("join")
+                join = self._parse_join("left")
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
         group_by = None
         if self._accept_keyword("group"):
             self._expect_keyword("by")
-            names = [self._expect_identifier_name()]
+            names = [self._parse_group_name()]
             while self._accept_op(","):
-                names.append(self._expect_identifier_name())
+                names.append(self._parse_group_name())
             group_by = tuple(names)
         order_by = None
         if self._accept_keyword("order"):
@@ -364,7 +426,41 @@ class _Parser:
             group_by=group_by,
             order_by=order_by,
             limit=limit,
+            join=join,
         )
+
+    def _parse_join(self, kind: str) -> _Join:
+        table_tok = self._expect_table_name()
+        self._expect_keyword("on")
+        left_key = self._parse_on_key()
+        self._expect_op("=")
+        right_key = self._parse_on_key()
+        return _Join(
+            kind=kind,
+            table=table_tok.value,
+            table_quoted=table_tok.kind == "qident",
+            left_key=left_key,
+            right_key=right_key,
+        )
+
+    def _parse_on_key(self) -> tuple:
+        tok = self._peek()
+        if tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(
+                f"ON requires table-qualified columns, got {tok.text!r}"
+            )
+        self._next()
+        if not self._accept_op("."):
+            raise QuerySyntaxError(
+                "ON requires table-qualified columns (table.column)"
+            )
+        nxt = self._peek()
+        if nxt.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(
+                f"expected column name after '.' in ON, got {nxt.text!r}"
+            )
+        self._next()
+        return (tok.value, tok.kind == "qident", nxt.value)
 
     def _parse_projection(self) -> list[_RefItem]:
         items = [self._parse_select_item()]
@@ -419,12 +515,39 @@ class _Parser:
             arg=item.arg,
             descending=descending,
             nulls_first=nulls_first,
+            table=item.table,
+            table_quoted=item.table_quoted,
+            arg_table=item.arg_table,
+            arg_table_quoted=item.arg_table_quoted,
+        )
+
+    def _qualifier_ahead(self) -> bool:
+        nxt = self.tokens[self.pos + 1]
+        return nxt.kind == "op" and nxt.value == "."
+
+    def _parse_qualified_column(self) -> _RefItem:
+        # Current token starts "table.column"; consumes all three tokens.
+        table_tok = self._next()
+        self._expect_op(".")
+        name_tok = self._peek()
+        if name_tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(
+                f"expected identifier after '.', got {name_tok.text!r}"
+            )
+        self._next()
+        return _RefItem(
+            "column",
+            name=name_tok.value,
+            table=table_tok.value,
+            table_quoted=table_tok.kind == "qident",
         )
 
     def _parse_column_or_agg(self) -> _RefItem:
         tok = self._peek()
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        if self._allow_join and self._qualifier_ahead():
+            return self._parse_qualified_column()
         # A quoted identifier, or a bare word not spelled like an aggregate,
         # can only be a plain column reference.
         if tok.kind == "qident" or tok.value.lower() not in _AGG_NAMES:
@@ -436,23 +559,38 @@ class _Parser:
             # e.g. a column literally named "count" -- the name token is
             # already consumed, so it is a plain column reference.
             return _RefItem("column", name=tok.value)
-        self._parse_aggregate_args(func)
+        arg, arg_table, arg_table_quoted = self._parse_aggregate_args(func)
         self._expect_op(")")
-        return _RefItem("agg", func=func.upper(), arg=self._agg_arg)
+        return _RefItem(
+            "agg",
+            func=func.upper(),
+            arg=arg,
+            arg_table=arg_table,
+            arg_table_quoted=arg_table_quoted,
+        )
 
-    def _parse_aggregate_args(self, func: str) -> None:
-        # Exactly one argument: '*' for COUNT, otherwise one identifier.
+    def _parse_aggregate_args(self, func: str) -> tuple:
+        # Exactly one argument: '*' for COUNT, otherwise one (possibly
+        # table-qualified) identifier.  Returns (name, table, table_quoted);
+        # name "" stands for '*'.
         tok = self._peek()
         if tok.kind == "star":
             if func != "count":
                 raise QuerySyntaxError(f"{func.upper()} does not accept '*'")
             self._next()
-            self._agg_arg = ""
-            return
+            return ("", None, False)
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(
                 f"{func.upper()} requires one column argument, got {tok.text!r}"
             )
+        if self._allow_join and self._qualifier_ahead():
+            item = self._parse_qualified_column()
+            nxt = self._peek()
+            if nxt.kind == "op" and nxt.value == "(":
+                raise QuerySyntaxError(
+                    f"{func.upper()} argument must be a column name, not a function call"
+                )
+            return (item.name, item.table, item.table_quoted)
         self._next()
         nxt = self._peek()
         if nxt.kind == "op" and nxt.value == "(":
@@ -464,7 +602,7 @@ class _Parser:
             raise QuerySyntaxError(
                 f"{func.upper()} argument must be a column name, not a function call"
             )
-        self._agg_arg = tok.value
+        return (tok.value, None, False)
 
     def _parse_limit(self) -> int:
         tok = self._peek()
@@ -487,12 +625,16 @@ class _Parser:
             return self._next()
         raise QuerySyntaxError(f"expected table name, got {tok.text!r}")
 
-    def _expect_identifier_name(self) -> str:
+    def _parse_group_name(self) -> tuple:
+        # Returns a (table|None, table_quoted, name) triple.
         tok = self._peek()
-        if tok.kind in ("ident", "qident"):
-            self._next()
-            return tok.value
-        raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        if tok.kind not in ("ident", "qident"):
+            raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
+        if self._allow_join and self._qualifier_ahead():
+            item = self._parse_qualified_column()
+            return (item.table, item.table_quoted, item.name)
+        self._next()
+        return (None, False, tok.value)
 
     # WHERE expression grammar ------------------------------------------------
 
@@ -572,6 +714,9 @@ class _Parser:
         if tok.kind in ("ident", "qident"):
             if sign == -1:
                 raise QuerySyntaxError("column reference cannot be negated")
+            if self._allow_join and self._qualifier_ahead():
+                item = self._parse_qualified_column()
+                return ("column", item.name, item.table, item.table_quoted)
             nxt = self.tokens[self.pos + 1]
             if (
                 tok.kind == "ident"
@@ -583,7 +728,7 @@ class _Parser:
                     f"aggregate {tok.value.upper()}(...) is not allowed in WHERE"
                 )
             self._next()
-            return ("column", tok.value, None, None, None)
+            return ("column", tok.value, None, False)
         if tok.kind == "keyword":
             raise QuerySyntaxError(f"unexpected keyword {tok.text.upper()!r} in expression")
         raise QuerySyntaxError(f"unexpected token {tok.text!r} in expression")
@@ -652,14 +797,17 @@ class _BoundItem:
     nullable: bool = True
 
 
-def _bind_select(select: _Select, schema: Schema) -> dict:
-    table_matches = (
-        select.table == "input"
-        if select.table_quoted
-        else select.table.lower() == "input"
-    )
-    if not table_matches:
-        raise QueryValidationError(f"unknown table {select.table!r}; only 'input' is supported")
+def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dict:
+    if expected_table is not None:
+        table_matches = (
+            select.table == expected_table
+            if select.table_quoted
+            else select.table.lower() == expected_table.lower()
+        )
+        if not table_matches:
+            raise QueryValidationError(
+                f"unknown table {select.table!r}; only {expected_table!r} is supported"
+            )
 
     where = _bind_expr(select.where, schema) if select.where is not None else None
     if where is not None and where[0] in ("literal", "column"):
@@ -736,10 +884,12 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
         raise QueryValidationError("'*' cannot be combined with aggregates or GROUP BY")
 
     # Resolve GROUP BY columns first: order matters for the grouping key, and
-    # duplicates / unknown columns are rejected here.
+    # duplicates / unknown columns are rejected here.  Entries are
+    # (table, table_quoted, name) triples; names reaching the binder are
+    # already canonical (single-file queries never carry a qualifier).
     group_indices: list[int] = []
     group_seen: set[str] = set()
-    for name in select.group_by or ():
+    for _table, _table_quoted, name in select.group_by or ():
         if name in group_seen:
             raise QueryValidationError(f"duplicate column in GROUP BY: {name!r}")
         group_seen.add(name)
@@ -1129,8 +1279,247 @@ def query_table(table: Table, sql: str) -> Table:
     return _run_query(table, select)
 
 
-def _run_query(table: Table, select: _Select) -> Table:
-    bound = _bind_select(select, table.schema)
+def query_files(sources: Any, sql: str) -> Table:
+    """Run ``sql`` against the tables named by ``sources``.
+
+    ``sources`` maps table names to columnar file paths; only the tables
+    referenced by the statement are read.  The statement may join two of
+    them once (``INNER JOIN`` / ``LEFT JOIN ... ON t1.col = t2.col``); see
+    the module docstring for the exact grammar and semantics.
+
+    A non-mapping or empty ``sources``, non-string keys or non-path values
+    raise :class:`ValueError` before any file is touched.  Lexical and
+    grammatical errors (including join-keyword, ON and multiple-join
+    problems) raise :class:`QuerySyntaxError` before any file is read.
+    Unknown tables or columns, unqualified column references in a join
+    query, duplicate tables, misattributed or type-incompatible join keys
+    and duplicate result columns raise :class:`QueryValidationError`;
+    malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
+    other I/O failures propagate as :class:`OSError`.
+    """
+    paths = _validate_sources(sources)
+    tokens = _tokenize(sql)
+    select = _Parser(tokens, allow_join=True).parse()
+    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
+    if select.join is None:
+        rewritten = _rewrite_select(select, _single_table_resolver(left_key))
+        table = read_file(paths[left_key])
+        return _run_query(table, rewritten, expected_table=None)
+
+    join = select.join
+    right_key = _resolve_table_ref(join.table, join.table_quoted, tuple(paths))
+    if right_key == left_key:
+        raise QueryValidationError(f"duplicate table {right_key!r} in join")
+    on_left = _resolve_table_ref(join.left_key[0], join.left_key[1], (left_key, right_key))
+    on_right = _resolve_table_ref(join.right_key[0], join.right_key[1], (left_key, right_key))
+    if on_left != left_key or on_right != right_key:
+        raise QueryValidationError(
+            "ON keys must reference the left and right tables respectively"
+        )
+    # Qualifier checks (unqualified / unknown-table column references) do
+    # not need the files and run before any read.
+    rewritten = _rewrite_select(select, _join_resolver(left_key, right_key))
+    left_table = read_file(paths[left_key])
+    right_table = read_file(paths[right_key])
+    combined = _build_joined_table(left_key, left_table, right_key, right_table, join)
+    return _run_query(combined, rewritten, expected_table=None)
+
+
+def _validate_sources(sources: Any) -> dict:
+    if not isinstance(sources, Mapping):
+        raise ValueError("sources must be a mapping of table names to file paths")
+    if not sources:
+        raise ValueError("sources must not be empty")
+    paths = {}
+    for key, value in sources.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("sources keys must be non-empty strings")
+        if not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"sources[{key!r}] must be a file path")
+        paths[key] = value
+    return paths
+
+
+def _resolve_table_ref(name: str, quoted: bool, candidates: tuple) -> str:
+    """Resolve a table reference against the available canonical names.
+
+    Quoted references match exactly; bare references match exactly first,
+    then case-insensitively when that is unambiguous.
+    """
+    if name in candidates:
+        return name
+    if not quoted:
+        lowered = name.lower()
+        matches = [c for c in candidates if c.lower() == lowered]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise QueryValidationError(f"ambiguous table name {name!r}")
+    raise QueryValidationError(f"unknown table {name!r}")
+
+
+def _single_table_resolver(table_key: str):
+    def resolve(table, table_quoted, column):
+        if table is not None:
+            _resolve_table_ref(table, table_quoted, (table_key,))
+        return column
+
+    return resolve
+
+
+def _join_resolver(left_key: str, right_key: str):
+    def resolve(table, table_quoted, column):
+        if table is None:
+            raise QueryValidationError(
+                f"column reference {column!r} must be qualified with a table name"
+            )
+        key = _resolve_table_ref(table, table_quoted, (left_key, right_key))
+        return f"{key}.{column}"
+
+    return resolve
+
+
+def _rewrite_select(select: _Select, resolve) -> _Select:
+    """Resolve every column reference to its canonical output name."""
+    items = tuple(_rewrite_ref_item(item, resolve) for item in select.items)
+    group_by = None
+    if select.group_by is not None:
+        group_by = tuple(
+            (None, False, resolve(table, quoted, name))
+            for table, quoted, name in select.group_by
+        )
+    order_by = None
+    if select.order_by is not None:
+        order_by = tuple(_rewrite_ref_item(item, resolve) for item in select.order_by)
+    where = _rewrite_expr(select.where, resolve) if select.where is not None else None
+    return _Select(
+        items=items,
+        table=select.table,
+        table_quoted=select.table_quoted,
+        where=where,
+        group_by=group_by,
+        order_by=order_by,
+        limit=select.limit,
+    )
+
+
+def _rewrite_ref_item(item: _RefItem, resolve) -> _RefItem:
+    if item.kind == "star":
+        return item
+    if item.kind == "column":
+        return _RefItem(
+            "column",
+            name=resolve(item.table, item.table_quoted, item.name),
+            descending=item.descending,
+            nulls_first=item.nulls_first,
+        )
+    arg = item.arg
+    if arg:
+        arg = resolve(item.arg_table, item.arg_table_quoted, arg)
+    return _RefItem(
+        "agg",
+        func=item.func,
+        arg=arg,
+        descending=item.descending,
+        nulls_first=item.nulls_first,
+    )
+
+
+def _rewrite_expr(node: tuple, resolve) -> tuple:
+    tag = node[0]
+    if tag == "literal":
+        return node
+    if tag == "column":
+        return ("column", resolve(node[2], node[3], node[1]), None, False)
+    if tag == "not":
+        return ("not", _rewrite_expr(node[1], resolve))
+    if tag in ("and", "or"):
+        return (tag, _rewrite_expr(node[1], resolve), _rewrite_expr(node[2], resolve))
+    if tag == "isnull":
+        return ("isnull", _rewrite_expr(node[1], resolve), node[2])
+    if tag == "cmp":
+        return ("cmp", node[1], _rewrite_expr(node[2], resolve), _rewrite_expr(node[3], resolve))
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _build_joined_table(
+    left_key: str, left: Table, right_key: str, right: Table, join: _Join
+) -> Table:
+    left_col = join.left_key[2]
+    right_col = join.right_key[2]
+    try:
+        left_idx = left.schema.index(left_col)
+    except KeyError:
+        raise QueryValidationError(
+            f"unknown column: {f'{left_key}.{left_col}'!r}"
+        ) from None
+    try:
+        right_idx = right.schema.index(right_col)
+    except KeyError:
+        raise QueryValidationError(
+            f"unknown column: {f'{right_key}.{right_col}'!r}"
+        ) from None
+    left_type = left.schema.columns[left_idx].type
+    right_type = right.schema.columns[right_idx].type
+    if left_type != right_type and not {left_type, right_type} <= {"int64", "float64"}:
+        raise QueryValidationError(
+            f"join key types are incompatible: {left_type} and {right_type}"
+        )
+
+    # The combined schema is left columns then right columns, named
+    # "table.column"; a LEFT JOIN makes every right-side column nullable.
+    combined_columns = [
+        ColumnSchema(f"{left_key}.{col.name}", col.type, col.nullable)
+        for col in left.schema.columns
+    ] + [
+        ColumnSchema(
+            f"{right_key}.{col.name}",
+            col.type,
+            True if join.kind == "left" else col.nullable,
+        )
+        for col in right.schema.columns
+    ]
+    names = [col.name for col in combined_columns]
+    if len(set(names)) != len(names):
+        raise QueryValidationError("joined tables produce duplicate column names")
+    schema = Schema(combined_columns)
+    columns = _join_columns(left, right, left_idx, right_idx, join.kind)
+    return Table._from_storage(schema, columns)
+
+
+def _join_columns(
+    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
+) -> list:
+    """Nested-loop equi-join preserving left-then-right file row order."""
+    left_cols = left._columns
+    right_cols = right._columns
+    left_width = len(left_cols)
+    right_width = len(right_cols)
+    # NULL keys never match, so they stay out of the right-side index.
+    index: dict[Any, list[int]] = {}
+    for j, key in enumerate(right_cols[right_idx]):
+        if key is not None:
+            index.setdefault(key, []).append(j)
+    out = [[] for _ in range(left_width + right_width)]
+    for i in range(left.row_count):
+        key = left_cols[left_idx][i]
+        matches = index.get(key) if key is not None else None
+        if matches:
+            for j in matches:
+                for c in range(left_width):
+                    out[c].append(left_cols[c][i])
+                for c in range(right_width):
+                    out[left_width + c].append(right_cols[c][j])
+        elif kind == "left":
+            for c in range(left_width):
+                out[c].append(left_cols[c][i])
+            for c in range(right_width):
+                out[left_width + c].append(None)
+    return out
+
+
+def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
+    bound = _bind_select(select, table.schema, expected_table)
     source_columns = table._columns
     row_count = table.row_count
     where = bound["where"]

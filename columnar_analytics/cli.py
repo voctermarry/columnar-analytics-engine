@@ -8,9 +8,30 @@ import sys
 
 from . import __version__
 from .format import ColumnarFormatError, inspect_file
-from .query import QuerySyntaxError, QueryValidationError, query_file
+from .query import QuerySyntaxError, QueryValidationError, query_file, query_files
 
 _QUERY_ERRORS = (QuerySyntaxError, QueryValidationError, ColumnarFormatError)
+
+
+def _print_query_result(table) -> int:
+    payload = {
+        "columns": [
+            {"name": col.name, "type": col.type, "nullable": col.nullable}
+            for col in table.schema.columns
+        ],
+        "rows": [
+            [table._columns[c][r] for c in range(len(table.schema.columns))]
+            for r in range(table.row_count)
+        ],
+    }
+    out = sys.stdout
+    try:
+        out.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    json.dump(payload, out, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    out.write("\n")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     query_parser = sub.add_parser("query", help="query a columnar file with SQL and print JSON")
     query_parser.add_argument("path", help="path to the columnar file")
     query_parser.add_argument("sql", help="SELECT statement to run against the file")
+    query_files_parser = sub.add_parser("query-files", help="query two columnar files with a join and print JSON")
+    query_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
+    query_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -55,24 +79,26 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        payload = {
-            "columns": [
-                {"name": col.name, "type": col.type, "nullable": col.nullable}
-                for col in table.schema.columns
-            ],
-            "rows": [
-                [table._columns[c][r] for c in range(len(table.schema.columns))]
-                for r in range(table.row_count)
-            ],
-        }
-        out = sys.stdout
+        return _print_query_result(table)
+
+    if args.command == "query-files":
         try:
-            out.reconfigure(encoding="utf-8")
-        except (AttributeError, ValueError):
-            pass
-        json.dump(payload, out, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        out.write("\n")
-        return 0
+            sources = json.loads(args.sources)
+        except json.JSONDecodeError as exc:
+            print(f"invalid sources JSON: {exc}", file=sys.stderr)
+            return 2
+        try:
+            table = query_files(sources, args.sql)
+        except _QUERY_ERRORS as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return _print_query_result(table)
 
     parser.print_help()
     return 0

@@ -16,6 +16,7 @@ from .query import (
     QuerySyntaxError,
     QueryValidationError,
     query_file,
+    query_files,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "QuerySyntaxError",
     "QueryValidationError",
     "query_file",
+    "query_files",
 ]
