@@ -83,12 +83,18 @@ def paths(tmp_path):
 JOIN_SQL = [
     "SELECT * FROM l INNER JOIN r ON l.k = r.k",
     "SELECT * FROM l LEFT JOIN r ON l.k = r.k",
+    "SELECT * FROM l RIGHT JOIN r ON l.k = r.k",
+    "SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k",
     "SELECT l.id, r.rid FROM l INNER JOIN r ON l.k = r.k "
     "WHERE r.tag IS NOT NULL ORDER BY l.id DESC, r.rid ASC LIMIT 3",
     "SELECT l.name, COUNT(*), SUM(r.rid) FROM l LEFT JOIN r ON l.k = r.k "
     "GROUP BY l.name HAVING COUNT(*) >= 1 ORDER BY l.name",
     "SELECT l.id, r.rid, l.k + r.k AS s FROM l INNER JOIN r ON l.k = r.k "
     "WHERE l.k + r.k > 15 ORDER BY s",
+    "SELECT l.id, r.rid FROM l RIGHT JOIN r ON l.k = r.k "
+    "WHERE l.id IS NULL OR r.tag IS NULL ORDER BY r.rid",
+    "SELECT l.id, r.rid FROM l FULL OUTER JOIN r ON l.k = r.k "
+    "ORDER BY r.rid NULLS FIRST, l.id NULLS FIRST LIMIT 4",
 ]
 
 
@@ -101,7 +107,7 @@ def test_strategies_match_default_path(paths, sql, strategy):
     assert joined_rows(chosen) == joined_rows(default)
 
 
-def test_strategies_match_each_other_inner_and_left(paths):
+def test_strategies_match_each_other_all_kinds(paths):
     expected_inner = [
         # Left file order; within one left row the right matches follow the
         # right file's original order (rid 200 before 400 for key 10).
@@ -118,12 +124,36 @@ def test_strategies_match_each_other_inner_and_left(paths):
         [4, None, "d", None, None, None],
         expected_inner[5],
     ]
-    for kind, expected in (("INNER", expected_inner), ("LEFT", expected_left)):
-        sql = f"SELECT * FROM l {kind} JOIN r ON l.k = r.k"
+    # RIGHT follows right-file order (rid 100/30/500 first) with each right
+    # row's matches in left-file order; the NULL-keyed right row (rid 300)
+    # and the key-20-only right row (rid 500) keep their file positions.
+    expected_right = [
+        [5, 30, "e", 100, 30, "p"],
+        [1, 10, "a", 200, 10, "q"],
+        [3, 10, "c", 200, 10, "q"],
+        [None, None, None, 300, None, None],
+        [1, 10, "a", 400, 10, "r"],
+        [3, 10, "c", 400, 10, "r"],
+        [2, 20, "b", 500, 20, "s"],
+    ]
+    # FULL is the LEFT output followed by the unmatched right rows (only the
+    # NULL-keyed rid 300) in right-file order.
+    expected_full = expected_left + [
+        [None, None, None, 300, None, None],
+    ]
+    for kind, spelling, expected in (
+        ("INNER", "INNER", expected_inner),
+        ("LEFT", "LEFT", expected_left),
+        ("RIGHT", "RIGHT", expected_right),
+        ("FULL", "FULL OUTER", expected_full),
+    ):
+        sql = f"SELECT * FROM l {spelling} JOIN r ON l.k = r.k"
+        default_rows = joined_rows(query_files(paths, sql))
         hash_rows = joined_rows(query_files(paths, sql, "hash"))
         merge_rows = joined_rows(query_files(paths, sql, "sort_merge"))
-        assert hash_rows == expected
-        assert merge_rows == expected
+        assert default_rows == expected, kind
+        assert hash_rows == expected, kind
+        assert merge_rows == expected, kind
 
 
 def test_int64_float64_mixed_keys_and_signed_zero(tmp_path):
@@ -260,6 +290,58 @@ def test_explain_strategy_matches_query_and_export(paths):
         query_result = query_files(paths, sql, strategy)
         # Output schema in the plan matches the strategy's query result.
         assert plan["output"] == schema_dicts(query_result)
+
+
+@pytest.mark.parametrize(
+    "spelling,label", [("RIGHT JOIN", "RIGHT"), ("FULL OUTER JOIN", "FULL")]
+)
+@pytest.mark.parametrize("strategy", [None, "hash", "sort_merge"])
+def test_explain_right_and_full(paths, spelling, label, strategy):
+    sql = f"SELECT * FROM l {spelling} r ON l.k = r.k"
+    plan = explain_files(paths, sql, strategy)
+    join_ops = [op for op in plan["operators"] if op["operator"] == "Join"]
+    expected_op = {
+        "operator": "Join",
+        "type": label,
+        "left": {"table": "l", "column": "k"},
+        "right": {"table": "r", "column": "k"},
+    }
+    if strategy is not None:
+        expected_op["strategy"] = (
+            "HASH" if strategy == "hash" else "SORT_MERGE"
+        )
+    assert join_ops == [expected_op]
+    query_result = query_files(paths, sql, strategy)
+    assert plan["output"] == schema_dicts(query_result)
+
+
+@pytest.mark.parametrize("spelling", ["RIGHT JOIN", "FULL OUTER JOIN"])
+def test_export_right_and_full_byte_stable(paths, tmp_path, spelling):
+    sources_json = json.dumps({"l": str(paths["l"]), "r": str(paths["r"])})
+    sql = f"SELECT l.id, r.rid FROM l {spelling} r ON l.k = r.k"
+    outputs = {}
+    for strategy, label in ((None, "default"), ("hash", "hash"), ("sort_merge", "merge")):
+        dst = tmp_path / f"{label}.csv"
+        argv = ["export-files", sources_json, sql, str(dst)]
+        if strategy is not None:
+            argv += ["--join-strategy", strategy]
+        assert main(argv) == 0
+        outputs[label] = dst.read_bytes()
+    assert outputs["default"] == outputs["hash"] == outputs["merge"]
+
+
+def test_full_without_outer_is_syntax_error(paths):
+    # Grammar change is restricted to the exact FULL OUTER JOIN spelling;
+    # parsing happens before any file is read.
+    missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
+    for sql in (
+        "SELECT * FROM l FULL JOIN r ON l.k = r.k",
+        "SELECT * FROM l RIGHT OUTER JOIN r ON l.k = r.k",
+        "SELECT * FROM l FULL INNER JOIN r ON l.k = r.k",
+    ):
+        with pytest.raises(Exception) as excinfo:
+            query_files(missing, sql)
+        assert type(excinfo.value).__name__ == "QuerySyntaxError"
 
 
 # ---------------------------------------------------------------------------

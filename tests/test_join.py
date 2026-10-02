@@ -138,6 +138,163 @@ def test_left_join_explicit_projection_right_nullable(paths):
     assert cols["r.tag"].nullable is True
 
 
+def test_right_join_star(paths):
+    result = query_files(paths, "SELECT * FROM l RIGHT JOIN r ON l.k = r.k")
+    assert result.column_names == ("l.id", "l.k", "l.name", "r.rid", "r.k", "r.tag")
+    # Right-file order; within one right row the matches expand in left-file
+    # order; the unmatched right row (rid 300) pads the left side with NULL.
+    assert joined_rows(result) == [
+        [1, 10, "a", 100, 10, "x"],
+        [3, 10, "c", 100, 10, "x"],
+        [1, 10, "a", 200, 10, "y"],
+        [3, 10, "c", 200, 10, "y"],
+        [None, None, None, 300, 30, "z"],
+    ]
+    # RIGHT JOIN forces every left-side result column nullable; the right
+    # side keeps its file-declared nullability.
+    assert [c.nullable for c in result.schema.columns] == [True, True, True, False, True, True]
+
+
+def test_right_join_explicit_projection_left_nullable(paths):
+    result = query_files(paths, "SELECT l.id, r.rid FROM l RIGHT JOIN r ON l.k = r.k")
+    cols = {c.name: c for c in result.schema.columns}
+    assert cols["l.id"].nullable is True
+    assert cols["r.rid"].nullable is False
+    assert joined_rows(result) == [
+        [1, 100],
+        [3, 100],
+        [1, 200],
+        [3, 200],
+        [None, 300],
+    ]
+
+
+def test_full_outer_join_star(paths):
+    result = query_files(paths, "SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k")
+    # Matches and unmatched left rows follow LEFT JOIN order; unmatched
+    # right rows are then appended in right-file order.
+    assert joined_rows(result) == [
+        [1, 10, "a", 100, 10, "x"],
+        [1, 10, "a", 200, 10, "y"],
+        [2, 20, "b", None, None, None],
+        [3, 10, "c", 100, 10, "x"],
+        [3, 10, "c", 200, 10, "y"],
+        [4, None, "d", None, None, None],
+        [None, None, None, 300, 30, "z"],
+    ]
+    # FULL OUTER JOIN forces every result column on both sides nullable.
+    assert [c.nullable for c in result.schema.columns] == [True, True, True, True, True, True]
+
+
+def test_full_outer_join_keywords_case_insensitive(paths):
+    result = query_files(paths, "select * from l full outer join r on l.k = r.k")
+    assert result.row_count == 7
+
+
+def test_right_join_where_order_limit(paths):
+    result = query_files(
+        paths,
+        "SELECT l.id, r.rid FROM l RIGHT JOIN r ON l.k = r.k "
+        "WHERE r.tag IS NOT NULL ORDER BY r.rid ASC, l.id ASC",
+    )
+    assert joined_rows(result) == [
+        [1, 100],
+        [3, 100],
+        [1, 200],
+        [3, 200],
+        [None, 300],
+    ]
+
+
+def test_right_join_padded_null_participates_in_where(paths):
+    # The padded NULL on the left follows three-valued logic in WHERE.
+    result = query_files(
+        paths,
+        "SELECT r.rid FROM l RIGHT JOIN r ON l.k = r.k WHERE l.id IS NULL",
+    )
+    assert joined_rows(result) == [[300]]
+    result = query_files(
+        paths,
+        "SELECT r.rid FROM l RIGHT JOIN r ON l.k = r.k WHERE l.id = 1",
+    )
+    assert joined_rows(result) == [[100], [200]]
+
+
+def test_full_outer_join_aggregates(paths):
+    result = query_files(
+        paths,
+        "SELECT l.name, COUNT(*), SUM(r.rid) FROM l FULL OUTER JOIN r ON l.k = r.k "
+        "GROUP BY l.name ORDER BY l.name",
+    )
+    # The unmatched right row forms a NULL-keyed group; COUNT(*) counts it,
+    # SUM skips no rid there since the right side is populated; unmatched
+    # left rows (name b, d) form their own groups with SUM(r.rid) NULL.
+    assert joined_rows(result) == [
+        ["a", 2, 300],
+        ["b", 1, None],
+        ["c", 2, 300],
+        ["d", 1, None],
+        [None, 1, 300],
+    ]
+
+
+def test_full_outer_join_distinct_and_order(paths):
+    result = query_files(
+        paths,
+        "SELECT DISTINCT l.k, r.k FROM l FULL OUTER JOIN r ON l.k = r.k "
+        "ORDER BY l.k NULLS LAST, r.k NULLS LAST",
+    )
+    # Padded NULLs on either side compare equal in DISTINCT; rk NULLS LAST
+    # keeps (None, None) behind (None, 30) inside the NULL l.k group.
+    assert joined_rows(result) == [
+        [10, 10],
+        [20, None],
+        [None, 30],
+        [None, None],
+    ]
+
+
+def test_right_and_full_duplicate_keys_full_combination(tmp_path):
+    left = tmp_path / "dl.caef"
+    right = tmp_path / "dr.caef"
+    write_file(left, Table(Schema([ColumnSchema("k", "int64")]), {"k": [1, 1, 2]}))
+    write_file(right, Table(Schema([ColumnSchema("k", "int64")]), {"k": [1, 1, 3]}))
+    sources = {"a": left, "b": right}
+    right_rows = joined_rows(
+        query_files(sources, "SELECT * FROM a RIGHT JOIN b ON a.k = b.k")
+    )
+    assert right_rows == [
+        [1, 1], [1, 1], [1, 1], [1, 1],
+        [None, 3],
+    ]
+    full_rows = joined_rows(
+        query_files(sources, "SELECT * FROM a FULL OUTER JOIN b ON a.k = b.k")
+    )
+    assert full_rows == [
+        [1, 1], [1, 1], [1, 1], [1, 1],
+        [2, None],
+        [None, 3],
+    ]
+
+
+def test_null_keys_never_match_right_and_full(tmp_path):
+    left = tmp_path / "nl.caef"
+    right = tmp_path / "nr.caef"
+    write_file(left, Table(Schema([ColumnSchema("k", "int64", nullable=True)]), {"k": [None, 1]}))
+    write_file(right, Table(Schema([ColumnSchema("k", "int64", nullable=True)]), {"k": [None, 2]}))
+    sources = {"a": left, "b": right}
+    assert joined_rows(query_files(sources, "SELECT * FROM a RIGHT JOIN b ON a.k = b.k")) == [
+        [None, None],
+        [None, 2],
+    ]
+    assert joined_rows(query_files(sources, "SELECT * FROM a FULL OUTER JOIN b ON a.k = b.k")) == [
+        [None, None],
+        [1, None],
+        [None, None],
+        [None, 2],
+    ]
+
+
 def test_join_keywords_case_insensitive_and_quoted(paths):
     result = query_files(paths, 'select "l"."id" from "l" inner join "r" on "l"."k" = "r"."k"')
     assert result.column_names == ("l.id",)
@@ -194,9 +351,13 @@ def test_query_files_unreferenced_source_not_read(tmp_path):
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT * FROM l JOIN r ON l.k = r.k",                # missing INNER/LEFT
-        "SELECT * FROM l RIGHT JOIN r ON l.k = r.k",          # unsupported join type
-        "SELECT * FROM l CROSS JOIN r ON l.k = r.k",
+        "SELECT * FROM l JOIN r ON l.k = r.k",                # missing INNER/LEFT/...
+        "SELECT * FROM l CROSS JOIN r ON l.k = r.k",          # unsupported join type
+        "SELECT * FROM l FULL JOIN r ON l.k = r.k",           # FULL without OUTER
+        "SELECT * FROM l FULL OUTER r ON l.k = r.k",          # missing JOIN
+        "SELECT * FROM l RIGHT OUTER JOIN r ON l.k = r.k",    # RIGHT takes no OUTER
+        "SELECT * FROM l LEFT OUTER JOIN r ON l.k = r.k",     # LEFT takes no OUTER
+        "SELECT * FROM l FULL OUTER JOIN r",                  # missing ON
         "SELECT * FROM l INNER r ON l.k = r.k",               # missing JOIN
         "SELECT * FROM l INNER JOIN r",                       # missing ON
         "SELECT * FROM l INNER JOIN r ON l.k",                # incomplete ON
