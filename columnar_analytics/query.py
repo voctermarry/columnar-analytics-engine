@@ -19,9 +19,9 @@ The accepted grammar (keywords case-insensitive)::
                    [HAVING expr]
                    [ORDER BY order_item (',' order_item)*]
                    [LIMIT uint]
-    select_item := '*' | ident | agg_name '(' ('*' | ident) ')'
+    select_item := '*' | ident | agg_name '(' ('*' | [DISTINCT] ident) ')'
                    | scalar_expr AS alias
-    order_item  := (ident | agg_name '(' ('*' | ident) ')')
+    order_item  := (ident | agg_name '(' ('*' | [DISTINCT] ident) ')')
                    [ASC | DESC] [NULLS FIRST | NULLS LAST]
     expr       := or_expr
     or_expr     := and_expr (OR and_expr)*
@@ -47,6 +47,31 @@ GROUP BY it may additionally contain the grouped columns.  A bare ``*``
 must not be mixed with aggregates or grouping.  Aggregates are not
 allowed inside WHERE, may not be nested, and aliases are not supported
 for bare columns or aggregate calls.
+
+Every single-column aggregate also accepts ``DISTINCT`` before its
+argument (``COUNT(DISTINCT ident)``, ``SUM(DISTINCT ident)``,
+``AVG(DISTINCT ident)``, ``MIN(DISTINCT ident)`` and
+``MAX(DISTINCT ident)``).  The keyword is case-insensitive, extra
+whitespace around it is insignificant, and the argument stays a single
+(possibly table-qualified) column reference: a star, a missing argument,
+an expression or extra arguments raise :class:`QuerySyntaxError` before
+any file is opened.  DISTINCT deduplicates the argument values inside
+each group (or the single global group) after WHERE selected the rows:
+NULLs are ignored, the remaining values are deduplicated by column type
+(float64 ``0.0`` and ``-0.0`` are the same value) and the aggregate then
+runs on the distinct values.  ``COUNT(DISTINCT ident)`` returns the
+number of distinct non-NULL values as a non-nullable int64 (0 on empty
+input); the other functions return NULL when no distinct non-NULL value
+remains, and their result types, nullability, comparison rules and the
+SUM overflow / non-finite float64 :class:`QueryValidationError` match
+the corresponding plain aggregates.  DISTINCT aggregates may appear
+wherever plain aggregates may (SELECT, HAVING and ORDER BY); textually
+identical calls are computed once under the existing aggregate
+deduplication rule, and the explain plan's Aggregate operator lists them
+in first-reference order with an extra ``distinct: true`` field that
+plain aggregate entries never carry.  The output name uses the uppercase
+function name and the DISTINCT keyword with the bound column name, e.g.
+``COUNT(DISTINCT n)``.
 
 Scalar arithmetic (parentheses, unary ``+``/``-``, binary ``+`` ``-``
 ``*`` ``/``; precedence: parentheses, unary, ``*``/``/``, ``+``/``-``)
@@ -92,8 +117,9 @@ are part of the projection; an unprojected or otherwise unknown name
 raises :class:`QueryValidationError`, and the sort direction, NULL
 placement and stability rules are unchanged.  DISTINCT combined with
 GROUP BY, HAVING or any aggregate projection raises
-:class:`QueryValidationError`; ``COUNT(DISTINCT ...)`` is not part of
-the grammar.  A missing projection, a repeated DISTINCT or a misplaced
+:class:`QueryValidationError`; aggregate ``DISTINCT`` inside a call
+(``COUNT(DISTINCT col)`` etc.) is unrelated to this row-level
+deduplication.  A missing projection, a repeated DISTINCT or a misplaced
 DISTINCT keyword raises :class:`QuerySyntaxError` before any file is
 opened.
 
@@ -478,6 +504,8 @@ class _RefItem:
     expr: tuple | None = None  # parsed scalar expression for kind == "expr"
     descending: bool = False
     nulls_first: bool | None = None  # None -> default (NULLs last)
+    # Aggregate DISTINCT: deduplicate the argument values per group.
+    distinct: bool = False
     # Table qualifiers (two-table queries only; None when unqualified):
     table: str | None = None
     table_quoted: bool = False
@@ -726,6 +754,7 @@ class _Parser:
             arg=item.arg,
             descending=descending,
             nulls_first=nulls_first,
+            distinct=item.distinct,
             table=item.table,
             table_quoted=item.table_quoted,
             arg_table=item.arg_table,
@@ -770,30 +799,48 @@ class _Parser:
             # e.g. a column literally named "count" -- the name token is
             # already consumed, so it is a plain column reference.
             return _RefItem("column", name=tok.value)
-        arg, arg_table, arg_table_quoted = self._parse_aggregate_args(func)
+        arg, arg_table, arg_table_quoted, distinct = self._parse_aggregate_args(func)
         self._expect_op(")")
         return _RefItem(
             "agg",
             func=func.upper(),
             arg=arg,
+            distinct=distinct,
             arg_table=arg_table,
             arg_table_quoted=arg_table_quoted,
         )
 
     def _parse_aggregate_args(self, func: str) -> tuple:
         # Exactly one argument: '*' for COUNT, otherwise one (possibly
-        # table-qualified) identifier.  Returns (name, table, table_quoted);
-        # name "" stands for '*'.
+        # table-qualified) identifier, optionally preceded by DISTINCT.
+        # Returns (name, table, table_quoted, distinct); name "" stands
+        # for '*'.  DISTINCT only accepts a single plain column reference:
+        # a star, a missing argument, an expression or extra arguments are
+        # syntax errors raised before any file is opened.
         tok = self._peek()
-        if tok.kind == "keyword" and tok.value == "case":
+        distinct = False
+        if tok.kind == "keyword" and tok.value == "distinct":
+            distinct = True
+            self._next()
+            tok = self._peek()
+            if tok.kind == "star":
+                raise QuerySyntaxError(
+                    f"{func.upper()}(DISTINCT ...) requires a column argument, not '*'"
+                )
+            if tok.kind not in ("ident", "qident"):
+                raise QuerySyntaxError(
+                    f"{func.upper()}(DISTINCT ...) requires one column argument, "
+                    f"got {tok.text!r}"
+                )
+        elif tok.kind == "keyword" and tok.value == "case":
             raise QueryValidationError(
                 f"{func.upper()} argument must be a column reference, not a CASE expression"
             )
-        if tok.kind == "star":
+        elif tok.kind == "star":
             if func != "count":
                 raise QuerySyntaxError(f"{func.upper()} does not accept '*'")
             self._next()
-            return ("", None, False)
+            return ("", None, False, False)
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(
                 f"{func.upper()} requires one column argument, got {tok.text!r}"
@@ -805,8 +852,8 @@ class _Parser:
                 raise QuerySyntaxError(
                     f"{func.upper()} argument must be a column name, not a function call"
                 )
-            self._reject_expression_in_agg_arg(func)
-            return (item.name, item.table, item.table_quoted)
+            self._reject_expression_in_agg_arg(func, distinct)
+            return (item.name, item.table, item.table_quoted, distinct)
         self._next()
         nxt = self._peek()
         if nxt.kind == "op" and nxt.value == "(":
@@ -818,13 +865,19 @@ class _Parser:
             raise QuerySyntaxError(
                 f"{func.upper()} argument must be a column name, not a function call"
             )
-        self._reject_expression_in_agg_arg(func)
-        return (tok.value, None, False)
+        self._reject_expression_in_agg_arg(func, distinct)
+        return (tok.value, None, False, distinct)
 
-    def _reject_expression_in_agg_arg(self, func: str) -> None:
-        # Aggregate arguments stay limited to plain column references; a
-        # scalar expression inside an aggregate query is a validation error.
+    def _reject_expression_in_agg_arg(self, func: str, distinct: bool = False) -> None:
+        # Aggregate arguments stay limited to plain column references.  A
+        # scalar expression in a plain aggregate query is a validation
+        # error; inside DISTINCT it is a grammatical error instead.
         if self._arith_op_ahead():
+            if distinct:
+                raise QuerySyntaxError(
+                    f"{func.upper()}(DISTINCT ...) argument must be a column "
+                    "reference, not an expression"
+                )
             raise QueryValidationError(
                 f"{func.upper()} argument must be a column reference, not an expression"
             )
@@ -975,9 +1028,11 @@ class _Parser:
                 func = tok.value.lower()
                 self._next()  # function name
                 self._expect_op("(")
-                arg, arg_table, arg_table_quoted = self._parse_aggregate_args(func)
+                arg, arg_table, arg_table_quoted, distinct = self._parse_aggregate_args(
+                    func
+                )
                 self._expect_op(")")
-                return ("hagg", func.upper(), arg, arg_table, arg_table_quoted)
+                return ("hagg", func.upper(), arg, arg_table, arg_table_quoted, distinct)
             if self._allow_join and self._qualifier_ahead():
                 item = self._parse_qualified_column()
                 return ("column", item.name, item.table, item.table_quoted)
@@ -1237,6 +1292,7 @@ class _BoundItem:
     func: str = ""
     arg_index: int = -1  # -1 means COUNT(*)
     arg_type: str = ""
+    distinct: bool = False  # deduplicate the argument values per group
     # kind == "expr":
     expr: tuple | None = None  # bound scalar expression
     out_type: str = ""
@@ -1449,16 +1505,17 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
     group_index_set = set(group_indices)
 
     # One registry of distinct aggregates shared by SELECT, HAVING and ORDER
-    # BY, keyed by (function, argument index) and kept in first-reference
-    # order.  HAVING-only aggregates are computed but never projected.
+    # BY, keyed by (function, argument index, DISTINCT flag) and kept in
+    # first-reference order.  HAVING-only aggregates are computed but never
+    # projected.
     agg_registry: dict[tuple, int] = {}
     agg_order: list[_BoundItem] = []
 
-    def require_aggregate(func: str, arg_name: str) -> int:
+    def require_aggregate(func: str, arg_name: str, distinct: bool = False) -> int:
         arg_index, arg_col, label, out_type, nullable = _resolve_agg_call(
-            func, arg_name, schema
+            func, arg_name, schema, distinct
         )
-        key = (func, arg_index)
+        key = (func, arg_index, distinct)
         slot = agg_registry.get(key)
         if slot is None:
             slot = len(agg_order)
@@ -1470,6 +1527,7 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
                     func=func,
                     arg_index=arg_index,
                     arg_type=arg_col.type if arg_col is not None else "",
+                    distinct=distinct,
                     out_type=out_type,
                     nullable=nullable,
                 )
@@ -1516,7 +1574,7 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
                 )
             )
         else:
-            slot = require_aggregate(item.func, item.arg)
+            slot = require_aggregate(item.func, item.arg, item.distinct)
             agg_item = agg_order[slot]
             if agg_item.output_name in output_seen:
                 raise QueryValidationError(
@@ -1594,7 +1652,7 @@ def _bind_having(
         col = schema.columns[col_index]
         return ("column", name, col_index, col.type, col.nullable)
     if tag == "hagg":
-        slot = require_aggregate(node[1], node[2])
+        slot = require_aggregate(node[1], node[2], node[5])
         agg_item = agg_order[slot]
         return ("hagg", slot, agg_item.out_type, agg_item.nullable)
     if tag == "not":
@@ -1703,7 +1761,7 @@ def _agg_result_type(func: str, arg_col: ColumnSchema | None) -> tuple[str, bool
 
 
 def _resolve_agg_call(
-    func: str, arg_name: str, schema: Schema
+    func: str, arg_name: str, schema: Schema, distinct: bool = False
 ) -> tuple[int, ColumnSchema | None, str, str, bool]:
     """Resolve one aggregate call to (arg_index, arg_col|None, label, type, nullable)."""
     if arg_name == "":
@@ -1718,6 +1776,14 @@ def _resolve_agg_call(
     arg_col = schema.columns[arg_index]
     out_type, nullable = _agg_result_type(func, arg_col)
     # The result label uses the column name as spelled in the schema.
+    if distinct:
+        return (
+            arg_index,
+            arg_col,
+            f"{func}(DISTINCT {arg_col.name})",
+            out_type,
+            nullable,
+        )
     return arg_index, arg_col, f"{func}({arg_col.name})", out_type, nullable
 
 
@@ -1741,7 +1807,7 @@ def _bind_aggregate_order_by(
             selected[("column", schema.columns[bound.col_index].name)] = i
         else:
             arg_key = "*" if bound.arg_index == -1 else schema.columns[bound.arg_index].name
-            selected[("agg", f"{bound.func}|{arg_key}")] = i
+            selected[("agg", f"{bound.func}|{arg_key}|{bound.distinct}")] = i
 
     bound_order: list[tuple[int, bool, bool]] = []
     order_seen: set[str] = set()
@@ -1773,8 +1839,11 @@ def _bind_aggregate_order_by(
                         f"unknown ORDER BY column: {item.arg!r}"
                     ) from None
                 arg_key = real_name
-                label = f"{item.func}({real_name})"
-            key = ("agg", f"{item.func}|{arg_key}")
+                if item.distinct:
+                    label = f"{item.func}(DISTINCT {real_name})"
+                else:
+                    label = f"{item.func}({real_name})"
+            key = ("agg", f"{item.func}|{arg_key}|{item.distinct}")
             if key not in selected:
                 raise QueryValidationError(
                     f"ORDER BY aggregate {label} is not part of the selected results"
@@ -2089,15 +2158,30 @@ def _arith_value(op: str, left, right):
 # ---------------------------------------------------------------------------
 
 
-def _aggregate_value(func: str, arg_index: int, arg_type: str, rows, source_columns):
-    if func == "COUNT":
+def _aggregate_value(
+    func: str,
+    arg_index: int,
+    arg_type: str,
+    rows,
+    source_columns,
+    distinct: bool = False,
+):
+    if func == "COUNT" and not distinct:
         if arg_index == -1:
             return len(rows)
         col = source_columns[arg_index]
         return sum(1 for i in rows if col[i] is not None)
 
     col = source_columns[arg_index]
-    values = [col[i] for i in rows if col[i] is not None]
+    if distinct:
+        # DISTINCT ignores NULLs and deduplicates the remaining values by
+        # column type (float64 0.0 and -0.0 are the same value) before the
+        # aggregate itself runs.
+        values = _distinct_arg_values(col, arg_type, rows)
+        if func == "COUNT":
+            return len(values)
+    else:
+        values = [col[i] for i in rows if col[i] is not None]
     if not values:
         return None
 
@@ -2128,6 +2212,21 @@ def _aggregate_value(func: str, arg_index: int, arg_type: str, rows, source_colu
     if not math.isfinite(result):
         raise QueryValidationError("AVG produced a non-finite float64 value")
     return result
+
+
+def _distinct_arg_values(col, arg_type: str, rows) -> list:
+    """The distinct non-NULL values of one aggregate argument, in first-seen order."""
+    seen: set = set()
+    values: list = []
+    for i in rows:
+        value = col[i]
+        if value is None:
+            continue
+        key = _distinct_key_part(arg_type, value)
+        if key not in seen:
+            seen.add(key)
+            values.append(value)
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -2370,6 +2469,7 @@ def _rewrite_ref_item(item: _RefItem, resolve) -> _RefItem:
         arg=arg,
         descending=item.descending,
         nulls_first=item.nulls_first,
+        distinct=item.distinct,
     )
 
 
@@ -2414,7 +2514,7 @@ def _rewrite_having_expr(node: tuple, resolve) -> tuple:
         arg = node[2]
         if arg:
             arg = resolve(node[3], node[4], arg)
-        return ("hagg", node[1], arg, None, False)
+        return ("hagg", node[1], arg, None, False, node[5])
     if tag == "not":
         return ("not", _rewrite_having_expr(node[1], resolve))
     if tag in ("and", "or"):
@@ -2827,7 +2927,7 @@ def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) ->
     for rows in groups:
         agg_values = tuple(
             _aggregate_value(
-                agg.func, agg.arg_index, agg.arg_type, rows, source_columns
+                agg.func, agg.arg_index, agg.arg_type, rows, source_columns, agg.distinct
             )
             for agg in all_aggs
         )
@@ -3375,25 +3475,30 @@ def _build_explain(
 
     if bound["mode"] == "aggregate":
         # The Aggregate node computes every distinct aggregate the SELECT,
-        # ORDER BY or HAVING needs, in first-reference order.
+        # ORDER BY or HAVING needs, in first-reference order.  Only
+        # DISTINCT aggregates carry the extra "distinct" field; plain
+        # aggregate entries keep their historical shape.
+        aggregate_entries = []
+        for item in bound["aggregates"]:
+            entry = {
+                "function": item.func,
+                "argument": (
+                    None
+                    if item.arg_index < 0
+                    else schema.columns[item.arg_index].name
+                ),
+                "output": item.output_name,
+            }
+            if item.distinct:
+                entry["distinct"] = True
+            aggregate_entries.append(entry)
         operators.append(
             {
                 "operator": "Aggregate",
                 "group_keys": [
                     schema.columns[index].name for index in bound["group_indices"]
                 ],
-                "aggregates": [
-                    {
-                        "function": item.func,
-                        "argument": (
-                            None
-                            if item.arg_index < 0
-                            else schema.columns[item.arg_index].name
-                        ),
-                        "output": item.output_name,
-                    }
-                    for item in bound["aggregates"]
-                ],
+                "aggregates": aggregate_entries,
             }
         )
         if bound["having"] is not None:
