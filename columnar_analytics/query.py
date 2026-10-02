@@ -148,28 +148,38 @@ Two-file queries (:func:`query_files`) add one equi-join to the grammar::
 
     query := SELECT ... FROM left_table [join_kind JOIN right_table
              ON left_table.column = right_table.column] ...
-    join_kind := INNER | LEFT
+    join_kind := INNER | LEFT | RIGHT | FULL OUTER
 
 ``sources`` maps table names to file paths; only the tables referenced by
-the statement are read.  Aliases, compound ON conditions, other join types
-and a second join are rejected as syntax errors before any file is opened.
+the statement are read.  Aliases, compound ON conditions, join types
+other than the four above and a second join are rejected as syntax
+errors before any file is opened (``FULL`` without ``OUTER`` included).
 In a join query every column reference outside ``COUNT(*)`` must be
 qualified as ``table.column`` (either part may be a double-quoted
 identifier).  ``SELECT *`` emits the left schema followed by the right
 schema with ``table.column`` names; explicit projections keep their
 qualified names and aggregates keep the uppercase ``FUNC(table.column)``
 labels.  Join keys may share a type or mix int64 with float64; NULL keys
-never match.  INNER JOIN emits every matching combination, LEFT JOIN also
-emits unmatched left rows with the right-side values set to NULL (the
-right result columns are nullable).  Rows expand in left-file order, and
-within one left row in right-file order, before WHERE / GROUP BY / HAVING
-/ ORDER BY / LIMIT apply with their usual semantics.
+never match, and duplicate keys expand to the full combination.
+INNER JOIN emits every matching combination in left-file order, and
+within one left row in right-file order.  LEFT JOIN additionally emits
+unmatched left rows in place (right-side values NULL).  RIGHT JOIN keeps
+every right row: the result follows the right file's original row order,
+the matching combinations of one right row expand in left-file order,
+and an unmatched right row gets NULL left-side values.  FULL OUTER JOIN
+emits the LEFT JOIN output first (matching combinations and unmatched
+left rows in left-file order) and then appends the unmatched right rows
+in right-file order with NULL left-side values.  The supplemented side's
+result columns are nullable (both sides for FULL OUTER JOIN).  WHERE /
+DISTINCT / GROUP BY / HAVING / ORDER BY / LIMIT apply afterwards with
+their usual three-valued-logic, grouping, NULL-sorting and stability
+semantics.
 
 The multi-file entry points (:func:`query_files`, :func:`explain_files`)
 take an optional ``join_strategy`` of ``"hash"`` or ``"sort_merge"``.
 Both strategies accept the same statements and return identical column
-descriptions, values, NULL placement and row order; they differ only in
-how matching right rows are located (a right-key hash index versus
+descriptions, values, NULL placement and row order for every join kind;
+they differ only in how matching rows are located (a hash index versus
 sorting both sides on the key and merging equal-key runs).  With the
 argument omitted the historical join path is used and the explain plan
 is unchanged; with an explicit strategy the plan's Join operator gains a
@@ -225,6 +235,9 @@ _KEYWORDS = frozenset(
         "having",
         "inner",
         "left",
+        "right",
+        "full",
+        "outer",
         "join",
         "on",
         "case",
@@ -484,7 +497,7 @@ class _RefItem:
 class _Join:
     """The single optional equi-join of a two-table query."""
 
-    kind: str  # "inner" | "left"
+    kind: str  # "inner" | "left" | "right" | "full"
     table: str  # right table name as spelled
     table_quoted: bool
     left_key: tuple  # (table, table_quoted, column)
@@ -552,6 +565,15 @@ class _Parser:
             elif self._accept_keyword("left"):
                 self._expect_keyword("join")
                 join = self._parse_join("left")
+            elif self._accept_keyword("right"):
+                self._expect_keyword("join")
+                join = self._parse_join("right")
+            elif self._accept_keyword("full"):
+                # FULL is only accepted in the FULL OUTER JOIN spelling; a
+                # missing OUTER (or any other keyword) is a syntax error.
+                self._expect_keyword("outer")
+                self._expect_keyword("join")
+                join = self._parse_join("full")
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
@@ -2139,8 +2161,9 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
 
     ``sources`` maps table names to columnar file paths; only the tables
     referenced by the statement are read.  The statement may join two of
-    them once (``INNER JOIN`` / ``LEFT JOIN ... ON t1.col = t2.col``); see
-    the module docstring for the exact grammar and semantics.
+    them once (``INNER`` / ``LEFT`` / ``RIGHT`` / ``FULL OUTER``
+    ``JOIN ... ON t1.col = t2.col``); see the module docstring for the
+    exact grammar and semantics.
 
     ``join_strategy`` optionally selects the join algorithm: ``"hash"``
     (a right-key hash lookup) or ``"sort_merge"`` (sort both sides on the
@@ -2433,15 +2456,23 @@ def _build_joined_schema(
         )
 
     # The combined schema is left columns then right columns, named
-    # "table.column"; a LEFT JOIN makes every right-side column nullable.
+    # "table.column".  An outer join forces every column on the
+    # nullable-supplemented side (both sides for FULL OUTER JOIN) to be
+    # nullable; INNER keeps each side's file-level nullability.
+    left_nulls = join.kind in ("right", "full")
+    right_nulls = join.kind in ("left", "full")
     combined_columns = [
-        ColumnSchema(f"{left_key}.{col.name}", col.type, col.nullable)
+        ColumnSchema(
+            f"{left_key}.{col.name}",
+            col.type,
+            True if left_nulls else col.nullable,
+        )
         for col in left_schema.columns
     ] + [
         ColumnSchema(
             f"{right_key}.{col.name}",
             col.type,
-            True if join.kind == "left" else col.nullable,
+            True if right_nulls else col.nullable,
         )
         for col in right_schema.columns
     ]
@@ -2476,31 +2507,75 @@ def _build_joined_table(
 def _join_columns(
     left: Table, right: Table, left_idx: int, right_idx: int, kind: str
 ) -> list:
-    """Hash equi-join preserving left-then-right file row order."""
+    """Hash equi-join.
+
+    INNER / LEFT / FULL emit in left-file order (matches of one left row in
+    right-file order), with LEFT / FULL padding unmatched left rows; FULL
+    then appends unmatched right rows in right-file order.  RIGHT emits in
+    right-file order, the matches of one right row in left-file order, and
+    pads unmatched right rows.  NULL keys are never indexed and never match.
+    """
     left_cols = left._columns
     right_cols = right._columns
     left_width = len(left_cols)
     right_width = len(right_cols)
+    out = [[] for _ in range(left_width + right_width)]
+
+    def emit_match(i: int, j: int) -> None:
+        for c in range(left_width):
+            out[c].append(left_cols[c][i])
+        for c in range(right_width):
+            out[left_width + c].append(right_cols[c][j])
+
+    def emit_left(i: int) -> None:
+        for c in range(left_width):
+            out[c].append(left_cols[c][i])
+        for c in range(right_width):
+            out[left_width + c].append(None)
+
+    def emit_right(j: int) -> None:
+        for c in range(left_width):
+            out[c].append(None)
+        for c in range(right_width):
+            out[left_width + c].append(right_cols[c][j])
+
+    if kind == "right":
+        # Index the left keys and drive the scan from the right file so the
+        # result follows the right-file row order.
+        left_index: dict[Any, list[int]] = {}
+        for i, key in enumerate(left_cols[left_idx]):
+            if key is not None:
+                left_index.setdefault(key, []).append(i)
+        for j in range(right.row_count):
+            key = right_cols[right_idx][j]
+            matches = left_index.get(key) if key is not None else None
+            if matches:
+                for i in matches:
+                    emit_match(i, j)
+            else:
+                emit_right(j)
+        return out
+
     # NULL keys never match, so they stay out of the right-side index.
     index: dict[Any, list[int]] = {}
     for j, key in enumerate(right_cols[right_idx]):
         if key is not None:
             index.setdefault(key, []).append(j)
-    out = [[] for _ in range(left_width + right_width)]
+    matched_right: set[int] = set()
     for i in range(left.row_count):
         key = left_cols[left_idx][i]
         matches = index.get(key) if key is not None else None
         if matches:
             for j in matches:
-                for c in range(left_width):
-                    out[c].append(left_cols[c][i])
-                for c in range(right_width):
-                    out[left_width + c].append(right_cols[c][j])
-        elif kind == "left":
-            for c in range(left_width):
-                out[c].append(left_cols[c][i])
-            for c in range(right_width):
-                out[left_width + c].append(None)
+                emit_match(i, j)
+                if kind == "full":
+                    matched_right.add(j)
+        elif kind in ("left", "full"):
+            emit_left(i)
+    if kind == "full":
+        for j in range(right.row_count):
+            if j not in matched_right:
+                emit_right(j)
     return out
 
 
@@ -2510,10 +2585,12 @@ def _sort_merge_join_columns(
     """Sort-merge equi-join.
 
     Both sides are stably sorted by the join key (NULLs excluded, they can
-    never match) and equal-key runs are merged.  Output is emitted in
-    left-file order, with each left row's matches in right-file order, so
-    the result is identical to :func:`_join_columns`; the two paths differ
-    only in how the matches are found.
+    never match) and equal-key runs are merged.  INNER / LEFT / FULL output
+    is emitted in left-file order (matches of one left row in right-file
+    order), with FULL also appending unmatched right rows in right-file
+    order; RIGHT is emitted in right-file order with matches in left-file
+    order.  Every ordering therefore matches :func:`_join_columns`; the two
+    paths differ only in how the matches are found.
     """
     left_cols = left._columns
     right_cols = right._columns
@@ -2529,6 +2606,56 @@ def _sort_merge_join_columns(
         (j for j in range(right.row_count) if right_keys[j] is not None),
         key=lambda j: right_keys[j],
     )
+
+    out = [[] for _ in range(left_width + right_width)]
+
+    def emit_match(i: int, j: int) -> None:
+        for c in range(left_width):
+            out[c].append(left_cols[c][i])
+        for c in range(right_width):
+            out[left_width + c].append(right_cols[c][j])
+
+    def emit_left(i: int) -> None:
+        for c in range(left_width):
+            out[c].append(left_cols[c][i])
+        for c in range(right_width):
+            out[left_width + c].append(None)
+
+    def emit_right(j: int) -> None:
+        for c in range(left_width):
+            out[c].append(None)
+        for c in range(right_width):
+            out[left_width + c].append(right_cols[c][j])
+
+    if kind == "right":
+        # Merge on sorted key runs, then emit following the right file's row
+        # order with each right row's matches in left-file order.
+        left_runs: dict[Any, list[int]] = {}
+        run_order: list[Any] = []
+        for i in left_order:
+            key = left_keys[i]
+            run = left_runs.get(key)
+            if run is None:
+                run = []
+                left_runs[key] = run
+                run_order.append(key)
+            run.append(i)
+        matches_by_right: dict[int, list[int]] = {}
+        p = 0
+        for j in right_order:
+            key = right_keys[j]
+            while p < len(run_order) and run_order[p] < key:
+                p += 1
+            if p < len(run_order) and run_order[p] == key:
+                matches_by_right[j] = left_runs[run_order[p]]
+        for j in range(right.row_count):
+            matches = matches_by_right.get(j)
+            if matches:
+                for i in matches:
+                    emit_match(i, j)
+            else:
+                emit_right(j)
+        return out
 
     # Index each non-NULL right key to the run of right rows carrying it;
     # runs are visited in sorted order and keep right-file row order.
@@ -2552,20 +2679,20 @@ def _sort_merge_join_columns(
         if p < len(run_order) and run_order[p] == key:
             matches_by_left[i] = right_runs[run_order[p]]
 
-    out = [[] for _ in range(left_width + right_width)]
+    matched_right: set[int] = set()
     for i in range(left.row_count):
         matches = matches_by_left.get(i)
         if matches:
             for j in matches:
-                for c in range(left_width):
-                    out[c].append(left_cols[c][i])
-                for c in range(right_width):
-                    out[left_width + c].append(right_cols[c][j])
-        elif kind == "left":
-            for c in range(left_width):
-                out[c].append(left_cols[c][i])
-            for c in range(right_width):
-                out[left_width + c].append(None)
+                emit_match(i, j)
+                if kind == "full":
+                    matched_right.add(j)
+        elif kind in ("left", "full"):
+            emit_left(i)
+    if kind == "full":
+        for j in range(right.row_count):
+            if j not in matched_right:
+                emit_right(j)
     return out
 
 

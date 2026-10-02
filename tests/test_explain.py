@@ -357,6 +357,52 @@ def test_left_join_output_nullability_and_on_keys_scanned(sources):
     assert all(col["nullable"] for col in right_output)
 
 
+def test_right_join_plan_type_and_nullability(sources):
+    sql = "SELECT * FROM l RIGHT JOIN r ON l.id = r.k"
+    plan = explain_files(sources, sql)
+    join = find_operator(plan, "Join")
+    assert join == {
+        "operator": "Join",
+        "type": "RIGHT",
+        "left": {"table": "l", "column": "id"},
+        "right": {"table": "r", "column": "k"},
+    }
+    result = query_files(sources, sql)
+    assert plan["output"] == [
+        {"name": col.name, "type": col.type, "nullable": col.nullable}
+        for col in result.schema.columns
+    ]
+    left_output = [col for col in plan["output"] if col["name"].startswith("l.")]
+    right_output = [col for col in plan["output"] if col["name"].startswith("r.")]
+    # LEFT columns become nullable under RIGHT JOIN; the right side keeps
+    # its file-level nullability (rid/tag non-null, k nullable).
+    assert all(col["nullable"] for col in left_output)
+    assert {col["name"]: col["nullable"] for col in right_output} == {
+        "r.rid": False,
+        "r.k": True,
+        "r.tag": False,
+    }
+
+
+def test_full_outer_join_plan_type_and_nullability(sources):
+    for strategy in (None, "hash", "sort_merge"):
+        sql = "SELECT * FROM l FULL OUTER JOIN r ON l.id = r.k"
+        plan = explain_files(sources, sql, strategy)
+        join = find_operator(plan, "Join")
+        assert join["type"] == "FULL"
+        if strategy is None:
+            assert "strategy" not in join
+        else:
+            assert join["strategy"] == strategy.upper()
+        # Every result column is nullable under FULL OUTER JOIN.
+        assert all(col["nullable"] for col in plan["output"])
+        result = query_files(sources, sql, strategy)
+        assert plan["output"] == [
+            {"name": col.name, "type": col.type, "nullable": col.nullable}
+            for col in result.schema.columns
+        ]
+
+
 def test_explain_files_single_table(sources):
     plan = explain_files(sources, "SELECT id FROM l WHERE flag = TRUE")
     assert [s["name"] for s in plan["sources"]] == ["l"]

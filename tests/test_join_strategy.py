@@ -83,10 +83,14 @@ def paths(tmp_path):
 JOIN_SQL = [
     "SELECT * FROM l INNER JOIN r ON l.k = r.k",
     "SELECT * FROM l LEFT JOIN r ON l.k = r.k",
+    "SELECT * FROM l RIGHT JOIN r ON l.k = r.k",
+    "SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k",
     "SELECT l.id, r.rid FROM l INNER JOIN r ON l.k = r.k "
     "WHERE r.tag IS NOT NULL ORDER BY l.id DESC, r.rid ASC LIMIT 3",
     "SELECT l.name, COUNT(*), SUM(r.rid) FROM l LEFT JOIN r ON l.k = r.k "
     "GROUP BY l.name HAVING COUNT(*) >= 1 ORDER BY l.name",
+    "SELECT l.id, r.rid FROM l FULL OUTER JOIN r ON l.k = r.k "
+    "WHERE l.id IS NULL OR r.rid IS NULL ORDER BY l.id ASC NULLS LAST",
     "SELECT l.id, r.rid, l.k + r.k AS s FROM l INNER JOIN r ON l.k = r.k "
     "WHERE l.k + r.k > 15 ORDER BY s",
 ]
@@ -124,6 +128,56 @@ def test_strategies_match_each_other_inner_and_left(paths):
         merge_rows = joined_rows(query_files(paths, sql, "sort_merge"))
         assert hash_rows == expected
         assert merge_rows == expected
+
+
+def test_strategies_match_each_other_right(paths):
+    expected_right = [
+        # Right-file order; the matches of one right row follow left-file
+        # order (rid 200/400 on key 10 expand to left ids 1 then 3), and
+        # unmatched right rows (rid 300, key NULL) pad the left side.
+        [5, 30, "e", 100, 30, "p"],
+        [1, 10, "a", 200, 10, "q"],
+        [3, 10, "c", 200, 10, "q"],
+        [None, None, None, 300, None, None],
+        [1, 10, "a", 400, 10, "r"],
+        [3, 10, "c", 400, 10, "r"],
+        [2, 20, "b", 500, 20, "s"],
+    ]
+    sql = "SELECT * FROM l RIGHT JOIN r ON l.k = r.k"
+    default_rows = joined_rows(query_files(paths, sql))
+    hash_rows = joined_rows(query_files(paths, sql, "hash"))
+    merge_rows = joined_rows(query_files(paths, sql, "sort_merge"))
+    assert default_rows == expected_right
+    assert hash_rows == expected_right
+    assert merge_rows == expected_right
+
+
+def test_strategies_match_each_other_full(paths):
+    expected_inner = [
+        [1, 10, "a", 200, 10, "q"],
+        [1, 10, "a", 400, 10, "r"],
+        [2, 20, "b", 500, 20, "s"],
+        [3, 10, "c", 200, 10, "q"],
+        [3, 10, "c", 400, 10, "r"],
+        [5, 30, "e", 100, 30, "p"],
+    ]
+    # LEFT JOIN order first (unmatched NULL-keyed left row id 4 between
+    # ids 3 and 5), then the unmatched right rows in right-file order.
+    expected_full = expected_inner[:5] + [
+        [4, None, "d", None, None, None],
+        expected_inner[5],
+        [None, None, None, 300, None, None],
+    ]
+    sql = "SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k"
+    default_rows = joined_rows(query_files(paths, sql))
+    hash_rows = joined_rows(query_files(paths, sql, "hash"))
+    merge_rows = joined_rows(query_files(paths, sql, "sort_merge"))
+    assert default_rows == expected_full
+    assert hash_rows == expected_full
+    assert merge_rows == expected_full
+    assert schema_dicts(query_files(paths, sql)) == schema_dicts(
+        query_files(paths, sql, "sort_merge")
+    )
 
 
 def test_int64_float64_mixed_keys_and_signed_zero(tmp_path):

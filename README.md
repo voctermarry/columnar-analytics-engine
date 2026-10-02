@@ -6,7 +6,8 @@
 （`SELECT` 投影、`SELECT DISTINCT` 结果行去重、`WHERE` 过滤、`GROUP BY` 分组与
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
 聚合、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
-另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` 等值连接。
+另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` /
+`FULL OUTER JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
 只解析、绑定并生成逻辑计划，仅读文件元数据、不执行查询。
 查询结果还可通过 `export_query_file` / `export_query_files`
@@ -77,7 +78,7 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
   连接与过滤阶段之后按 `Project`、`Distinct`、`Sort`、`Limit` 的顺序给出；缺少的阶段省略：
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
     （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
-  - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`）与 `left`、`right` 两侧限定键
+  - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`/`RIGHT`/`FULL`）与 `left`、`right` 两侧限定键
     （`table`、`column`）；显式传入 `join_strategy` 时额外给出 `strategy`
     （`HASH`/`SORT_MERGE`），且与对应查询、导出实际使用的策略一致；未传策略时
     `Join` 算子保持无 `strategy` 字段的既有结构。
@@ -318,27 +319,33 @@ FROM input
 （命令行用同一结构的 JSON 对象），只有被语句引用的表对应的文件会被读取：
 
 ```sql
-SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.列
+SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN | RIGHT JOIN | FULL OUTER JOIN] 右表 ON 左表.列 = 右表.列
 [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 ```
 
-- 不支持别名、复合 `ON`、其他连接类型或第二次连接；词法错误、连接关键字缺失、
-  非法 `ON`、超过一次连接抛 `QuerySyntaxError`，且在读取任何源文件之前判定。
+- 不支持别名、复合 `ON`、四种之外的连接类型（`FULL` 缺 `OUTER` 亦属此类）或第二次连接；
+  词法错误、连接关键字缺失或错位、非法 `ON`、超过一次连接抛 `QuerySyntaxError`，
+  且在读取任何源文件之前判定。
 - 连接查询中除 `COUNT(*)` 外的列引用都必须写成 `表名.列名`（两部分都可用双引号
   标识符，延续精确匹配与 `""` 转义语义）；未限定列、未知表或列、重复表、连接键
   来源错误（左右颠倒或来自同一表）、键类型不兼容、重复结果列抛
   `QueryValidationError`。非连接查询沿用单表语义，列可限定也可不限定。
 - `SELECT *` 按左、右 schema 顺序输出，列名为 `表名.列名`；显式投影保留限定名，
   聚合结果列名沿用大写函数格式并含限定参数（如 `SUM(r.x)`）。
-- 连接键类型须相同，或一为 int64 一为 float64；NULL 键永不匹配。`INNER JOIN`
-  输出全部匹配组合；`LEFT JOIN` 还输出未匹配左行并把右侧值置为 NULL，
-  右侧结果列 nullable 为 true。结果按左文件原始行序、同一左行内按右文件原始行序
-  展开，之后 `WHERE`、`DISTINCT` 去重、`GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理；
-  没有显式排序时相同输入与 SQL 重复执行输出字节一致。
+- 连接键类型须相同，或一为 int64 一为 float64；NULL 键永不匹配，重复键展开完整组合。
+  `INNER JOIN` 输出全部匹配组合（左文件行序、同一左行内右文件行序）。`LEFT JOIN`
+  还在原位输出未匹配左行并把右侧值置为 NULL，右侧结果列 nullable 为 true。
+  `RIGHT JOIN` 保留全部右行：结果按右文件原始行序排列，同一右行的匹配组合按左文件
+  原始行序展开，未匹配时左侧列补 NULL，左侧结果列 nullable 为 true。`FULL OUTER JOIN`
+  先按 `LEFT JOIN` 顺序输出匹配组合与未匹配左行，再按右文件原始行序追加未匹配右行
+  （左侧列补 NULL），两侧结果列 nullable 均为 true。之后 `WHERE`、`DISTINCT` 去重、
+  `GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理（补出的 NULL
+  进入既有三值逻辑、分组与排序）；没有显式排序时相同输入与 SQL 重复执行输出字节一致。
 - 多文件 Python 入口（`query_files`、`explain_files`）与命令行（`query-files`、
   `explain-files`、`export-files` 的 `--join-strategy`）可选指定连接算法：
-  `hash` 对右文件非空键建哈希索引，`sort_merge` 将两侧按键稳定排序后归并等值键段。
-  两种策略接受完全相同的 INNER/LEFT 等值连接、键类型兼容、NULL 与重复键规则，
+  `hash` 对被保留侧的对侧非空键建哈希索引（RIGHT 时索引左表、其余连接索引右表），
+  `sort_merge` 将两侧按键稳定排序后归并等值键段。
+  两种策略接受完全相同的 INNER/LEFT/RIGHT/FULL 等值连接、键类型兼容、NULL 与重复键规则，
   对相同 sources 与 SQL 返回的列描述、值、NULL 位置和行序完全一致（int64/float64
   混合键、正负零、重复值、可空键均无差异），查询 JSON 与导出文件重复执行字节稳定。
   未传参数时继续使用既有连接路径，调用签名、结果与解释计划结构不变；无 JOIN 的
@@ -369,6 +376,7 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
   `COUNT(DISTINCT ...)`、simple CASE、
   裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
   表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。两文件入口额外支持
-  一次 `INNER JOIN` / `LEFT JOIN` 等值连接（无别名、无复合 ON、无第二次连接），连接查询中
+  一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接
+  （无别名、无复合 ON、无第二次连接、仅这四种写法），连接查询中
   标量表达式的列引用同样必须限定表名。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
