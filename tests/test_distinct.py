@@ -369,7 +369,6 @@ def test_distinct_syntax_errors(path):
         "SELECT DISTINCT s, FROM input",
         "SELECT s FROM input DISTINCT",
         "SELECT s FROM input LIMIT DISTINCT",
-        "SELECT COUNT(DISTINCT s) FROM input",
     ):
         with pytest.raises(QuerySyntaxError):
             query_file(path, sql)
@@ -381,7 +380,6 @@ def test_distinct_syntax_errors_before_file_access(tmp_path):
         "SELECT DISTINCT FROM input",
         "SELECT DISTINCT",
         "SELECT DISTINCT DISTINCT s FROM input",
-        "SELECT COUNT(DISTINCT s) FROM input",
     ):
         with pytest.raises(QuerySyntaxError):
             query_file(missing, sql)

@@ -5,7 +5,7 @@
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
 （`SELECT` 投影、`SELECT DISTINCT` 结果行去重、`WHERE` 过滤、`GROUP BY` 分组与
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
-聚合、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
+聚合（均支持参数级 `DISTINCT`，如 `COUNT(DISTINCT 列)`）、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
 另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
 只解析、绑定并生成逻辑计划，仅读文件元数据、不执行查询。
@@ -86,11 +86,13 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
     searched CASE 节点的 `kind` 为 `case`，`cases` 按书写顺序给出
     `{when, then}`（两者均为递归表达式），`else` 为递归表达式或 `null`（省略 ELSE）。
   - `Aggregate` 给出 `group_keys`（绑定列名列表，无 GROUP BY 时为空）与 `aggregates`
-    （每项 `function`、`argument`（`COUNT(*)` 为 null）、`output`）；`aggregates`
+    （每项 `function`、`argument`（`COUNT(*)` 为 null）、`output`；DISTINCT 聚合
+    额外给出 `distinct: true`，普通聚合不增加该字段）；`aggregates`
     收录 SELECT、ORDER BY、HAVING 所需的去重聚合，按首次引用顺序排列。
   - `Having`（仅含 HAVING 子句时）位于 `Aggregate` 之后、`Sort` 之前，`condition`
     沿用递归条件树；分组列叶子为带 `name` 的 `column`，聚合叶子额外给出
-    `function`、`argument`（`COUNT(*)` 为 null）、`type` 与 `nullable`。
+    `function`、`argument`（`COUNT(*)` 为 null）、`type` 与 `nullable`
+    （DISTINCT 聚合叶子同样额外给出 `distinct: true`）。
   - `Sort` 的 `keys` 每项给出 `column`、`direction`（`ASC`/`DESC`）与
     `nulls`（`FIRST`/`LAST`）；`Limit` 给出 `count`；`Project` 的 `expressions`
     每项给出绑定表达式（列、聚合或递归标量表达式）与 `output` 输出名。
@@ -210,7 +212,7 @@ FROM input
 
 投影项 := 列名
         | COUNT (*)
-        | COUNT | SUM | AVG | MIN | MAX (列名)
+        | COUNT | SUM | AVG | MIN | MAX ([DISTINCT] 列名)
         | 标量表达式 AS 别名
 排序项 := (列名 | 聚合调用 | SELECT 别名) [ASC | DESC] [NULLS FIRST | NULLS LAST]
 标量表达式 := 数值列 | 数值字面量 | (标量表达式)
@@ -238,7 +240,8 @@ FROM input
   `ORDER BY` 只能引用投影中的裸列或显式别名，引用未投影列或未知名称抛
   `QueryValidationError`，排序方向、NULL 位置与稳定性维持现状。DISTINCT 与
   `GROUP BY`、`HAVING` 或任何聚合投影同时使用抛 `QueryValidationError`；
-  `COUNT(DISTINCT ...)` 不属于本语法；DISTINCT 缺少投影、重复出现或位置错误抛
+  聚合参数内的 `DISTINCT`（`COUNT(DISTINCT ...)`) 等）是另一特性，见下文聚合条目；
+  DISTINCT 缺少投影、重复出现或位置错误抛
   `QuerySyntaxError`，且在访问文件之前判定。连接查询中 DISTINCT 沿用限定列名规则，
   星号结果的列名仍为 `表名.列名`。
 - 标量表达式支持括号、一元 `+`/`-` 与二元 `+`、`-`、`*`、`/`，操作数为 int64/float64
@@ -269,6 +272,19 @@ FROM input
   `MIN`/`MAX` 接受现有四类并沿用既有比较规则。除 COUNT 外的聚合在没有非 NULL
   输入时返回 NULL，结果列 nullable。int64 求和越界或浮点聚合得到非有限值抛
   `QueryValidationError`。
+- `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` 的参数前可加 `DISTINCT`（如 `COUNT(DISTINCT 列)`）：
+  先按 WHERE 选行，再在每个分组（或唯一的全局分组）内忽略 NULL 并按列类型对非 NULL
+  参数值去重（float64 的 `0.0` 与 `-0.0` 视为同一值），然后执行聚合。
+  `COUNT(DISTINCT 列)` 返回不同非 NULL 值的数量，空输入返回 0 且为非空 int64；其余
+  DISTINCT 聚合在没有不同非 NULL 值时返回 NULL，结果类型、可空性、比较规则以及
+  SUM 溢出或非有限浮点的 `QueryValidationError` 与对应普通聚合一致。参数级 DISTINCT
+  只作用于该调用的参数值，不改变 `SELECT DISTINCT` 的整行去重；参数仍只能是单列引用
+  （连接查询中带表限定），星号、多参数、表达式与嵌套聚合均不接受。DISTINCT 位置错误、
+  缺参数、用于星号、表达式或多参数时在访问文件前抛 `QuerySyntaxError`；未知列、类型
+  不兼容与既有绑定冲突抛 `QueryValidationError`。DISTINCT 聚合可出现在 SELECT、HAVING
+  与 ORDER BY 允许普通聚合出现的位置（HAVING 中未投影的调用仍过滤分组，ORDER BY 仍只能
+  引用已选聚合），文本相同的调用按现有聚合去重规则只计算一次；输出名使用大写函数名与
+  `DISTINCT` 关键字并保留绑定后的真实列名（如 `COUNT(DISTINCT x)`）。
 - 无 `GROUP BY` 时投影只能包含聚合表达式（筛选为空也返回一行：COUNT 为 0、其余为
   NULL）；有 `GROUP BY` 时可投影分组列与聚合，普通列必须已分组，星号不得与聚合或
   分组混用（抛 `QueryValidationError`）。分组按 GROUP BY 列顺序成键，NULL 键归为
@@ -374,7 +390,7 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN | RIGHT JOIN | FULL OUTER JOIN] �
   数值算术与 searched `CASE`）+
   固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`HAVING`（仅限分组列/聚合/字面量条件）、
   `ORDER BY`、`LIMIT`；DISTINCT 不与 `GROUP BY`/`HAVING`/聚合投影组合，不支持
-  `COUNT(DISTINCT ...)`、simple CASE、
+  simple CASE、
   裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
   表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。两文件入口额外支持
   一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接
