@@ -14,7 +14,7 @@ Public API:
 
 The accepted grammar (keywords case-insensitive)::
 
-    query       := SELECT select_item (',' select_item)*
+    query       := SELECT [DISTINCT] select_item (',' select_item)*
                    FROM ident [WHERE expr] [GROUP BY ident (',' ident)*]
                    [HAVING expr]
                    [ORDER BY order_item (',' order_item)*]
@@ -64,13 +64,38 @@ numeric expression used directly as a boolean condition is rejected with
 :class:`QueryValidationError` as well.  Non-aggregate queries execute
 WHERE, then compute the sort keys, stably sort, apply LIMIT and only
 then evaluate the SELECT expressions, so filtered or truncated rows
-never trigger division-by-zero or overflow in the projection.  ORDER BY
+never trigger division-by-zero or overflow in the projection; a
+DISTINCT query instead evaluates the projection right after WHERE,
+deduplicates the result rows, and only then sorts and applies LIMIT.  ORDER BY
 may name a SELECT alias (an alias shadows an input column of the same
 name) and sorts on the expression's result type with the usual NULL
 placement and stability rules.  Aggregate queries do not accept scalar
 expressions: GROUP BY keys and aggregate arguments stay plain column
 references, and mixing a scalar expression into an aggregate query
 raises :class:`QueryValidationError`.
+
+``SELECT DISTINCT`` removes duplicate rows from a non-aggregate query:
+the projection may be a star, plain columns or ``AS``-aliased scalar
+expressions exactly as without DISTINCT, and deduplication compares the
+full projected result row column by column after WHERE.  Two NULLs in
+the same result column compare equal, NULL never equals a non-NULL
+value, bool / utf8 / numeric values keep their existing comparison
+semantics, and float64 ``0.0`` and ``-0.0`` compare equal.  Without
+ORDER BY the surviving rows keep the order of the first occurrence of
+each distinct result row; ORDER BY then sorts the deduplicated rows and
+LIMIT keeps the first N.  The projection expressions are evaluated
+only for rows that passed WHERE (and, with ORDER BY, before the sort),
+so a division by zero, int64 overflow or non-finite float64 result that
+actually occurs still raises :class:`QueryValidationError`.  ORDER BY
+of a DISTINCT query may name only bare columns or explicit aliases that
+are part of the projection; an unprojected or otherwise unknown name
+raises :class:`QueryValidationError`, and the sort direction, NULL
+placement and stability rules are unchanged.  DISTINCT combined with
+GROUP BY, HAVING or any aggregate projection raises
+:class:`QueryValidationError`; ``COUNT(DISTINCT ...)`` is not part of
+the grammar.  A missing projection, a repeated DISTINCT or a misplaced
+DISTINCT keyword raises :class:`QuerySyntaxError` before any file is
+opened.
 
 Searched CASE expressions
 (``CASE WHEN cond THEN result [WHEN ...] [ELSE result] END``; the simple
@@ -177,6 +202,7 @@ __all__ = [
 _KEYWORDS = frozenset(
     (
         "select",
+        "distinct",
         "from",
         "where",
         "as",
@@ -478,6 +504,8 @@ class _Select:
     order_by: tuple[_RefItem, ...] | None
     limit: int | None
     join: _Join | None = None
+    # SELECT DISTINCT: deduplicate the projected rows (non-aggregate only).
+    distinct: bool = False
 
     @property
     def star(self) -> bool:
@@ -512,6 +540,7 @@ class _Parser:
 
     def _parse_select(self) -> _Select:
         self._expect_keyword("select")
+        distinct = self._accept_keyword("distinct")
         items = tuple(self._parse_projection())
         self._expect_keyword("from")
         table_tok = self._expect_table_name()
@@ -556,6 +585,7 @@ class _Parser:
             order_by=order_by,
             limit=limit,
             join=join,
+            distinct=distinct,
         )
 
     def _parse_join(self, kind: str) -> _Join:
@@ -1208,6 +1238,11 @@ def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dic
                 f"WHERE clause must be boolean, got {type_name}"
             )
 
+    if select.distinct and select.is_aggregate_query:
+        raise QueryValidationError(
+            "DISTINCT is not allowed with GROUP BY, HAVING or aggregate projections"
+        )
+
     if not select.is_aggregate_query:
         return _bind_plain(select, schema, where)
     return _bind_aggregate(select, schema, where)
@@ -1285,7 +1320,10 @@ def _bind_plain(select: _Select, schema: Schema, where) -> dict:
     aliases = {
         item.output_name: item.expr for item in bound_items if item.kind == "expr"
     }
-    order_by = _bind_plain_order_by(select.order_by, schema, aliases)
+    projected = {item.output_name: i for i, item in enumerate(bound_items)}
+    order_by = _bind_plain_order_by(
+        select.order_by, schema, aliases, select.distinct, projected
+    )
     return {
         "mode": "plain",
         "items": tuple(bound_items),
@@ -1293,10 +1331,13 @@ def _bind_plain(select: _Select, schema: Schema, where) -> dict:
         "where": where,
         "having": None,
         "order_by": order_by,
+        "distinct": select.distinct,
     }
 
 
-def _bind_plain_order_by(select_order_by, schema: Schema, aliases: dict):
+def _bind_plain_order_by(
+    select_order_by, schema: Schema, aliases: dict, distinct: bool, projected: dict
+):
     if select_order_by is None:
         return None
     bound: list[tuple] = []
@@ -1314,6 +1355,22 @@ def _bind_plain_order_by(select_order_by, schema: Schema, aliases: dict):
             )
         order_seen.add(name)
         nulls_first = item.nulls_first if item.nulls_first is not None else False
+        if distinct:
+            # A DISTINCT query sorts its deduplicated result rows, so every
+            # ORDER BY name must be one of the projected outputs (a bare
+            # projected column or an explicit AS alias).
+            if name not in projected:
+                try:
+                    schema.index(name)
+                except KeyError:
+                    raise QueryValidationError(
+                        f"unknown ORDER BY column: {name!r}"
+                    ) from None
+                raise QueryValidationError(
+                    f"ORDER BY column {name!r} is not part of the SELECT DISTINCT results"
+                )
+            bound.append(("out", projected[name], item.descending, nulls_first))
+            continue
         # A SELECT alias shadows an input column of the same name.
         if name in aliases:
             bound.append(("expr", aliases[name], item.descending, nulls_first))
@@ -1463,6 +1520,7 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
         "where": where,
         "having": having,
         "order_by": order_by,
+        "distinct": False,
     }
 
 
@@ -2249,6 +2307,7 @@ def _rewrite_select(select: _Select, resolve) -> _Select:
         having=having,
         order_by=order_by,
         limit=select.limit,
+        distinct=select.distinct,
     )
 
 
@@ -2534,24 +2593,55 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
     items = bound["items"]
     order_by = bound["order_by"]
     source_columns = table._columns
-    # Execution order: WHERE (done by the caller) -> sort keys -> stable sort
-    # -> LIMIT -> result expressions, so rows filtered out or cut by LIMIT
-    # never evaluate the SELECT expressions.
+
+    out_schema_columns = [
+        table.schema.columns[item.col_index]
+        if item.kind == "column"
+        else ColumnSchema(item.output_name, item.out_type, nullable=item.nullable)
+        for item in items
+    ]
+    out_schema = Schema(out_schema_columns)
+
+    if not bound.get("distinct"):
+        # Execution order: WHERE (done by the caller) -> sort keys -> stable
+        # sort -> LIMIT -> result expressions, so rows filtered out or cut by
+        # LIMIT never evaluate the SELECT expressions.
+        if order_by is not None:
+            comparator = _make_row_comparator(source_columns, order_by, selected)
+            selected = sorted(selected, key=cmp_to_key(comparator))
+
+        if select.limit is not None:
+            selected = selected[: select.limit]
+
+        out_columns = _project_items(items, source_columns, selected)
+        return Table._from_storage(out_schema, out_columns)
+
+    # DISTINCT: WHERE -> project every surviving input row -> deduplicate the
+    # full result rows -> sort -> LIMIT.  Projection happens before the sort
+    # so ORDER BY compares deduplicated output values, and before LIMIT so a
+    # row LIMIT would cut still surfaces a real division-by-zero/overflow.
+    rows = _project_item_rows(items, source_columns, selected)
+    rows = _deduplicate_rows(rows, out_schema)
+
     if order_by is not None:
-        comparator = _make_row_comparator(source_columns, order_by, selected)
-        selected = sorted(selected, key=cmp_to_key(comparator))
+        comparator = _make_projected_comparator(order_by)
+        rows = sorted(rows, key=cmp_to_key(comparator))
 
     if select.limit is not None:
-        selected = selected[: select.limit]
+        rows = rows[: select.limit]
 
+    width = len(items)
+    out_columns = [tuple(row[c] for row in rows) for c in range(width)]
+    return Table._from_storage(out_schema, out_columns)
+
+
+def _project_items(items, source_columns, selected) -> list:
     out_columns = []
-    out_schema_columns = []
     for item in items:
         if item.kind == "column":
             out_columns.append(
                 tuple(source_columns[item.col_index][i] for i in selected)
             )
-            out_schema_columns.append(table.schema.columns[item.col_index])
         else:  # "expr"
             out_columns.append(
                 tuple(
@@ -2559,11 +2649,61 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
                     for i in selected
                 )
             )
-            out_schema_columns.append(
-                ColumnSchema(item.output_name, item.out_type, nullable=item.nullable)
-            )
-    out_schema = Schema(out_schema_columns)
-    return Table._from_storage(out_schema, out_columns)
+    return out_columns
+
+
+def _project_item_rows(items, source_columns, selected) -> list[tuple]:
+    return [
+        tuple(
+            source_columns[item.col_index][i]
+            if item.kind == "column"
+            else _eval(item.expr, _row_values(source_columns, i))
+            for item in items
+        )
+        for i in selected
+    ]
+
+
+def _deduplicate_rows(rows: list[tuple], schema: Schema) -> list[tuple]:
+    """Keep the first occurrence of each distinct result row.
+
+    Equality follows the result schema column by column: NULLs compare equal
+    to each other but never to a non-NULL value, bool/utf8/numeric keep
+    their existing semantics, and float64 0.0 and -0.0 compare equal.
+    """
+    seen: set[tuple] = set()
+    unique: list[tuple] = []
+    for row in rows:
+        key = tuple(
+            _distinct_key_part(schema.columns[c].type, value)
+            for c, value in enumerate(row)
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
+
+
+def _distinct_key_part(type_name: str, value):
+    if value is None:
+        return (False,)
+    if type_name == "float64":
+        # 0.0 and -0.0 are the same distinct value; the wrapper also keeps a
+        # float from ever colliding with an int64 part of the same number.
+        return (True, 0.0 if value == 0 else value)
+    return (True, value)
+
+
+def _make_projected_comparator(order_by: tuple[tuple, ...]):
+    def compare(a: tuple, b: tuple) -> int:
+        for entry in order_by:
+            col_index = entry[1]
+            c = _compare_scalar(a[col_index], b[col_index], entry[2], entry[3])
+            if c:
+                return c
+        return 0
+
+    return compare
 
 
 def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) -> Table:
@@ -3177,35 +3317,6 @@ def _build_explain(
                 }
             )
 
-    if bound["order_by"] is not None:
-        alias_by_expr = {
-            id(item.expr): item.output_name
-            for item in bound["items"]
-            if item.kind == "expr"
-        }
-        keys = []
-        for entry in bound["order_by"]:
-            if entry[0] == "col":
-                name = schema.columns[entry[1]].name
-                descending, nulls_first = entry[2], entry[3]
-            elif entry[0] == "expr":
-                name = alias_by_expr[id(entry[1])]
-                descending, nulls_first = entry[2], entry[3]
-            else:  # aggregate-query ORDER BY indexes a selected output column
-                name = bound["items"][entry[0]].output_name
-                descending, nulls_first = entry[1], entry[2]
-            keys.append(
-                {
-                    "column": name,
-                    "direction": "DESC" if descending else "ASC",
-                    "nulls": "FIRST" if nulls_first else "LAST",
-                }
-            )
-        operators.append({"operator": "Sort", "keys": keys})
-
-    if select.limit is not None:
-        operators.append({"operator": "Limit", "count": select.limit})
-
     projections = []
     for item in bound["items"]:
         if item.kind == "column":
@@ -3223,7 +3334,63 @@ def _build_explain(
         else:  # "expr"
             expression = _expr_json(item.expr)
         projections.append({"expression": expression, "output": item.output_name})
-    operators.append({"operator": "Project", "expressions": projections})
+    project_operator = {"operator": "Project", "expressions": projections}
+
+    if bound.get("distinct"):
+        # DISTINCT evaluates the projection right after the scan/join/filter
+        # stages, then deduplicates the result rows before Sort and Limit.
+        operators.append(project_operator)
+        operators.append(
+            {
+                "operator": "Distinct",
+                "keys": [item.output_name for item in bound["items"]],
+            }
+        )
+        if bound["order_by"] is not None:
+            keys = []
+            for entry in bound["order_by"]:
+                # DISTINCT ORDER BY entries index projected output columns.
+                name = bound["items"][entry[1]].output_name
+                keys.append(
+                    {
+                        "column": name,
+                        "direction": "DESC" if entry[2] else "ASC",
+                        "nulls": "FIRST" if entry[3] else "LAST",
+                    }
+                )
+            operators.append({"operator": "Sort", "keys": keys})
+        if select.limit is not None:
+            operators.append({"operator": "Limit", "count": select.limit})
+    else:
+        if bound["order_by"] is not None:
+            alias_by_expr = {
+                id(item.expr): item.output_name
+                for item in bound["items"]
+                if item.kind == "expr"
+            }
+            keys = []
+            for entry in bound["order_by"]:
+                if entry[0] == "col":
+                    name = schema.columns[entry[1]].name
+                    descending, nulls_first = entry[2], entry[3]
+                elif entry[0] == "expr":
+                    name = alias_by_expr[id(entry[1])]
+                    descending, nulls_first = entry[2], entry[3]
+                else:  # aggregate-query ORDER BY indexes a selected output column
+                    name = bound["items"][entry[0]].output_name
+                    descending, nulls_first = entry[1], entry[2]
+                keys.append(
+                    {
+                        "column": name,
+                        "direction": "DESC" if descending else "ASC",
+                        "nulls": "FIRST" if nulls_first else "LAST",
+                    }
+                )
+            operators.append({"operator": "Sort", "keys": keys})
+
+        if select.limit is not None:
+            operators.append({"operator": "Limit", "count": select.limit})
+        operators.append(project_operator)
 
     output = [
         {
