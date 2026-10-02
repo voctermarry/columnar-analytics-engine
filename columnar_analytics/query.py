@@ -16,6 +16,7 @@ The accepted grammar (keywords case-insensitive)::
 
     query       := SELECT select_item (',' select_item)*
                    FROM ident [WHERE expr] [GROUP BY ident (',' ident)*]
+                   [HAVING expr]
                    [ORDER BY order_item (',' order_item)*]
                    [LIMIT uint]
     select_item := '*' | ident | agg_name '(' ('*' | ident) ')'
@@ -45,7 +46,8 @@ GROUP BY the projection may contain aggregate expressions only; with
 GROUP BY it may additionally contain the grouped columns.  A bare ``*``
 must not be mixed with aggregates or grouping.  Aggregates are not
 allowed inside WHERE, may not be nested, and aliases are not supported
-for bare columns or aggregate calls.
+for bare columns or aggregate calls.  HAVING additionally accepts
+aggregate calls (and grouped columns) in its condition.
 
 Scalar arithmetic (parentheses, unary ``+``/``-``, binary ``+`` ``-``
 ``*`` ``/``; precedence: parentheses, unary, ``*``/``/``, ``+``/``-``)
@@ -108,10 +110,27 @@ keeps the first N groups.  Without GROUP BY and aggregates an aggregate
 query over zero selected rows still yields one output row (COUNT 0, the
 other aggregates NULL); with GROUP BY it yields zero rows.
 
+An optional HAVING clause sits between GROUP BY and ORDER BY and filters
+the grouped rows with the same condition grammar and three-valued logic
+as WHERE: only groups whose condition is TRUE survive (FALSE and UNKNOWN
+are dropped).  Its operands are grouped columns, aggregate calls and
+type-compatible literals combined with NOT / AND / OR / comparisons and
+IS [NOT] NULL; an aggregate used by HAVING need not appear in the
+projection, but scalar arithmetic, CASE, ungrouped plain columns, stars
+and nested aggregates are rejected just like the other aggregate-query
+positions.  Without GROUP BY HAVING filters the single global-aggregate
+row (which is still produced when WHERE selected no rows); with GROUP BY
+a filter that removes every group yields zero rows.  Aggregate NULL,
+empty-input and numeric-error rules are the existing ones and apply
+equally to aggregates referenced only by HAVING.  The execution order is
+WHERE, grouping/aggregation, HAVING, ORDER BY, LIMIT, projection.
+
 Two-file queries (:func:`query_files`) add one equi-join to the grammar::
 
     query := SELECT ... FROM left_table [join_kind JOIN right_table
-             ON left_table.column = right_table.column] ...
+             ON left_table.column = right_table.column]
+             [WHERE ...] [GROUP BY ...] [HAVING ...]
+             [ORDER BY ...] [LIMIT ...]
     join_kind := INNER | LEFT
 
 ``sources`` maps table names to file paths; only the tables referenced by
@@ -127,7 +146,7 @@ never match.  INNER JOIN emits every matching combination, LEFT JOIN also
 emits unmatched left rows with the right-side values set to NULL (the
 right result columns are nullable).  Rows expand in left-file order, and
 within one left row in right-file order, before WHERE / GROUP BY /
-ORDER BY / LIMIT apply with their usual semantics.
+HAVING / ORDER BY / LIMIT apply with their usual semantics.
 """
 
 from __future__ import annotations
@@ -173,6 +192,7 @@ _KEYWORDS = frozenset(
         "last",
         "limit",
         "group",
+        "having",
         "inner",
         "left",
         "join",
@@ -380,6 +400,14 @@ def _parse_number(text: str) -> int | float:
 # Predicate nodes are boolean-typed (three-valued at evaluation time);
 # "literal"/"column"/"arith"/"unary" nodes are value nodes.
 #
+# HAVING reuses the same tree after binding, plus one extra leaf:
+#   ("aggref", func_upper, slot, arg_index, argument_name|None,
+#    out_type, nullable)
+# and grouped columns take their bound "column" form.  HAVING is bound
+# against grouped source columns plus the aggregate registry; an "aggref"
+# reads its precomputed value by registry slot (argument_name is None for
+# COUNT(*)).
+#
 # Projection / ORDER BY reference items:
 #   ("column_ref", name)                 -- a plain column name
 #   ("agg", func_upper, arg_name|None)   -- an aggregate call; arg None = '*'
@@ -424,6 +452,7 @@ class _Select:
     where: tuple | None
     # GROUP BY entries are (table|None, table_quoted, name) triples.
     group_by: tuple[tuple, ...] | None
+    having: tuple | None  # parsed post-group filter tree; aggregates allowed
     order_by: tuple[_RefItem, ...] | None
     limit: int | None
     join: _Join | None = None
@@ -438,7 +467,7 @@ class _Select:
 
     @property
     def is_aggregate_query(self) -> bool:
-        return self.has_aggregate or self.group_by is not None
+        return self.has_aggregate or self.group_by is not None or self.having is not None
 
 
 class _Parser:
@@ -451,6 +480,10 @@ class _Parser:
         # enabled for query_files; single-file entry points keep rejecting
         # them as syntax errors.
         self._allow_join = allow_join
+        # Aggregate calls inside an expression are only accepted while the
+        # HAVING condition is being parsed; WHERE and scalar SELECT
+        # expressions reject them.
+        self._aggregates_allowed = False
 
     def parse(self) -> _Select:
         select = self._parse_select()
@@ -482,6 +515,13 @@ class _Parser:
             while self._accept_op(","):
                 names.append(self._parse_group_name())
             group_by = tuple(names)
+        having = None
+        if self._accept_keyword("having"):
+            self._aggregates_allowed = True
+            try:
+                having = self._parse_or()
+            finally:
+                self._aggregates_allowed = False
         order_by = None
         if self._accept_keyword("order"):
             self._expect_keyword("by")
@@ -498,6 +538,7 @@ class _Parser:
             table_quoted=table_tok.kind == "qident",
             where=where,
             group_by=group_by,
+            having=having,
             order_by=order_by,
             limit=limit,
             join=join,
@@ -906,9 +947,16 @@ class _Parser:
                 and nxt.kind == "op"
                 and nxt.value == "("
             ):
-                raise QueryValidationError(
-                    f"aggregate {tok.value.upper()}(...) is not allowed here"
-                )
+                if not self._aggregates_allowed:
+                    raise QueryValidationError(
+                        f"aggregate {tok.value.upper()}(...) is not allowed here"
+                    )
+                func = tok.value.lower()
+                self._next()  # consume the function name
+                self._expect_op("(")
+                arg, arg_table, arg_table_quoted = self._parse_aggregate_args(func)
+                self._expect_op(")")
+                return ("aggcall", func.upper(), arg, arg_table, arg_table_quoted)
             self._next()
             return ("column", tok.value, None, False)
         if tok.kind == "keyword":
@@ -1167,6 +1215,29 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
             raise QueryValidationError(f"unknown GROUP BY column: {name!r}") from None
     group_index_set = set(group_indices)
 
+    # Aggregate registry: every aggregate the query has to compute,
+    # deduplicated by its canonical "FUNC(arg)" label and ordered by first
+    # reference (SELECT first, then HAVING).  ORDER BY never adds entries:
+    # its aggregates must be part of the SELECT results.
+    agg_registry: list[_BoundItem] = []
+    agg_by_label: dict[str, int] = {}
+
+    def register_aggregate(item: _RefItem) -> int:
+        if item.arg == "":
+            arg_index = -1
+        else:
+            try:
+                arg_index = schema.index(item.arg)
+            except KeyError:
+                raise QueryValidationError(f"unknown column: {item.arg!r}") from None
+        desc = _make_agg_bound_item(item.func, arg_index, schema)
+        slot = agg_by_label.get(desc.output_name)
+        if slot is None:
+            slot = len(agg_registry)
+            agg_by_label[desc.output_name] = slot
+            agg_registry.append(desc)
+        return slot
+
     # Resolve the projection.  Plain columns must be grouped; output names
     # (group column names and canonical "FUNC(arg)" labels) must be unique.
     bound_items: list[_BoundItem] = []
@@ -1207,12 +1278,25 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
                 )
             )
         else:
-            bound_items.append(_bind_agg_item(item, schema, output_seen))
+            slot = register_aggregate(item)
+            label = agg_registry[slot].output_name
+            if label in output_seen:
+                raise QueryValidationError(f"duplicate result column: {label!r}")
+            output_seen.add(label)
+            bound_items.append(agg_registry[slot])
 
     if select.group_by is None and has_plain:
         # No grouping: every projected column must be an aggregate.
         raise QueryValidationError(
             "without GROUP BY, the projection may contain aggregates only"
+        )
+
+    # HAVING is bound between the projection and ORDER BY so HAVING-only
+    # aggregates take their first-reference slots before the sort keys.
+    having = None
+    if select.having is not None:
+        having = _bind_having(
+            select.having, schema, group_index_set, agg_registry, agg_by_label
         )
 
     order_by = _bind_aggregate_order_by(
@@ -1222,31 +1306,129 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
         "mode": "aggregate",
         "group_indices": tuple(group_indices),
         "items": tuple(bound_items),
+        "aggregates": tuple(agg_registry),
         "where": where,
+        "having": having,
         "order_by": order_by,
     }
 
 
-def _bind_agg_item(item: _RefItem, schema: Schema, output_seen: set[str]) -> _BoundItem:
-    func = item.func
-    if item.arg == "":
+# Value-node tags allowed as HAVING operands: typed literals, grouped
+# columns and aggregate calls only -- no arithmetic / CASE / unary nodes.
+_HAVING_LEAF_TAGS = frozenset(("literal", "column", "aggref"))
+
+
+def _bind_having(
+    node: tuple,
+    schema: Schema,
+    group_index_set: set[int],
+    agg_registry: list[_BoundItem],
+    agg_by_label: dict[str, int],
+) -> tuple:
+    """Bind the post-group filter against groups plus computed aggregates."""
+
+    def register_agg(func: str, arg_index: int) -> tuple[int, _BoundItem]:
+        desc = _make_agg_bound_item(func, arg_index, schema)
+        slot = agg_by_label.get(desc.output_name)
+        if slot is None:
+            slot = len(agg_registry)
+            agg_by_label[desc.output_name] = slot
+            agg_registry.append(desc)
+        return slot, desc
+
+    def bind(sub: tuple) -> tuple:
+        tag = sub[0]
+        if tag == "literal":
+            return sub
+        if tag == "column":
+            name = sub[1]
+            try:
+                index = schema.index(name)
+            except KeyError:
+                raise QueryValidationError(f"unknown column: {name!r}") from None
+            if index not in group_index_set:
+                raise QueryValidationError(
+                    f"HAVING column {name!r} must appear in GROUP BY "
+                    "or be wrapped in an aggregate"
+                )
+            col = schema.columns[index]
+            return ("column", name, index, col.type, col.nullable)
+        if tag == "aggcall":
+            func = sub[1]
+            arg = sub[2]
+            if arg == "":
+                arg_index = -1
+            else:
+                try:
+                    arg_index = schema.index(arg)
+                except KeyError:
+                    raise QueryValidationError(f"unknown column: {arg!r}") from None
+            slot, desc = register_agg(func, arg_index)
+            argument_name = None if arg_index < 0 else schema.columns[arg_index].name
+            return (
+                "aggref",
+                func,
+                slot,
+                arg_index,
+                argument_name,
+                desc.out_type,
+                desc.nullable,
+            )
+        if tag in ("unary", "arith", "case"):
+            raise QueryValidationError(
+                "HAVING only accepts grouped columns, aggregates and literals"
+            )
+        if tag == "not":
+            operand = bind(sub[1])
+            _require_boolean(operand, "HAVING")
+            return ("not", operand)
+        if tag in ("and", "or"):
+            left = bind(sub[1])
+            right = bind(sub[2])
+            _require_boolean(left, "HAVING")
+            _require_boolean(right, "HAVING")
+            return (tag, left, right)
+        if tag == "isnull":
+            operand = bind(sub[1])
+            if operand[0] not in _HAVING_LEAF_TAGS:
+                raise QuerySyntaxError(
+                    "IS NULL operand must be a column, an aggregate or a literal"
+                )
+            return ("isnull", operand, sub[2])
+        if tag == "cmp":
+            op = sub[1]
+            left = bind(sub[2])
+            right = bind(sub[3])
+            if left[0] not in _HAVING_LEAF_TAGS or right[0] not in _HAVING_LEAF_TAGS:
+                raise QuerySyntaxError(
+                    "comparison operands must be columns, aggregates or literals"
+                )
+            left_t = _expr_type(left)
+            right_t = _expr_type(right)
+            _check_comparison_types(op, left_t, right_t)
+            return ("cmp", op, left, right)
+        raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+    bound = bind(node)
+    _require_boolean(bound, "HAVING")
+    return bound
+
+
+def _make_agg_bound_item(func: str, arg_index: int, schema: Schema) -> _BoundItem:
+    """Build the bound description of one aggregate call.
+
+    Shared by the projection and HAVING binding; HAVING-only aggregates use
+    the same canonical label even though they produce no output column.
+    """
+    if arg_index == -1:
         if func != "COUNT":
             raise QuerySyntaxError(f"{func} does not accept '*'")
         label = "COUNT(*)"
-        arg_index = -1
         arg_col = None
     else:
-        arg_name = item.arg
-        try:
-            arg_index = schema.index(arg_name)
-        except KeyError:
-            raise QueryValidationError(f"unknown column: {arg_name!r}") from None
         arg_col = schema.columns[arg_index]
         # The result label uses the column name as spelled in the schema.
         label = f"{func}({arg_col.name})"
-    if label in output_seen:
-        raise QueryValidationError(f"duplicate result column: {label!r}")
-    output_seen.add(label)
 
     if func == "COUNT":
         out_type, nullable = "int64", False
@@ -1417,26 +1599,29 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
             "literal", "column", "arith", "unary", "case"
         ) or right[0] not in ("literal", "column", "arith", "unary", "case"):
             raise QuerySyntaxError("comparison operands must be column references or literals")
-        left_t = _expr_type(left)
-        right_t = _expr_type(right)
-        if "bool" in (left_t, right_t):
-            if left_t != "bool" or right_t != "bool":
-                raise QueryValidationError(
-                    f"bool can only be compared to bool, got {left_t} and {right_t}"
-                )
-            if op not in ("=", "!="):
-                raise QueryValidationError(f"bool only supports = and !=, not {op!r}")
-        elif "utf8" in (left_t, right_t):
-            if left_t != "utf8" or right_t != "utf8":
-                raise QueryValidationError(
-                    f"utf8 can only be compared to utf8, got {left_t} and {right_t}"
-                )
-        elif not {left_t, right_t} <= {"int64", "float64"}:
-            raise QueryValidationError(
-                f"cannot compare values of type {left_t} and {right_t}"
-            )
+        _check_comparison_types(op, _expr_type(left), _expr_type(right))
         return ("cmp", op, left, right)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _check_comparison_types(op: str, left_t: str, right_t: str) -> None:
+    """Shared comparison type rules for WHERE and HAVING."""
+    if "bool" in (left_t, right_t):
+        if left_t != "bool" or right_t != "bool":
+            raise QueryValidationError(
+                f"bool can only be compared to bool, got {left_t} and {right_t}"
+            )
+        if op not in ("=", "!="):
+            raise QueryValidationError(f"bool only supports = and !=, not {op!r}")
+    elif "utf8" in (left_t, right_t):
+        if left_t != "utf8" or right_t != "utf8":
+            raise QueryValidationError(
+                f"utf8 can only be compared to utf8, got {left_t} and {right_t}"
+            )
+    elif not {left_t, right_t} <= {"int64", "float64"}:
+        raise QueryValidationError(
+            f"cannot compare values of type {left_t} and {right_t}"
+        )
 
 
 def _unify_case_types(types: list[str]) -> str:
@@ -1463,6 +1648,9 @@ def _expr_type(node: tuple) -> str:
         return node[2]
     if tag == "column":
         return node[3]
+    if tag == "aggref":
+        # ("aggref", func, slot, arg_index, arg_type, out_type, nullable)
+        return node[5]
     if tag == "unary":
         return node[3]
     if tag == "arith":
@@ -1509,22 +1697,25 @@ def _require_boolean(node: tuple, context: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _eval(node: tuple, row: tuple) -> bool | None:
+def _eval(node: tuple, row: tuple, agg_values=None) -> bool | None:
     tag = node[0]
     if tag == "literal":
         return node[1]
     if tag == "column":
         return row[node[2]]
+    if tag == "aggref":
+        # HAVING only: the precomputed aggregate value, by registry slot.
+        return agg_values[node[2]]
     if tag == "unary":
-        value = _eval(node[1], row)
+        value = _eval(node[1], row, agg_values)
         if value is None:
             return None
         if not node[2]:  # unary plus keeps the value
             return value
         return _negate_value(value)
     if tag == "arith":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
+        left = _eval(node[2], row, agg_values)
+        right = _eval(node[3], row, agg_values)
         if left is None or right is None:
             return None
         return _arith_value(node[1], left, right)
@@ -1534,11 +1725,11 @@ def _eval(node: tuple, row: tuple) -> bool | None:
         # their division-by-zero, int64 overflow or non-finite float64
         # cannot raise.  The chosen result alone is evaluated.
         for condition, result in node[1]:
-            if _eval(condition, row) is True:
-                value = _eval(result, row)
+            if _eval(condition, row, agg_values) is True:
+                value = _eval(result, row, agg_values)
                 break
         else:
-            value = None if node[2] is None else _eval(node[2], row)
+            value = None if node[2] is None else _eval(node[2], row, agg_values)
         if value is None:
             return None
         # int64/float64 results unify to float64; ints become floats.
@@ -1546,36 +1737,36 @@ def _eval(node: tuple, row: tuple) -> bool | None:
             return float(value)
         return value
     if tag == "isnull":
-        value = _eval(node[1], row)
+        value = _eval(node[1], row, agg_values)
         result = value is None
         return (not result) if node[2] else result
     if tag == "not":
-        value = _eval(node[1], row)
+        value = _eval(node[1], row, agg_values)
         return None if value is None else (not value)
     if tag in ("and", "or"):
         # Short-circuit SQL semantics; UNKNOWN propagates only when needed.
         if tag == "and":
-            left = _eval(node[1], row)
+            left = _eval(node[1], row, agg_values)
             if left is False:
                 return False
-            right = _eval(node[2], row)
+            right = _eval(node[2], row, agg_values)
             if right is False:
                 return False
             if left is None or right is None:
                 return None
             return True
-        left = _eval(node[1], row)
+        left = _eval(node[1], row, agg_values)
         if left is True:
             return True
-        right = _eval(node[2], row)
+        right = _eval(node[2], row, agg_values)
         if right is True:
             return True
         if left is None or right is None:
             return None
         return False
     if tag == "cmp":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
+        left = _eval(node[2], row, agg_values)
+        right = _eval(node[3], row, agg_values)
         if left is None or right is None:
             return None
         op = node[1]
@@ -1694,11 +1885,12 @@ def query_file(path: Any, sql: str) -> Table:
 
     Returns a :class:`~columnar_analytics.format.Table` with columns in
     projection order.  Rows are filtered by WHERE, then grouped (for
-    aggregate queries) or sorted by ORDER BY, then capped by LIMIT, then
-    projected; without ORDER BY the file's original row order (or the
-    first-selected-row group order) is kept.  The statement is parsed
-    before the file is touched, so purely grammatical errors surface as
-    :class:`QuerySyntaxError` regardless of whether ``path`` exists.
+    aggregate queries); groups may be filtered by HAVING, then sorted by
+    ORDER BY, capped by LIMIT and projected; without ORDER BY the file's
+    original row order (or the first-selected-row group order) is kept.
+    The statement is parsed before the file is touched, so purely
+    grammatical errors surface as :class:`QuerySyntaxError` regardless of
+    whether ``path`` exists.
     Unknown columns, duplicate result columns, the wrong table name,
     type-incompatible predicates, ungrouped columns, illegal aggregate
     arguments or int64 SUM overflow raise :class:`QueryValidationError`;
@@ -1864,12 +2056,16 @@ def _rewrite_select(select: _Select, resolve) -> _Select:
             for item in select.order_by
         )
     where = _rewrite_expr(select.where, resolve) if select.where is not None else None
+    having = (
+        _rewrite_expr(select.having, resolve) if select.having is not None else None
+    )
     return _Select(
         items=items,
         table=select.table,
         table_quoted=select.table_quoted,
         where=where,
         group_by=group_by,
+        having=having,
         order_by=order_by,
         limit=select.limit,
     )
@@ -1911,6 +2107,12 @@ def _rewrite_expr(node: tuple, resolve) -> tuple:
         return node
     if tag == "column":
         return ("column", resolve(node[2], node[3], node[1]), None, False)
+    if tag == "aggcall":
+        # ("aggcall", func, arg, arg_table, arg_table_quoted); arg "" = '*'.
+        func, arg, arg_table, arg_table_quoted = node[1], node[2], node[3], node[4]
+        if arg:
+            arg = resolve(arg_table, arg_table_quoted, arg)
+        return ("aggcall", func, arg, arg_table, arg_table_quoted)
     if tag == "unary":
         return ("unary", _rewrite_expr(node[1], resolve), node[2])
     if tag == "arith":
@@ -2085,6 +2287,8 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
 def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) -> Table:
     group_indices = bound["group_indices"]
     bound_items = bound["items"]
+    all_aggregates = bound["aggregates"]
+    having = bound["having"]
     order_by = bound["order_by"]
     source_columns = table._columns
 
@@ -2102,19 +2306,33 @@ def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) ->
         # empty stream still produces the one all-NULL/COUNT-0 row.
         groups = [tuple(selected)]
 
-    # Materialise one output tuple per group, following the SELECT order.
+    # For every group compute the full registry first (SELECT, HAVING and
+    # ORDER BY share the deduplicated aggregates), then evaluate HAVING with
+    # three-valued logic over the grouped columns (keyed by their source
+    # schema index) and the aggregate slots, and only afterwards materialise
+    # the projection.  A HAVING-only aggregate is still computed here even
+    # though SELECT never references it; projection aggregates reuse the
+    # registry values rather than being computed a second time.
+    slot_by_label = {agg.output_name: i for i, agg in enumerate(all_aggregates)}
     materialised: list[tuple] = []
     for rows in groups:
+        group_values = {
+            index: source_columns[index][rows[0]] for index in group_indices
+        }
+        agg_values: tuple = tuple(
+            _aggregate_value(
+                agg.func, agg.arg_index, agg.arg_type, rows, source_columns
+            )
+            for agg in all_aggregates
+        )
+        if having is not None and _eval(having, group_values, agg_values) is not True:
+            continue
         values = []
         for item in bound_items:
             if item.kind == "column":
                 values.append(source_columns[item.col_index][rows[0]])
             else:
-                values.append(
-                    _aggregate_value(
-                        item.func, item.arg_index, item.arg_type, rows, source_columns
-                    )
-                )
+                values.append(agg_values[slot_by_label[item.output_name]])
         materialised.append(tuple(values))
 
     if order_by is not None:
@@ -2336,6 +2554,11 @@ def _collect_expr_columns(node: tuple, indices: set) -> None:
     if tag == "column":
         indices.add(node[2])
         return
+    if tag == "aggref":
+        # ("aggref", func, slot, arg_index, ...) -- the argument is scanned
+        # separately from the aggregate registry; nothing to add from the
+        # condition tree itself.
+        return
     if tag in ("not", "isnull", "unary"):
         _collect_expr_columns(node[1], indices)
         return
@@ -2374,6 +2597,14 @@ def _collect_required_indices(bound: Mapping) -> set:
                 indices.add(item.arg_index)
         else:  # "expr"
             _collect_expr_columns(item.expr, indices)
+    # The aggregate registry covers SELECT plus HAVING (and, transitively,
+    # the ORDER BY aggregates), so HAVING-only aggregate arguments are
+    # scanned as well.
+    for agg in bound.get("aggregates", ()):
+        if agg.arg_index >= 0:
+            indices.add(agg.arg_index)
+    if bound.get("having") is not None:
+        _collect_expr_columns(bound["having"], indices)
     for entry in bound["order_by"] or ():
         if entry[0] == "col":
             indices.add(entry[1])
@@ -2395,6 +2626,16 @@ def _expr_json(node: tuple) -> dict:
         return {"kind": "literal", "type": node[2], "value": node[1]}
     if tag == "column":
         return {"kind": "column", "name": node[1]}
+    if tag == "aggref":
+        # ("aggref", func, slot, arg_index, argument_name|None,
+        #  out_type, nullable)
+        return {
+            "kind": "aggregate",
+            "function": node[1],
+            "argument": node[4],
+            "type": node[5],
+            "nullable": node[6],
+        }
     if tag == "unary":
         operator = "-" if node[2] else "+"
         return {
@@ -2493,6 +2734,9 @@ def _build_explain(
         operators.append({"operator": "Filter", "condition": _expr_json(bound["where"])})
 
     if bound["mode"] == "aggregate":
+        # The registry lists every aggregate the query has to compute --
+        # SELECT, HAVING (and any ORDER BY aggregate), deduplicated by their
+        # canonical label in first-reference order.
         operators.append(
             {
                 "operator": "Aggregate",
@@ -2501,18 +2745,22 @@ def _build_explain(
                 ],
                 "aggregates": [
                     {
-                        "function": item.func,
+                        "function": agg.func,
                         "argument": (
                             None
-                            if item.arg_index < 0
-                            else schema.columns[item.arg_index].name
+                            if agg.arg_index < 0
+                            else schema.columns[agg.arg_index].name
                         ),
-                        "output": item.output_name,
+                        "output": agg.output_name,
                     }
-                    for item in bound["items"]
-                    if item.kind == "agg"
+                    for agg in bound["aggregates"]
                 ],
             }
+        )
+
+    if bound.get("having") is not None:
+        operators.append(
+            {"operator": "Having", "condition": _expr_json(bound["having"])}
         )
 
     if bound["order_by"] is not None:
