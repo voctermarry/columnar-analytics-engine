@@ -3,7 +3,8 @@
 本项目是「列式分析型数据库引擎」的代码仓库，用于逐步实现该方向的列式存储、查询执行与结果对账能力。
 
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
-（`SELECT` 投影、`WHERE` 过滤、`GROUP BY` 分组与 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+（`SELECT` 投影、`SELECT DISTINCT` 行去重、`WHERE` 过滤、`GROUP BY` 分组与
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
 聚合、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
 另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
@@ -46,11 +47,20 @@ columnar-analytics-engine --help                        # 打印用法
 格式错误时向标准错误输出消息并以码 2 退出；路径等系统错误以码 1 退出。
 
 `query` 对单个文件执行一条
-`SELECT ... FROM input [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ...] [LIMIT n]` 语句，以单行
+`SELECT [DISTINCT] ... FROM input [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ...] [LIMIT n]` 语句，以单行
 UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`columns` 按结果顺序
 列出每列的 `name`、`type`、`nullable`，`rows` 是同序值数组的数组。空结果保留列
 描述且 `rows` 为空（无 GROUP BY 的聚合查询在零入选行时仍返回一行，COUNT 为 0、
-其余聚合为 null，该行再经 HAVING 过滤；有 GROUP BY 时返回零行）；同一文件与 SQL 重复执行输出字节一致。语法错误
+其余聚合为 null，该行再经 HAVING 过滤；有 GROUP BY 时返回零行）；同一文件与 SQL 重复执行输出字节一致。
+非聚合查询可在 SELECT 后加 `DISTINCT`：先对通过 WHERE 的行按投影项（星号、裸列或
+带 `AS` 别名的标量表达式）求值，再按完整结果行逐列判重（两 NULL 相等、NULL 与非
+NULL 不等，float64 的 `0.0` 与 `-0.0` 相等），随后执行 ORDER BY 与 LIMIT；省略
+ORDER BY 时按每种结果行第一次出现的顺序输出。投影表达式只对通过 WHERE 的行求值，
+入选行上的除零、int64 溢出或非有限 float64 结果仍抛 `QueryValidationError`。
+DISTINCT 查询的 ORDER BY 只能引用投影中的裸列或显式别名，未投影列与未知名称抛
+`QueryValidationError`；DISTINCT 不得与 GROUP BY、HAVING 或聚合投影同用（同样抛
+`QueryValidationError`），不支持 `COUNT(DISTINCT ...)`；DISTINCT 缺少投影、重复
+出现或位置错误抛 `QuerySyntaxError`，且在访问文件前判定。语法错误
 （`QuerySyntaxError`）、校验错误（`QueryValidationError`）与文件格式错误
 （`ColumnarFormatError`）向标准错误输出消息并以码 2 退出；系统错误以码 1 退出。
 
@@ -71,8 +81,9 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 
 - `sources` 按 `FROM`、`JOIN` 顺序列出，每项含 `name`、`row_count` 与按源 schema
   顺序的 `columns`（每列 `name`、`type`、`nullable`）。
-- `operators` 依次包含实际存在的阶段，顺序为 `Scan`、`Join`、`Filter`、`Aggregate`、
-  `Having`、`Sort`、`Limit`、`Project`；缺少的阶段省略：
+- `operators` 依次包含实际存在的阶段；非 DISTINCT 语句的顺序为 `Scan`、`Join`、`Filter`、`Aggregate`、
+  `Having`、`Sort`、`Limit`、`Project`，`SELECT DISTINCT` 语句则为 `Scan`、`Join`、`Filter`、
+  `Project`、`Distinct`、`Sort`、`Limit`（投影先于去重）；缺少的阶段省略：
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
     （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
   - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`）与 `left`、`right` 两侧限定键
@@ -89,6 +100,9 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
   - `Having`（仅含 HAVING 子句时）位于 `Aggregate` 之后、`Sort` 之前，`condition`
     沿用递归条件树；分组列叶子为带 `name` 的 `column`，聚合叶子额外给出
     `function`、`argument`（`COUNT(*)` 为 null）、`type` 与 `nullable`。
+  - `SELECT DISTINCT` 语句的 `Project` 位于 `Filter`（及 `Join`）之后、`Distinct`
+    之前；`Distinct` 的 `keys` 按结果列顺序给出投影输出名，顶层 `output` 与去重后
+    的查询结果 schema 一致。非 DISTINCT 语句不含 `Distinct` 算子，`Project` 仍在计划末尾。
   - `Sort` 的 `keys` 每项给出 `column`、`direction`（`ASC`/`DESC`）与
     `nulls`（`FIRST`/`LAST`）；`Limit` 给出 `count`；`Project` 的 `expressions`
     每项给出绑定表达式（列、聚合或递归标量表达式）与 `output` 输出名。
@@ -298,7 +312,7 @@ FROM input
 （命令行用同一结构的 JSON 对象），只有被语句引用的表对应的文件会被读取：
 
 ```sql
-SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.列
+SELECT [DISTINCT] ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.列
 [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 ```
 
@@ -314,6 +328,8 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
   输出全部匹配组合；`LEFT JOIN` 还输出未匹配左行并把右侧值置为 NULL，
   右侧结果列 nullable 为 true。结果按左文件原始行序、同一左行内按右文件原始行序
   展开，之后 `WHERE`、`GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理；
+`SELECT DISTINCT` 同样在连接展开与 WHERE 过滤后对限定名投影行去重，其 ORDER BY
+只能引用投影中的限定裸列或显式别名；
   没有显式排序时相同输入与 SQL 重复执行输出字节一致。
 - 多文件 Python 入口（`query_files`、`explain_files`）与命令行（`query-files`、
   `explain-files`、`export-files` 的 `--join-strategy`）可选指定连接算法：
@@ -342,11 +358,12 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
 ## 限制
 
 - 单文件 SQL 查询：`SELECT`（星号/列名/单层聚合/带 `AS` 别名的标量表达式，标量表达式含
-  数值算术与 searched `CASE`）+
+  数值算术与 searched `CASE`，非聚合投影前可选 `DISTINCT` 行去重）+
   固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`HAVING`（仅限分组列/聚合/字面量条件）、
   `ORDER BY`、`LIMIT`；不支持 simple CASE、
   裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
-  表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。两文件入口额外支持
+  表达式或未分组列、聚合查询 SELECT 中的标量表达式、`DISTINCT` 与 GROUP BY/HAVING/
+  聚合投影同用、`COUNT(DISTINCT ...)`、DISTINCT 查询的 ORDER BY 引用未投影列、连接等。两文件入口额外支持
   一次 `INNER JOIN` / `LEFT JOIN` 等值连接（无别名、无复合 ON、无第二次连接），连接查询中
   标量表达式的列引用同样必须限定表名。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
