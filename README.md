@@ -73,7 +73,9 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
   - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`）与 `left`、`right` 两侧限定键
     （`table`、`column`）。
   - `Filter` 的 `condition` 是递归表达式树：内部节点含 `kind`、`operator`、`operands`，
-    叶子是带 `type` 的 `literal`（`value` 为类型化字面量）或带 `name` 的绑定 `column`。
+    叶子是带 `type` 的 `literal`（`value` 为类型化字面量）或带 `name` 的绑定 `column`；
+    `CASE` 节点的 `kind` 为 `case`，`whens` 按书写顺序给出每项的 `when`/`then`
+    子树，`else` 为可空的 ELSE 子树。
   - `Aggregate` 给出 `group_keys`（绑定列名列表，无 GROUP BY 时为空）与 `aggregates`
     （每项 `function`、`argument`（`COUNT(*)` 为 null）、`output`）。
   - `Sort` 的 `keys` 每项给出 `column`、`direction`（`ASC`/`DESC`）与
@@ -191,6 +193,7 @@ FROM input
 标量表达式 := 数值列 | 数值字面量 | (标量表达式)
            | +标量表达式 | -标量表达式
            | 标量表达式 + - * / 标量表达式   （优先级：括号、一元、乘除、加减）
+           | CASE WHEN 条件 THEN 结果 [WHEN 条件 THEN 结果 ...] [ELSE 结果] END
 ```
 
 - 投影允许星号、逗号分隔的列名、聚合调用或带 `AS` 别名的数值标量表达式；别名沿用
@@ -208,6 +211,17 @@ FROM input
   `ORDER BY` 可引用 SELECT 的显式别名（别名与输入列同名时优先解析别名），并按表达式
   的结果类型、NULL 位置与稳定排序规则排序。聚合查询不扩展：GROUP BY 键与聚合参数仍只
   接受列引用或 `COUNT(*)`，聚合查询混入标量表达式时抛 `QueryValidationError`。
+- 搜索式 `CASE` 标量表达式：`CASE WHEN 条件 THEN 结果 [WHEN ...] [ELSE 结果] END`，
+  至少一个 `WHEN`，不支持简单 CASE；关键字大小写不敏感。CASE 可递归嵌套，可用于非聚合
+  查询的 SELECT 表达式（仍用 `AS` 命名并可由 `ORDER BY` 引用别名）、算术运算数与 WHERE
+  比较两侧。条件按书写顺序判断，沿用现有布尔类型检查与三值逻辑：仅 TRUE 命中，FALSE 与
+  UNKNOWN 继续判断后续分支；均未命中时取 ELSE，省略 ELSE 返回 NULL。只计算命中的结果
+  分支，未命中分支的除零、int64 溢出或非有限浮点不报错，实际命中时仍抛
+  `QueryValidationError`。所有 THEN 与显式 ELSE 的类型须一致，仅允许 int64 与 float64
+  混合并统一为 float64；bool、utf8 与数值或彼此混合均抛 `QueryValidationError`。任一
+  THEN/ELSE 结果可空或省略 ELSE 时结果列 nullable，否则非空。缺失关键字、空分支、孤立
+  关键字或嵌套未闭合抛 `QuerySyntaxError`（在访问文件之前）；聚合查询中的 CASE 与其他
+  标量表达式一样抛 `QueryValidationError`。
 - 聚合函数为 `COUNT(*)`、`COUNT(列)`、`SUM(列)`、`AVG(列)`、`MIN(列)`、`MAX(列)`，
   函数名大小写不敏感，结果列名为大写函数名加括号（列引用使用 schema 真实名）。
   `COUNT(*)` 计入选行，`COUNT(列)` 忽略 NULL，二者均为非空 int64；`SUM`/`AVG`
