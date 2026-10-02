@@ -4,7 +4,7 @@
 
 当前已实现可独立读写的**列式文件层**，以及面向单个文件的 SQL 查询入口
 （`SELECT` 投影、`WHERE` 过滤、`GROUP BY` 分组与 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
-聚合、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
+聚合、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
 另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
 只解析、绑定并生成逻辑计划，仅读文件元数据、不执行查询。
@@ -46,11 +46,11 @@ columnar-analytics-engine --help                        # 打印用法
 格式错误时向标准错误输出消息并以码 2 退出；路径等系统错误以码 1 退出。
 
 `query` 对单个文件执行一条
-`SELECT ... FROM input [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]` 语句，以单行
+`SELECT ... FROM input [WHERE ...] [GROUP BY ... [HAVING ...]] [ORDER BY ...] [LIMIT n]` 语句，以单行
 UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`columns` 按结果顺序
 列出每列的 `name`、`type`、`nullable`，`rows` 是同序值数组的数组。空结果保留列
 描述且 `rows` 为空（无 GROUP BY 的聚合查询在零入选行时仍返回一行，COUNT 为 0、
-其余聚合为 null；有 GROUP BY 时返回零行）；同一文件与 SQL 重复执行输出字节一致。语法错误
+其余聚合为 null，该行再经 HAVING 过滤；有 GROUP BY 时返回零行）；同一文件与 SQL 重复执行输出字节一致。语法错误
 （`QuerySyntaxError`）、校验错误（`QueryValidationError`）与文件格式错误
 （`ColumnarFormatError`）向标准错误输出消息并以码 2 退出；系统错误以码 1 退出。
 
@@ -67,9 +67,9 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 - `sources` 按 `FROM`、`JOIN` 顺序列出，每项含 `name`、`row_count` 与按源 schema
   顺序的 `columns`（每列 `name`、`type`、`nullable`）。
 - `operators` 依次包含实际存在的阶段，顺序为 `Scan`、`Join`、`Filter`、`Aggregate`、
-  `Sort`、`Limit`、`Project`；缺少的阶段省略：
+  `Having`、`Sort`、`Limit`、`Project`；缺少的阶段省略：
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
-    （投影、WHERE、GROUP BY、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
+    （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
   - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`）与 `left`、`right` 两侧限定键
     （`table`、`column`）。
   - `Filter` 的 `condition` 是递归表达式树：内部节点含 `kind`、`operator`、`operands`，
@@ -77,7 +77,11 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
     searched CASE 节点的 `kind` 为 `case`，`cases` 按书写顺序给出
     `{when, then}`（两者均为递归表达式），`else` 为递归表达式或 `null`（省略 ELSE）。
   - `Aggregate` 给出 `group_keys`（绑定列名列表，无 GROUP BY 时为空）与 `aggregates`
-    （每项 `function`、`argument`（`COUNT(*)` 为 null）、`output`）。
+    （每项 `function`、`argument`（`COUNT(*)` 为 null）、`output`）；`aggregates`
+    收录 SELECT、ORDER BY、HAVING 所需的去重聚合，按首次引用顺序排列。
+  - `Having`（仅含 HAVING 子句时）位于 `Aggregate` 之后、`Sort` 之前，`condition`
+    沿用递归条件树；分组列叶子为带 `name` 的 `column`，聚合叶子额外给出
+    `function`、`argument`（`COUNT(*)` 为 null）、`type` 与 `nullable`。
   - `Sort` 的 `keys` 每项给出 `column`、`direction`（`ASC`/`DESC`）与
     `nulls`（`FIRST`/`LAST`）；`Limit` 给出 `count`；`Project` 的 `expressions`
     每项给出绑定表达式（列、聚合或递归标量表达式）与 `output` 输出名。
@@ -182,6 +186,7 @@ SELECT * | 投影项 [, 投影项 ...]
 FROM input
 [WHERE 表达式]
 [GROUP BY 列名 [, 列名 ...]]
+[HAVING 分组条件]
 [ORDER BY 排序项 [, ...]]
 [LIMIT 无符号整数]
 
@@ -236,6 +241,17 @@ FROM input
   NULL）；有 `GROUP BY` 时可投影分组列与聚合，普通列必须已分组，星号不得与聚合或
   分组混用（抛 `QueryValidationError`）。分组按 GROUP BY 列顺序成键，NULL 键归为
   一组；没有 ORDER BY 时各分组按首条入选行顺序输出，筛选为空时返回零行。
+- `HAVING` 位于 GROUP BY 之后、ORDER BY 之前，对已形成的分组做三值逻辑过滤：条件
+  用现有 `NOT`、`AND`、`OR`、比较与 `IS [NOT] NULL` 语义组合**分组列、聚合调用与
+  类型兼容的字面量**，只有条件为 TRUE 的组保留，FALSE 与 UNKNOWN 均丢弃。HAVING
+  中的聚合不必出现在 SELECT（仍按聚合现有 NULL、空输入、数值异常与类型规则计算并
+  参与去重）；不解析 SELECT 别名，不接受未分组普通列、星号、CASE、标量算术或嵌套
+  聚合，最终条件非 bool、类型不兼容或聚合参数非法抛 `QueryValidationError`。完全
+  非聚合查询使用 HAVING 抛 `QueryValidationError`；HAVING 缺条件、重复、错位（如
+  位于 LIMIT 后）在访问文件前抛 `QuerySyntaxError`。无 GROUP BY 时 HAVING 过滤
+  那一行全局聚合（WHERE 零入选行时仍先生成该行再过滤）；有 GROUP BY 且无入选行时
+  返回零组。执行顺序固定为 `WHERE` → 分组聚合 → HAVING → 排序 → `LIMIT` → 投影，
+  因此被 HAVING 丢弃的组不参与排序与 LIMIT，结果与导出行数以过滤后为准。
 - `ORDER BY` 在非聚合查询中可引用任意 schema 列（无需出现在投影中）；在聚合查询中
   只能引用已选分组列或已选聚合表达式（按 schema 真实名匹配）。未知列、同一
   `ORDER BY` 中的重复项或引用未选结果抛 `QueryValidationError`。多列按书写顺序比较：
@@ -245,7 +261,7 @@ FROM input
 - `LIMIT` 只接受 `0` 至 `9223372036854775807` 的无符号十进制整数，可独立出现；
   `0` 返回保留列描述的空表，大于入选行数（或分组数）时返回全部。非聚合查询的执行
   顺序固定为 `WHERE` → 排序 → `LIMIT` → 投影；聚合查询为
-  `WHERE` → 分组/聚合 → 排序 → `LIMIT`。
+  `WHERE` → 分组/聚合 → HAVING → 排序 → `LIMIT` → 投影（无 HAVING 时跳过该阶段）。
 - `WHERE` 支持括号、`NOT`、`AND`、`OR`、`=`、`!=`、`<`、`<=`、`>`、`>=`、
   `IS NULL`、`IS NOT NULL`；优先级从高到低为 `NOT`、比较、`AND`、`OR`。
   比较两侧可使用列引用、字面量或数值标量表达式（含 `CASE`）：字面量为 `TRUE`/`FALSE`、int64 整数、
@@ -270,7 +286,7 @@ FROM input
 
 ```sql
 SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.列
-[WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]
+[WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 ```
 
 - 不支持别名、复合 `ON`、其他连接类型或第二次连接；词法错误、连接关键字缺失、
@@ -284,7 +300,7 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
 - 连接键类型须相同，或一为 int64 一为 float64；NULL 键永不匹配。`INNER JOIN`
   输出全部匹配组合；`LEFT JOIN` 还输出未匹配左行并把右侧值置为 NULL，
   右侧结果列 nullable 为 true。结果按左文件原始行序、同一左行内按右文件原始行序
-  展开，之后 `WHERE`、`GROUP BY`、聚合、`ORDER BY`、`LIMIT` 按单文件语义处理；
+  展开，之后 `WHERE`、`GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理；
   没有显式排序时相同输入与 SQL 重复执行输出字节一致。
 - `sources` 非映射或为空、键不是非空字符串、值不是路径对象时抛 `ValueError`，
   且不会访问任何文件；已引用文件损坏仍抛 `ColumnarFormatError`，系统错误保留
@@ -302,8 +318,10 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
 
 - 单文件 SQL 查询：`SELECT`（星号/列名/单层聚合/带 `AS` 别名的标量表达式，标量表达式含
   数值算术与 searched `CASE`）+
-  固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`ORDER BY`、`LIMIT`；不支持 simple CASE、
-  裸列或聚合的别名、聚合嵌套、WHERE 内聚合、聚合查询中的标量表达式、连接等。两文件入口额外支持
+  固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`HAVING`（仅限分组列/聚合/字面量条件）、
+  `ORDER BY`、`LIMIT`；不支持 simple CASE、
+  裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
+  表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。两文件入口额外支持
   一次 `INNER JOIN` / `LEFT JOIN` 等值连接（无别名、无复合 ON、无第二次连接），连接查询中
   标量表达式的列引用同样必须限定表名。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。
