@@ -32,6 +32,9 @@ The accepted grammar (keywords case-insensitive)::
     term        := factor (('*' | '/') factor)*
     factor      := ('+' | '-') factor | atom
     atom        := '(' expr ')' | operand
+                | CASE WHEN expr THEN scalar_expr
+                  (WHEN expr THEN scalar_expr)*
+                  (ELSE scalar_expr)? END
     operand     := ident | literal
     literal     := TRUE | FALSE | [+-]? int64 | [+-]? finite float64
                    | single-quoted utf8
@@ -67,6 +70,26 @@ placement and stability rules.  Aggregate queries do not accept scalar
 expressions: GROUP BY keys and aggregate arguments stay plain column
 references, and mixing a scalar expression into an aggregate query
 raises :class:`QueryValidationError`.
+
+Searched CASE expressions
+(``CASE WHEN cond THEN result [WHEN ...] [ELSE result] END``; the simple
+``CASE value WHEN ...`` form is not supported and at least one WHEN is
+required) are scalar operands and may be nested inside more arithmetic,
+comparisons and other CASE expressions.  For each row the WHEN conditions
+are tested in written order and only TRUE matches; FALSE and UNKNOWN fall
+through, an explicit ELSE supplies the fallback and a missing ELSE yields
+NULL.  Only the chosen result is evaluated, so division by zero, int64
+overflow or a non-finite float64 inside an unhit branch never raises; a
+chosen result that errors still raises :class:`QueryValidationError`.
+Every reachable THEN and an explicit ELSE must share one type family:
+int64 and float64 may mix and unify to float64, while bool and utf8 must
+match each other exactly (any other mix raises
+:class:`QueryValidationError`).  The result column is nullable if any
+reachable result is nullable or the ELSE is omitted.  WHEN conditions use
+the same boolean type check and three-valued logic as WHERE; CASE stays a
+scalar expression, so it is rejected in aggregate arguments, GROUP BY and
+the projection of an aggregate query just like the other scalar
+expressions.
 
 Operator precedence (highest first) is NOT, comparison, AND, OR; IS [NOT]
 NULL is a postfix of its scalar operand.  Comparison operands may be
@@ -154,6 +177,11 @@ _KEYWORDS = frozenset(
         "left",
         "join",
         "on",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
     )
 )
 
@@ -343,6 +371,8 @@ def _parse_number(text: str) -> int | float:
 #   ("arith", op, left_node, right_node, type_name)   -- after binding
 #   ("unary", operand, negate)                        -- as parsed
 #   ("unary", operand, negate, type_name)             -- after binding
+#   ("case", ((cond, result), ...), else_node|None)   -- as parsed
+#   ("case", ((cond, result), ...), else_node|None, type_name) -- after binding
 #   ("cmp", op, left_node, right_node)
 #   ("isnull", operand, negate)
 #   ("not", operand)
@@ -655,6 +685,10 @@ class _Parser:
         # table-qualified) identifier.  Returns (name, table, table_quoted);
         # name "" stands for '*'.
         tok = self._peek()
+        if tok.kind == "keyword" and tok.value == "case":
+            raise QueryValidationError(
+                f"{func.upper()} argument must be a column reference, not a CASE expression"
+            )
         if tok.kind == "star":
             if func != "count":
                 raise QuerySyntaxError(f"{func.upper()} does not accept '*'")
@@ -719,6 +753,10 @@ class _Parser:
     def _parse_group_name(self) -> tuple:
         # Returns a (table|None, table_quoted, name) triple.
         tok = self._peek()
+        if tok.kind == "keyword" and tok.value == "case":
+            raise QueryValidationError(
+                "GROUP BY only accepts column references, not CASE expressions"
+            )
         if tok.kind not in ("ident", "qident"):
             raise QuerySyntaxError(f"expected identifier, got {tok.text!r}")
         if self._allow_join and self._qualifier_ahead():
@@ -822,7 +860,7 @@ class _Parser:
                 return ("literal", value, "float64")
             if nxt.kind not in ("ident", "qident") and not (
                 nxt.kind == "op" and nxt.value == "("
-            ):
+            ) and not (nxt.kind == "keyword" and nxt.value == "case"):
                 raise QuerySyntaxError(
                     "sign must be followed by a numeric literal or expression"
                 )
@@ -844,6 +882,8 @@ class _Parser:
             node = self._parse_or()
             self._expect_op(")")
             return node
+        if self._accept_keyword("case"):
+            return self._parse_case()
         tok = self._peek()
         if tok.kind == "number":
             self._next()
@@ -874,6 +914,28 @@ class _Parser:
         if tok.kind == "keyword":
             raise QuerySyntaxError(f"unexpected keyword {tok.text.upper()!r} in expression")
         raise QuerySyntaxError(f"unexpected token {tok.text!r} in expression")
+
+    def _parse_case(self) -> tuple:
+        # A searched CASE: at least one "WHEN cond THEN result", an optional
+        # "ELSE result", terminated by END.  Conditions are boolean
+        # expressions; results are scalar (numeric, bool or utf8) and may
+        # themselves contain nested CASE expressions.  The simple form
+        # (CASE value WHEN ...) is not supported.
+        branches: list[tuple] = []
+        while True:
+            self._expect_keyword("when")
+            condition = self._parse_or()
+            self._expect_keyword("then")
+            result = self._parse_arith()
+            branches.append((condition, result))
+            tok = self._peek()
+            if not (tok.kind == "keyword" and tok.value == "when"):
+                break
+        else_node = None
+        if self._accept_keyword("else"):
+            else_node = self._parse_arith()
+        self._expect_keyword("end")
+        return ("case", tuple(branches), else_node)
 
     # Token helpers -----------------------------------------------------------
 
@@ -954,7 +1016,13 @@ def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dic
             )
 
     where = _bind_expr(select.where, schema) if select.where is not None else None
-    if where is not None and where[0] in ("literal", "column", "arith", "unary"):
+    if where is not None and where[0] in (
+        "literal",
+        "column",
+        "arith",
+        "unary",
+        "case",
+    ):
         type_name = _expr_type(where)
         if type_name != "bool":
             raise QueryValidationError(
@@ -1011,7 +1079,14 @@ def _bind_plain(select: _Select, schema: Schema, where) -> dict:
             else:  # "expr"
                 expr = _bind_expr(item.expr, schema)
                 out_type = _expr_type(expr)
-                if out_type not in ("int64", "float64"):
+                # Arithmetic scalar expressions stay numeric-only; a CASE
+                # expression may additionally yield bool or utf8 results
+                # (its own WHEN/ELSE type consistency is checked at binding).
+                if expr[0] == "case":
+                    allowed_types = ("int64", "float64", "bool", "utf8")
+                else:
+                    allowed_types = ("int64", "float64")
+                if out_type not in allowed_types:
                     raise QueryValidationError(
                         f"SELECT expression must be numeric, got {out_type}"
                     )
@@ -1290,7 +1365,7 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
         return (tag, left, right)
     if tag == "isnull":
         operand = _bind_expr(node[1], schema)
-        if operand[0] not in ("literal", "column", "arith", "unary"):
+        if operand[0] not in ("literal", "column", "arith", "unary", "case"):
             raise QuerySyntaxError(
                 "IS NULL operand must be a column reference or a literal"
             )
@@ -1319,13 +1394,28 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
             else "int64"
         )
         return ("arith", op, left, right, out_type)
+    if tag == "case":
+        bound_branches = []
+        result_types: list[str] = []
+        for cond_node, result_node in node[1]:
+            cond = _bind_expr(cond_node, schema)
+            _require_boolean(cond, "WHEN")
+            result = _bind_expr(result_node, schema)
+            bound_branches.append((cond, result))
+            result_types.append(_expr_type(result))
+        else_bound = None
+        if node[2] is not None:
+            else_bound = _bind_expr(node[2], schema)
+            result_types.append(_expr_type(else_bound))
+        out_type = _unify_case_types(result_types)
+        return ("case", tuple(bound_branches), else_bound, out_type)
     if tag == "cmp":
         op = node[1]
         left = _bind_expr(node[2], schema)
         right = _bind_expr(node[3], schema)
-        if left[0] not in ("literal", "column", "arith", "unary") or right[0] not in (
-            "literal", "column", "arith", "unary"
-        ):
+        if left[0] not in (
+            "literal", "column", "arith", "unary", "case"
+        ) or right[0] not in ("literal", "column", "arith", "unary", "case"):
             raise QuerySyntaxError("comparison operands must be column references or literals")
         left_t = _expr_type(left)
         right_t = _expr_type(right)
@@ -1349,6 +1439,23 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
+def _unify_case_types(types: list[str]) -> str:
+    """Unify the static types of every reachable CASE result.
+
+    int64 and float64 may mix and unify to float64; bool and utf8 must
+    match every other result exactly.  Anything else is incompatible.
+    """
+    unique = set(types)
+    if unique <= {"int64", "float64"}:
+        return "float64" if "float64" in unique else "int64"
+    if len(unique) == 1:
+        return next(iter(unique))
+    raise QueryValidationError(
+        "CASE results must have consistent types: "
+        + ", ".join(sorted(unique))
+    )
+
+
 def _expr_type(node: tuple) -> str:
     """The static type of a bound value node."""
     tag = node[0]
@@ -1360,6 +1467,8 @@ def _expr_type(node: tuple) -> str:
         return node[3]
     if tag == "arith":
         return node[4]
+    if tag == "case":
+        return node[3]
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
@@ -1374,6 +1483,16 @@ def _expr_nullable(node: tuple) -> bool:
         return _expr_nullable(node[1])
     if tag == "arith":
         return _expr_nullable(node[2]) or _expr_nullable(node[3])
+    if tag == "case":
+        # The value is NULL only when a reachable result yields NULL, or
+        # every WHEN fails/UNKNOWN and no ELSE was given (implicit NULL).
+        # A NULL condition merely routes the row elsewhere and never makes
+        # a non-NULL result nullable.
+        if node[2] is None:
+            return True
+        return any(_expr_nullable(result) for _cond, result in node[1]) or _expr_nullable(
+            node[2]
+        )
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
@@ -1409,6 +1528,23 @@ def _eval(node: tuple, row: tuple) -> bool | None:
         if left is None or right is None:
             return None
         return _arith_value(node[1], left, right)
+    if tag == "case":
+        # Conditions are tried in written order; only TRUE matches.  FALSE
+        # and UNKNOWN fall through, so unhit results are never evaluated:
+        # their division-by-zero, int64 overflow or non-finite float64
+        # cannot raise.  The chosen result alone is evaluated.
+        for condition, result in node[1]:
+            if _eval(condition, row) is True:
+                value = _eval(result, row)
+                break
+        else:
+            value = None if node[2] is None else _eval(node[2], row)
+        if value is None:
+            return None
+        # int64/float64 results unify to float64; ints become floats.
+        if node[3] == "float64" and isinstance(value, int) and not isinstance(value, bool):
+            return float(value)
+        return value
     if tag == "isnull":
         value = _eval(node[1], row)
         result = value is None
@@ -1779,6 +1915,15 @@ def _rewrite_expr(node: tuple, resolve) -> tuple:
         return ("unary", _rewrite_expr(node[1], resolve), node[2])
     if tag == "arith":
         return ("arith", node[1], _rewrite_expr(node[2], resolve), _rewrite_expr(node[3], resolve))
+    if tag == "case":
+        return (
+            "case",
+            tuple(
+                (_rewrite_expr(cond, resolve), _rewrite_expr(result, resolve))
+                for cond, result in node[1]
+            ),
+            _rewrite_expr(node[2], resolve) if node[2] is not None else None,
+        )
     if tag == "not":
         return ("not", _rewrite_expr(node[1], resolve))
     if tag in ("and", "or"):
@@ -2202,6 +2347,13 @@ def _collect_expr_columns(node: tuple, indices: set) -> None:
         _collect_expr_columns(node[2], indices)
         _collect_expr_columns(node[3], indices)
         return
+    if tag == "case":
+        for condition, result in node[1]:
+            _collect_expr_columns(condition, indices)
+            _collect_expr_columns(result, indices)
+        if node[2] is not None:
+            _collect_expr_columns(node[2], indices)
+        return
     if tag == "cmp":
         _collect_expr_columns(node[2], indices)
         _collect_expr_columns(node[3], indices)
@@ -2255,6 +2407,17 @@ def _expr_json(node: tuple) -> dict:
             "kind": "arithmetic",
             "operator": node[1],
             "operands": [_expr_json(node[2]), _expr_json(node[3])],
+        }
+    if tag == "case":
+        # Written order is preserved; an omitted ELSE is rendered as null,
+        # which also marks the implicit result nullable in the output schema.
+        return {
+            "kind": "case",
+            "cases": [
+                {"when": _expr_json(cond), "then": _expr_json(result)}
+                for cond, result in node[1]
+            ],
+            "else": None if node[2] is None else _expr_json(node[2]),
         }
     if tag == "cmp":
         return {
