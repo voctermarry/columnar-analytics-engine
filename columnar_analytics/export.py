@@ -10,7 +10,9 @@ Public API:
 The exports reuse the existing single-/two-file query layer unchanged: the
 accepted SQL subset, binding rules, join order, NULL and type semantics and
 deterministic ordering are all :mod:`columnar_analytics.query` behaviour.
-No query syntax is added here.
+``export_query_files`` additionally forwards an optional ``join_strategy``
+(``"hash"`` / ``"sort_merge"``) to the two-file query layer; both
+strategies produce byte-identical exports.  No query syntax is added here.
 
 Both formats are UTF-8 without a BOM and use LF line endings.  CSV always
 writes a header line with the result column names in schema order and quotes
@@ -38,7 +40,12 @@ import tempfile
 from typing import Any
 
 from .format import Table
-from .query import _referenced_source_paths, query_file, query_files
+from .query import (
+    _referenced_source_paths,
+    _validate_join_strategy,
+    query_file,
+    query_files,
+)
 
 __all__ = [
     "export_query_file",
@@ -67,7 +74,11 @@ def export_query_file(
 
 
 def export_query_files(
-    sources: Any, sql: str, destination: Any, format: str = "csv"
+    sources: Any,
+    sql: str,
+    destination: Any,
+    format: str = "csv",
+    join_strategy: Any = None,
 ) -> int:
     """Run ``sql`` against the mapped tables and export the result.
 
@@ -76,14 +87,19 @@ def export_query_files(
     check; ``sources`` validation otherwise follows
     :func:`columnar_analytics.query.query_files`.
 
-    :class:`ValueError` is raised for invalid ``sources``, an unknown
-    ``format`` or a ``destination`` resolving to the same path as any
-    referenced source.
+    ``join_strategy`` forwards the optional ``"hash"`` / ``"sort_merge"``
+    join algorithm to :func:`columnar_analytics.query.query_files`; both
+    strategies export byte-identical files.  Invalid ``sources`` or
+    ``join_strategy``, an unknown ``format`` or a ``destination``
+    resolving to the same path as any referenced source raises
+    :class:`ValueError`; strategy and source validation happen before any
+    source file is opened.
     """
     format = _validate_format(format)
-    referenced = _referenced_source_paths(sources, sql)
+    strategy = _validate_join_strategy(join_strategy)
+    referenced = _referenced_source_paths(sources, sql, strategy)
     _ensure_distinct_path(destination, referenced)
-    table = query_files(sources, sql)
+    table = query_files(sources, sql, strategy)
     return _write_export(table, destination, format)
 
 
