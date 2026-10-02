@@ -8,6 +8,8 @@
 另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
 只解析、绑定并生成逻辑计划，仅读文件元数据、不执行查询。
+`export_query_file` / `export_query_files`（命令行 `export` / `export-files`）
+复用同一 SQL 子集与结果语义，把查询结果确定性、原子地导出为 CSV 或 JSONL 文件。
 
 ## 环境与安装
 
@@ -34,6 +36,8 @@ columnar-analytics-engine query <path> "<sql>"          # 对单个文件执行 
 columnar-analytics-engine query-files <sources-json> "<sql>"   # 对映射的多表执行 SQL（可含一次连接）
 columnar-analytics-engine explain <path> "<sql>"        # 只解析/绑定并输出单文件语句的计划 JSON
 columnar-analytics-engine explain-files <sources-json> "<sql>"  # 只解析/绑定并输出多表语句的计划 JSON
+columnar-analytics-engine export <path> "<sql>" <target> [--format csv|jsonl]   # 导出单文件查询结果
+columnar-analytics-engine export-files <sources-json> "<sql>" <target> [--format csv|jsonl]  # 导出多表查询结果
 columnar-analytics-engine --help                        # 打印用法
 ```
 
@@ -84,6 +88,30 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 未读取而不校验）。命令行对 `ValueError`、查询错误与格式错误以码 2 退出，对
 `OSError` 以码 1 退出，失败时标准输出为空。
 
+## 查询结果导出
+
+`export_query_file(path, sql, target, format="csv")` 与
+`export_query_files(sources, sql, target, format="csv")`（命令行 `export` /
+`export-files`，对应 `--format` 选项）把查询结果写入目标文件；它们复用现有 SQL
+子集、绑定规则、连接顺序、NULL 与类型语义及稳定排序，不增加查询语法。`format`
+只接受 `csv`（默认）或 `jsonl`；成功时 Python 入口返回写出的结果行数，命令行以
+状态码 0 结束且标准输出、标准错误均为空。
+
+- **CSV**：UTF-8 无 BOM、LF 换行；第一行始终按结果 schema 顺序写列名。含逗号、
+  双引号、CR 或 LF 的字段整体加双引号，内部双引号重复；NULL 写为空的未加引号
+  字段，空字符串固定写成 `""`，bool 写为 `true`/`false`，数值采用与紧凑 JSON
+  结果相同的文本形式。零行结果只含表头行。
+- **JSONL**：每个结果行写成一个紧凑 JSON 对象，键按结果列顺序排列，值保持现有
+  JSON 类型和 null，非 ASCII 字符不转义，每行以一个 LF 结束；零行结果为零字节文件。
+
+相同输入、SQL、格式与版本重复导出字节一致；未写 `ORDER BY` 时沿用现有查询的确定
+顺序。导出只在查询完整成功且全部内容可编码后原子替换目标文件，任何失败都不会新建
+目标或改变已有目标。目标与任一实际引用的源文件解析为同一路径时抛 `ValueError`，
+未知格式也抛 `ValueError`；SQL、绑定与列式格式问题继续分别抛 `QuerySyntaxError`、
+`QueryValidationError`、`ColumnarFormatError`，sources 校验仍抛 `ValueError`，目录、
+权限及其他文件系统问题保留 `OSError`。命令行把 `ValueError` 与三类查询错误映射为
+状态码 2，把 `OSError` 映射为状态码 1，失败时标准输出为空、标准错误只写异常消息。
+
 ## Python 公开接口
 
 包 `columnar_analytics` 导出：
@@ -97,6 +125,9 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 - `explain_file(path, sql)`：只读元数据，返回单文件语句的有序计划字典（键为
   `sources`、`operators`、`output`），不执行查询、不读数据段
 - `explain_files(sources, sql)`：同上，面向多表语句；未被引用的 sources 不会被打开
+- `export_query_file(path, sql, target, format="csv")`：执行单文件查询并把结果导出为
+  CSV/JSONL 文件，返回写出行数
+- `export_query_files(sources, sql, target, format="csv")`：同上，面向多表语句
 - `ColumnarFormatError`：所有文件格式错误的统一异常；系统错误保留 `OSError` 语义
 - `QuerySyntaxError`：SQL 词法/语法错误；`QueryValidationError`：未知列、错误表名、类型不兼容
 - `FORMAT_VERSION`、`__version__`

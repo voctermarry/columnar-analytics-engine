@@ -2,6 +2,7 @@
 
 __version__ = "0.1.0"
 
+from .export import export_query_file, export_query_files
 from .format import (
     ColumnSchema,
     ColumnarFormatError,
@@ -37,4 +38,6 @@ __all__ = [
     "explain_files",
     "query_file",
     "query_files",
+    "export_query_file",
+    "export_query_files",
 ]

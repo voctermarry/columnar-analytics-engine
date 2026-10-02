@@ -7,6 +7,7 @@ import json
 import sys
 
 from . import __version__
+from .export import export_query_file, export_query_files
 from .format import ColumnarFormatError, inspect_file
 from .query import (
     QuerySyntaxError,
@@ -63,6 +64,16 @@ def main(argv: list[str] | None = None) -> int:
     explain_files_parser = sub.add_parser("explain-files", help="explain a SQL statement against mapped tables and print the plan JSON")
     explain_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
     explain_files_parser.add_argument("sql", help="SELECT statement to plan against the mapped tables")
+    export_parser = sub.add_parser("export", help="query a columnar file and write the result to a CSV or JSONL file")
+    export_parser.add_argument("path", help="path to the columnar file")
+    export_parser.add_argument("sql", help="SELECT statement to run against the file")
+    export_parser.add_argument("target", help="path of the export file to write")
+    export_parser.add_argument("--format", default="csv", help="export format: csv (default) or jsonl")
+    export_files_parser = sub.add_parser("export-files", help="query mapped tables and write the result to a CSV or JSONL file")
+    export_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
+    export_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
+    export_files_parser.add_argument("target", help="path of the export file to write")
+    export_files_parser.add_argument("--format", default="csv", help="export format: csv (default) or jsonl")
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -146,6 +157,33 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         return _write_json(plan)
+
+    if args.command == "export":
+        try:
+            export_query_file(args.path, args.sql, args.target, format=args.format)
+        except _QUERY_ERRORS + (ValueError,) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    if args.command == "export-files":
+        try:
+            sources = json.loads(args.sources)
+        except json.JSONDecodeError as exc:
+            print(f"invalid sources JSON: {exc}", file=sys.stderr)
+            return 2
+        try:
+            export_query_files(sources, args.sql, args.target, format=args.format)
+        except _QUERY_ERRORS + (ValueError,) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
 
     parser.print_help()
     return 0
