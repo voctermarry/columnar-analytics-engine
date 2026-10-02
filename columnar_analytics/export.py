@@ -38,7 +38,12 @@ import tempfile
 from typing import Any
 
 from .format import Table
-from .query import _referenced_source_paths, query_file, query_files
+from .query import (
+    _referenced_source_paths,
+    _validate_join_strategy,
+    query_file,
+    query_files,
+)
 
 __all__ = [
     "export_query_file",
@@ -67,7 +72,11 @@ def export_query_file(
 
 
 def export_query_files(
-    sources: Any, sql: str, destination: Any, format: str = "csv"
+    sources: Any,
+    sql: str,
+    destination: Any,
+    format: str = "csv",
+    join_strategy: Any = None,
 ) -> int:
     """Run ``sql`` against the mapped tables and export the result.
 
@@ -76,14 +85,19 @@ def export_query_files(
     check; ``sources`` validation otherwise follows
     :func:`columnar_analytics.query.query_files`.
 
+    ``join_strategy`` forwards the optional ``"hash"`` / ``"sort_merge"``
+    join algorithm selection to the query layer; an invalid value raises
+    :class:`ValueError` before any source file is opened.
+
     :class:`ValueError` is raised for invalid ``sources``, an unknown
     ``format`` or a ``destination`` resolving to the same path as any
     referenced source.
     """
     format = _validate_format(format)
+    strategy = _validate_join_strategy(join_strategy)
     referenced = _referenced_source_paths(sources, sql)
     _ensure_distinct_path(destination, referenced)
-    table = query_files(sources, sql)
+    table = query_files(sources, sql, join_strategy=strategy)
     return _write_export(table, destination, format)
 
 

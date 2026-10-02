@@ -221,6 +221,87 @@ def test_jsonl_join_qualified_keys(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# join_strategy
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def join_sources(tmp_path):
+    left = tmp_path / "l.caef"
+    right = tmp_path / "r.caef"
+    write_file(
+        left,
+        Table(
+            Schema(
+                [
+                    ColumnSchema("id", "int64"),
+                    ColumnSchema("k", "int64", nullable=True),
+                ]
+            ),
+            {"id": [1, 2, 3, 4], "k": [1, 2, 1, None]},
+        ),
+    )
+    write_file(
+        right,
+        Table(
+            Schema(
+                [
+                    ColumnSchema("rid", "int64"),
+                    ColumnSchema("k", "int64", nullable=True),
+                    ColumnSchema("tag", "utf8", nullable=True),
+                ]
+            ),
+            {"rid": [10, 11, 20], "k": [1, 1, 2], "tag": ["x", "y", "z"]},
+        ),
+    )
+    return {"l": left, "r": right}
+
+
+@pytest.mark.parametrize("strategy", ["hash", "sort_merge"])
+@pytest.mark.parametrize("format", ["csv", "jsonl"])
+def test_export_files_join_strategy_byte_identical(join_sources, tmp_path, strategy, format):
+    sql = "SELECT * FROM l LEFT JOIN r ON l.k = r.k"
+    default_dst = tmp_path / "default.out"
+    chosen_dst = tmp_path / f"{strategy}.out"
+    export_query_files(join_sources, sql, default_dst, format=format)
+    export_query_files(
+        join_sources, sql, chosen_dst, format=format, join_strategy=strategy
+    )
+    assert read_bytes(chosen_dst) == read_bytes(default_dst)
+
+
+def test_export_files_invalid_join_strategy_value_error(join_sources, tmp_path):
+    dst = tmp_path / "never.csv"
+    with pytest.raises(ValueError):
+        export_query_files(
+            join_sources,
+            "SELECT * FROM l INNER JOIN r ON l.k = r.k",
+            dst,
+            join_strategy="sortmerge",
+        )
+    assert not dst.exists()
+
+
+def test_cli_export_files_bad_join_strategy_exit_2(join_sources, tmp_path, capsys):
+    dst = tmp_path / "out.csv"
+    code = main(
+        [
+            "export-files",
+            json.dumps({k: str(v) for k, v in join_sources.items()}),
+            "SELECT * FROM l INNER JOIN r ON l.k = r.k",
+            str(dst),
+            "--join-strategy",
+            "hash_join",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "join_strategy" in captured.err
+    assert not dst.exists()
+
+
+# ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
 

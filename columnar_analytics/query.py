@@ -139,6 +139,17 @@ emits unmatched left rows with the right-side values set to NULL (the
 right result columns are nullable).  Rows expand in left-file order, and
 within one left row in right-file order, before WHERE / GROUP BY / HAVING
 / ORDER BY / LIMIT apply with their usual semantics.
+
+The multi-file entry points accept an optional ``join_strategy`` of
+``"hash"`` (a right-key index) or ``"sort_merge"`` (stable key sorts plus
+a group merge); omitting it keeps the historical path.  Both algorithms
+accept the same INNER/LEFT equi-joins and return identical columns,
+values, NULL placement and row order, so the choice never affects query
+results or exports.  A JOIN-free statement accepts either strategy
+without gaining an operator.  An explicit strategy additionally labels
+the EXPLAIN Join node with ``"strategy"`` set to ``HASH`` or
+``SORT_MERGE``; an invalid value raises :class:`ValueError` before any
+source file is opened.
 """
 
 from __future__ import annotations
@@ -202,6 +213,29 @@ _KEYWORDS = frozenset(
 _AGG_NAMES = frozenset(("count", "sum", "avg", "min", "max"))
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+# Optional join algorithms selectable through ``join_strategy``.  ``None``
+# keeps the historical (hash) path and its plan shape; the explicit values
+# are additionally labelled in the EXPLAIN Join node (HASH / SORT_MERGE).
+_JOIN_STRATEGIES = frozenset(("hash", "sort_merge"))
+_JOIN_STRATEGY_LABELS = {"hash": "HASH", "sort_merge": "SORT_MERGE"}
+
+
+def _validate_join_strategy(join_strategy: Any) -> str | None:
+    """Normalise the optional join algorithm selection.
+
+    ``None`` means the default (unspecified) path; otherwise the value must
+    be exactly ``"hash"`` or ``"sort_merge"``.  Checked before any source
+    file is opened.
+    """
+    if join_strategy is None:
+        return None
+    if not isinstance(join_strategy, str) or join_strategy not in _JOIN_STRATEGIES:
+        raise ValueError(
+            "join_strategy must be 'hash' or 'sort_merge', got "
+            f"{join_strategy!r}"
+        )
+    return join_strategy
 
 
 class QuerySyntaxError(Exception):
@@ -2039,13 +2073,23 @@ def query_table(table: Table, sql: str) -> Table:
     return _run_query(table, select)
 
 
-def query_files(sources: Any, sql: str) -> Table:
+def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     """Run ``sql`` against the tables named by ``sources``.
 
     ``sources`` maps table names to columnar file paths; only the tables
     referenced by the statement are read.  The statement may join two of
     them once (``INNER JOIN`` / ``LEFT JOIN ... ON t1.col = t2.col``); see
     the module docstring for the exact grammar and semantics.
+
+    ``join_strategy`` optionally selects the join algorithm: ``"hash"``
+    (build an index on the right key) or ``"sort_merge"`` (sort both sides
+    on the key and merge the groups).  When omitted the historical join
+    path is used.  Both algorithms accept exactly the same statements and
+    produce identical columns, values, NULL placement and row order (left
+    file order, right file order within one left row); a statement without
+    a JOIN accepts either value unchanged.  A non-string value or a string
+    other than ``"hash"`` / ``"sort_merge"`` raises :class:`ValueError`
+    before any file is touched.
 
     A non-mapping or empty ``sources``, non-string keys or non-path values
     raise :class:`ValueError` before any file is touched.  Lexical and
@@ -2057,6 +2101,7 @@ def query_files(sources: Any, sql: str) -> Table:
     malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
     """
+    strategy = _validate_join_strategy(join_strategy)
     paths = _validate_sources(sources)
     tokens = _tokenize(sql)
     select = _Parser(tokens, allow_join=True).parse()
@@ -2081,7 +2126,14 @@ def query_files(sources: Any, sql: str) -> Table:
     rewritten = _rewrite_select(select, _join_resolver(left_key, right_key))
     left_table = read_file(paths[left_key])
     right_table = read_file(paths[right_key])
-    combined = _build_joined_table(left_key, left_table, right_key, right_table, join)
+    if strategy == "sort_merge":
+        combined = _build_joined_table_sort_merge(
+            left_key, left_table, right_key, right_table, join
+        )
+    else:
+        combined = _build_joined_table(
+            left_key, left_table, right_key, right_table, join
+        )
     return _run_query(combined, rewritten, expected_table=None)
 
 
@@ -2385,6 +2437,97 @@ def _join_columns(
     return out
 
 
+def _build_joined_table_sort_merge(
+    left_key: str, left: Table, right_key: str, right: Table, join: _Join
+) -> Table:
+    """Validate the ON keys like the default path, then sort-merge join."""
+    schema = _build_joined_schema(
+        left_key, left.schema, right_key, right.schema, join
+    )
+    left_idx = left.schema.index(join.left_key[2])
+    right_idx = right.schema.index(join.right_key[2])
+    columns = _join_columns_sort_merge(
+        left, right, left_idx, right_idx, join.kind
+    )
+    return Table._from_storage(schema, columns)
+
+
+def _join_columns_sort_merge(
+    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
+) -> list:
+    """Sort-merge equi-join returning the same rows as the hash path.
+
+    Both sides are stably sorted by key (NULLs excluded from matching), then
+    equal-key groups are merged.  Output is finally reordered back to left
+    file order and right file order within one left row, so the result is
+    byte-identical to :func:`_join_columns` for every legal key type
+    (including int64/float64 mixing and signed zero).
+    """
+    left_cols = left._columns
+    right_cols = right._columns
+    left_width = len(left_cols)
+    right_width = len(right_cols)
+
+    # Stable key sorts keep the original row order inside each equal-key
+    # group; Python's ordering matches SQL equality here (1 == 1.0,
+    # -0.0 == 0.0) because the binder already restricted the keys to
+    # compatible types.
+    left_order = sorted(
+        (i for i in range(left.row_count) if left_cols[left_idx][i] is not None),
+        key=lambda i: left_cols[left_idx][i],
+    )
+    right_order = sorted(
+        (j for j in range(right.row_count) if right_cols[right_idx][j] is not None),
+        key=lambda j: right_cols[right_idx][j],
+    )
+
+    # (left_index, right_index) pairs in merge-emission order: left groups
+    # in sorted-key order, right matches in right-file order within a left
+    # row.  NULL-key left rows and unmatched left rows are appended later.
+    pairs: list[tuple[int, int]] = []
+    matched_left: set[int] = set()
+    p = 0
+    n_right = len(right_order)
+    for i in left_order:
+        key = left_cols[left_idx][i]
+        while p < n_right and right_cols[right_idx][right_order[p]] < key:
+            p += 1
+        q = p
+        while q < n_right and right_cols[right_idx][right_order[q]] == key:
+            q += 1
+        if q > p:
+            matched_left.add(i)
+            group = right_order[p:q]
+            # The right side was only sorted, so restore its file order
+            # inside the matched key group.
+            if len(group) > 1:
+                group = sorted(group)
+            for j in group:
+                pairs.append((i, j))
+
+    # Restore left file order across the matched pairs.
+    pairs.sort(key=lambda pair: pair[0])
+
+    out = [[] for _ in range(left_width + right_width)]
+    pair_pos = 0
+    for i in range(left.row_count):
+        while pair_pos < len(pairs) and pairs[pair_pos][0] == i:
+            _j = pairs[pair_pos][1]
+            for c in range(left_width):
+                out[c].append(left_cols[c][i])
+            for c in range(right_width):
+                out[left_width + c].append(right_cols[c][_j])
+            pair_pos += 1
+        if i not in matched_left and kind == "left":
+            # NULL-key rows never match either; an INNER join drops them
+            # silently while a LEFT join pads the right side with NULLs.
+            for c in range(left_width):
+                out[c].append(left_cols[c][i])
+            for c in range(right_width):
+                out[left_width + c].append(None)
+    return out
+
+
 def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
     bound = _bind_select(select, table.schema, expected_table)
     source_columns = table._columns
@@ -2669,7 +2812,7 @@ def explain_file(path: Any, sql: str) -> dict:
     return _build_explain(sources, schema, select, bound, join=None)
 
 
-def explain_files(sources: Any, sql: str) -> dict:
+def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     """Produce the query plan for ``sql`` against the mapped tables.
 
     Like :func:`query_files` for parsing, source resolution and binding,
@@ -2677,6 +2820,13 @@ def explain_files(sources: Any, sql: str) -> dict:
     sources are never opened and no data section is ever touched.  The
     returned value is a JSON-serialisable ordered dict with the fixed
     top-level keys ``sources``, ``operators`` and ``output``.
+
+    ``join_strategy`` accepts the same ``"hash"`` / ``"sort_merge"``
+    values as :func:`query_files` and must agree with the strategy the
+    matching query uses: an explicit strategy adds a ``strategy`` field
+    (``HASH`` / ``SORT_MERGE``) to the Join operator; without a JOIN the
+    strategy is accepted but adds no operator.  An invalid value raises
+    :class:`ValueError` before any file is touched.
 
     A non-mapping or empty ``sources``, non-string keys or non-path
     values raise :class:`ValueError` before any file is touched;
@@ -2686,6 +2836,7 @@ def explain_files(sources: Any, sql: str) -> dict:
     mismatch raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
     """
+    strategy = _validate_join_strategy(join_strategy)
     paths = _validate_sources(sources)
     tokens = _tokenize(sql)
     select = _Parser(tokens, allow_join=True).parse()
@@ -2729,6 +2880,7 @@ def explain_files(sources: Any, sql: str) -> dict:
         rewritten,
         bound,
         join=(left_key, right_key, join),
+        strategy=strategy,
     )
 
 
@@ -2964,6 +3116,7 @@ def _build_explain(
     select: _Select,
     bound: Mapping,
     join: tuple | None,
+    strategy: str | None = None,
 ) -> dict:
     referenced = _collect_required_indices(bound)
     if join is not None:
@@ -2992,14 +3145,17 @@ def _build_explain(
         )
 
     if join is not None:
-        operators.append(
-            {
-                "operator": "Join",
-                "type": join_node.kind.upper(),
-                "left": {"table": left_key, "column": join_node.left_key[2]},
-                "right": {"table": right_key, "column": join_node.right_key[2]},
-            }
-        )
+        join_node_dict = {
+            "operator": "Join",
+            "type": join_node.kind.upper(),
+            "left": {"table": left_key, "column": join_node.left_key[2]},
+            "right": {"table": right_key, "column": join_node.right_key[2]},
+        }
+        if strategy is not None:
+            # An explicitly selected algorithm is labelled right after the
+            # join type; the unspecified path keeps the historical shape.
+            join_node_dict["strategy"] = _JOIN_STRATEGY_LABELS[strategy]
+        operators.append(join_node_dict)
 
     if bound["where"] is not None:
         operators.append({"operator": "Filter", "condition": _expr_json(bound["where"])})

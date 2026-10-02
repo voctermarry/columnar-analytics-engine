@@ -401,3 +401,152 @@ def test_cli_query_still_works(paths, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert json.loads(out)["rows"] == [[1]]
+
+
+# ---------------------------------------------------------------------------
+# join_strategy: hash / sort_merge
+# ---------------------------------------------------------------------------
+
+
+JOIN_SQLS = [
+    "SELECT * FROM l INNER JOIN r ON l.k = r.k",
+    "SELECT * FROM l LEFT JOIN r ON l.k = r.k",
+    "SELECT l.id, r.rid FROM l INNER JOIN r ON l.k = r.k "
+    "WHERE r.tag != 'x' ORDER BY l.id DESC LIMIT 3",
+    "SELECT l.name, COUNT(*), SUM(r.rid) FROM l LEFT JOIN r ON l.k = r.k "
+    "GROUP BY l.name ORDER BY l.name",
+    "SELECT l.id, r.tag FROM l INNER JOIN r ON l.k = r.k ORDER BY r.tag, l.id",
+]
+
+
+@pytest.mark.parametrize("sql", JOIN_SQLS)
+@pytest.mark.parametrize("strategy", ["hash", "sort_merge"])
+def test_join_strategy_matches_default(paths, sql, strategy):
+    default_result = query_files(paths, sql)
+    chosen = query_files(paths, sql, join_strategy=strategy)
+    assert [c.name for c in chosen.schema.columns] == [
+        c.name for c in default_result.schema.columns
+    ]
+    assert [c.nullable for c in chosen.schema.columns] == [
+        c.nullable for c in default_result.schema.columns
+    ]
+    assert joined_rows(chosen) == joined_rows(default_result)
+
+
+@pytest.mark.parametrize("strategy", ["hash", "sort_merge"])
+def test_join_strategy_left_order_and_right_order(paths, strategy):
+    # Left file order; within one left row the right file order.
+    result = query_files(
+        paths, "SELECT * FROM l LEFT JOIN r ON l.k = r.k", join_strategy=strategy
+    )
+    assert joined_rows(result) == [
+        [1, 10, "a", 100, 10, "x"],
+        [1, 10, "a", 200, 10, "y"],
+        [2, 20, "b", None, None, None],
+        [3, 10, "c", 100, 10, "x"],
+        [3, 10, "c", 200, 10, "y"],
+        [4, None, "d", None, None, None],
+    ]
+
+
+def test_join_strategy_int64_float64_and_signed_zero(tmp_path):
+    left = tmp_path / "li.caef"
+    right = tmp_path / "rf.caef"
+    write_file(
+        left,
+        Table(
+            Schema([ColumnSchema("k", "int64", nullable=True)]),
+            {"k": [0, 2, None, 2]},
+        ),
+    )
+    write_file(
+        right,
+        Table(
+            Schema([ColumnSchema("k", "float64", nullable=True)]),
+            {"k": [-0.0, 2.0, 0.0, None, 2.0]},
+        ),
+    )
+    sources = {"a": left, "b": right}
+    sql = "SELECT * FROM a LEFT JOIN b ON a.k = b.k"
+    default_rows = joined_rows(query_files(sources, sql))
+    for strategy in ("hash", "sort_merge"):
+        result = query_files(sources, sql, join_strategy=strategy)
+        assert joined_rows(result) == default_rows
+    # +0/-0.0 compare equal and every combination is emitted.
+    assert default_rows == [
+        [0, -0.0],
+        [0, 0.0],
+        [2, 2.0],
+        [2, 2.0],
+        [None, None],
+        [2, 2.0],
+        [2, 2.0],
+    ]
+
+
+def test_join_strategy_duplicate_keys_emit_every_combination(tmp_path):
+    left = tmp_path / "l.caef"
+    right = tmp_path / "r.caef"
+    write_file(left, Table(Schema([ColumnSchema("k", "utf8")]), {"k": ["x", "x", "y"]}))
+    write_file(right, Table(Schema([ColumnSchema("k", "utf8")]), {"k": ["x", "x", "x", "y"]}))
+    sources = {"l": left, "r": right}
+    sql = "SELECT * FROM l INNER JOIN r ON l.k = r.k"
+    expected = joined_rows(query_files(sources, sql))
+    assert len(expected) == 2 * 3 + 1
+    for strategy in ("hash", "sort_merge"):
+        assert joined_rows(query_files(sources, sql, join_strategy=strategy)) == expected
+
+
+def test_join_strategy_repeated_runs_byte_stable(paths):
+    sql = "SELECT * FROM l LEFT JOIN r ON l.k = r.k"
+    first = joined_rows(query_files(paths, sql, join_strategy="sort_merge"))
+    second = joined_rows(query_files(paths, sql, join_strategy="sort_merge"))
+    assert first == second
+
+
+@pytest.mark.parametrize("strategy", ["hash", "sort_merge"])
+def test_join_strategy_accepted_without_join(paths, strategy):
+    result = query_files(
+        paths, "SELECT id, name FROM l WHERE id >= 2 ORDER BY id", join_strategy=strategy
+    )
+    assert result.column_names == ("id", "name")
+    assert result.column("id") == [2, 3, 4]
+
+
+@pytest.mark.parametrize("bad", ["HASH", "Sort_Merge", "nested_loop", "", 3, True])
+def test_invalid_join_strategy_value_error(paths, bad):
+    with pytest.raises(ValueError):
+        query_files(paths, "SELECT * FROM l INNER JOIN r ON l.k = r.k", join_strategy=bad)
+
+
+def test_invalid_join_strategy_before_any_file_access():
+    # A ValueError here must precede source validation/file access: an
+    # OSError for the nonexistent paths would prove a file was touched.
+    missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
+    sql = "SELECT * FROM l INNER JOIN r ON l.k = r.k"
+    with pytest.raises(ValueError):
+        query_files(missing, sql, join_strategy="merge")
+    # Validated even for a JOIN-free statement.
+    with pytest.raises(ValueError):
+        query_files({"l": "/nonexistent/l.caef"}, "SELECT id FROM l", join_strategy=4)
+
+
+def test_cli_query_files_join_strategy_parity(paths, capsys):
+    sources_json = json.dumps({"l": str(paths["l"]), "r": str(paths["r"])})
+    sql = "SELECT * FROM l LEFT JOIN r ON l.k = r.k"
+    assert main(["query-files", sources_json, sql]) == 0
+    default_out = capsys.readouterr().out
+    for strategy in ("hash", "sort_merge"):
+        assert main(["query-files", sources_json, sql, "--join-strategy", strategy]) == 0
+        assert capsys.readouterr().out == default_out
+
+
+def test_cli_query_files_bad_join_strategy_exit_2(paths, capsys):
+    sources_json = json.dumps({"l": str(paths["l"]), "r": str(paths["r"])})
+    sql = "SELECT * FROM l INNER JOIN r ON l.k = r.k"
+    code = main(["query-files", sources_json, sql, "--join-strategy", "nested"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err.strip()
+    assert "join_strategy" in captured.err

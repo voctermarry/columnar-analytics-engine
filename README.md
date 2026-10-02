@@ -33,11 +33,11 @@ python -m pytest
 columnar-analytics-engine version                       # 打印版本号
 columnar-analytics-engine inspect <path>                # 输出文件元数据 JSON
 columnar-analytics-engine query <path> "<sql>"          # 对单个文件执行 SQL，输出结果 JSON
-columnar-analytics-engine query-files <sources-json> "<sql>"   # 对映射的多表执行 SQL（可含一次连接）
+columnar-analytics-engine query-files <sources-json> "<sql>" [--join-strategy hash|sort_merge]   # 对映射的多表执行 SQL（可含一次连接）
 columnar-analytics-engine explain <path> "<sql>"        # 只解析/绑定并输出单文件语句的计划 JSON
-columnar-analytics-engine explain-files <sources-json> "<sql>"  # 只解析/绑定并输出多表语句的计划 JSON
+columnar-analytics-engine explain-files <sources-json> "<sql>" [--join-strategy hash|sort_merge]  # 只解析/绑定并输出多表语句的计划 JSON
 columnar-analytics-engine export <path> "<sql>" <dest> [--format csv|jsonl]   # 执行单文件查询并导出结果文件
-columnar-analytics-engine export-files <sources-json> "<sql>" <dest> [--format csv|jsonl]  # 执行多表查询并导出
+columnar-analytics-engine export-files <sources-json> "<sql>" <dest> [--format csv|jsonl] [--join-strategy hash|sort_merge]  # 执行多表查询并导出
 columnar-analytics-engine --help                        # 打印用法
 ```
 
@@ -57,7 +57,8 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 `query-files` 的 `<sources-json>` 是一个 JSON 对象，把表名映射到列式文件路径，例如
 `'{"l": "left.caef", "r": "right.caef"}'`；SQL 中的 `FROM`/`JOIN` 表名即取这些键。
 输出格式与退出码约定同 `query`；sources-json 本身非法（不是 JSON 对象、键不是非空
-字符串、值不是路径）也以码 2 退出。
+字符串、值不是路径）也以码 2 退出。可选 `--join-strategy hash|sort_merge`
+显式选择连接算法（见「两文件连接查询」）；取值非法时以码 2 退出，标准输出为空。
 
 `explain` / `explain-files` 与对应的查询入口接受完全相同的输入与 SQL 子集，但只做
 解析、绑定与计划生成：不执行查询，只读取文件元数据头（不读取、不解压、不解码数据
@@ -71,7 +72,8 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
     （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
   - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`）与 `left`、`right` 两侧限定键
-    （`table`、`column`）。
+    （`table`、`column`）；显式传入 `--join-strategy` / `join_strategy` 时额外给出
+    `strategy`（`HASH`/`SORT_MERGE`），未传时不含该字段。
   - `Filter` 的 `condition` 是递归表达式树：内部节点含 `kind`、`operator`、`operands`，
     叶子是带 `type` 的 `literal`（`value` 为类型化字面量）或带 `name` 的绑定 `column`。
     searched CASE 节点的 `kind` 为 `case`，`cases` 按书写顺序给出
@@ -98,9 +100,10 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 
 `export` / `export-files` 与对应查询入口接受完全相同的源与 SQL（不增加查询语法），
 把结果直接写成可复核文件，位置参数最后为目标路径，另加 `--format`（仅接受
-`csv` 或 `jsonl`，默认 `csv`）。成功时状态码为 0 且标准输出、标准错误均为空；
+`csv` 或 `jsonl`，默认 `csv`）；`export-files` 另加可选
+`--join-strategy hash|sort_merge`，语义与 `query-files` 相同。成功时状态码为 0 且标准输出、标准错误均为空；
 Python 入口 `export_query_file(path, sql, destination, format="csv")` 与
-`export_query_files(sources, sql, destination, format="csv")` 成功时返回写出的
+`export_query_files(sources, sql, destination, format="csv", join_strategy=None)` 成功时返回写出的
 结果行数。
 
 - **CSV**：UTF-8 无 BOM、统一 LF 换行；第一行始终按结果 schema 顺序写列名
@@ -131,14 +134,14 @@ Python 入口 `export_query_file(path, sql, destination, format="csv")` 与
 - `read_file(path, *, columns=None)`：读回表；`columns` 按调用方顺序投影部分列
 - `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
-- `query_files(sources, sql)`：对表名→路径映射执行 SQL（可含一次两表连接），成功返回 `Table`
+- `query_files(sources, sql, join_strategy=None)`：对表名→路径映射执行 SQL（可含一次两表连接），成功返回 `Table`；`join_strategy` 可选 `"hash"` / `"sort_merge"`
 - `explain_file(path, sql)`：只读元数据，返回单文件语句的有序计划字典（键为
   `sources`、`operators`、`output`），不执行查询、不读数据段
-- `explain_files(sources, sql)`：同上，面向多表语句；未被引用的 sources 不会被打开
+- `explain_files(sources, sql, join_strategy=None)`：同上，面向多表语句；未被引用的 sources 不会被打开；显式 `join_strategy` 会在 Join 算子中标注 `strategy`
 - `export_query_file(path, sql, destination, format="csv")`：执行单文件查询并把结果
   原子导出到 `destination`（`csv` 或 `jsonl`，默认 `csv`），成功返回写出行数
-- `export_query_files(sources, sql, destination, format="csv")`：对表名→路径映射执行
-  查询并导出；目标与任一实际引用源同路径或格式未知时抛 `ValueError`，其他异常沿用
+- `export_query_files(sources, sql, destination, format="csv", join_strategy=None)`：对表名→路径映射执行
+  查询并导出；目标与任一实际引用源同路径、格式未知或 `join_strategy` 取值非法时抛 `ValueError`，其他异常沿用
   查询入口的分类
 - `ColumnarFormatError`：所有文件格式错误的统一异常；系统错误保留 `OSError` 语义
 - `QuerySyntaxError`：SQL 词法/语法错误；`QueryValidationError`：未知列、错误表名、类型不兼容
@@ -302,6 +305,18 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN] 右表 ON 左表.列 = 右表.�
   右侧结果列 nullable 为 true。结果按左文件原始行序、同一左行内按右文件原始行序
   展开，之后 `WHERE`、`GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理；
   没有显式排序时相同输入与 SQL 重复执行输出字节一致。
+- `query_files` / `explain_files` / `export_query_files` 均接受可选
+  `join_strategy`（命令行 `--join-strategy`），取值 `"hash"`（右表按键建索引）或
+  `"sort_merge"`（两侧按键稳定排序后归并同键分组）；未传时沿用既有连接路径。
+  两种算法接受完全相同的 INNER/LEFT 等值连接、键类型兼容规则（含 int64/float64
+  互配、正负零、重复键、可空键），对相同 sources 与 SQL 返回完全一致的列描述、值、
+  NULL 位置与行序，WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/标量表达式/导出语义不变，
+  重复执行的查询 JSON 与导出文件字节一致。不含 JOIN 的语句也可传入任一合法策略，
+  但不产生额外算子、不影响结果。显式传入时 `explain-files` 的 `Join` 算子增加
+  `strategy` 字段（`HASH`/`SORT_MERGE`），与实际查询/导出所用策略一致；解释仍只读
+  被引用源元数据。`join_strategy` 不是字符串或不是两个允许值之一时，Python 入口在
+  打开任何源文件前抛 `ValueError`；三个命令行入口以状态码 2 失败、标准输出为空、
+  标准错误只写异常消息。
 - `sources` 非映射或为空、键不是非空字符串、值不是路径对象时抛 `ValueError`，
   且不会访问任何文件；已引用文件损坏仍抛 `ColumnarFormatError`，系统错误保留
   `OSError`。

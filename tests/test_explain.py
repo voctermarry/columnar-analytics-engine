@@ -337,6 +337,65 @@ def test_join_plan_shape(sources):
     }
 
 
+@pytest.mark.parametrize(
+    "strategy,label", [("hash", "HASH"), ("sort_merge", "SORT_MERGE")]
+)
+def test_join_plan_strategy_field(sources, strategy, label):
+    sql = "SELECT l.id FROM l INNER JOIN r ON l.id = r.k"
+    plan = explain_files(sources, sql, join_strategy=strategy)
+    join = find_operator(plan, "Join")
+    assert join == {
+        "operator": "Join",
+        "type": "INNER",
+        "strategy": label,
+        "left": {"table": "l", "column": "id"},
+        "right": {"table": "r", "column": "k"},
+    }
+    # Everything but the Join node is unchanged by the strategy.
+    default = explain_files(sources, sql)
+    assert plan["sources"] == default["sources"]
+    assert plan["output"] == default["output"]
+    assert [op for op in plan["operators"] if op["operator"] != "Join"] == [
+        op for op in default["operators"] if op["operator"] != "Join"
+    ]
+
+
+def test_join_plan_strategy_left_join(sources):
+    plan = explain_files(
+        sources, "SELECT COUNT(*) FROM l LEFT JOIN r ON l.n = r.k",
+        join_strategy="sort_merge",
+    )
+    assert find_operator(plan, "Join")["strategy"] == "SORT_MERGE"
+
+
+def test_join_plan_without_strategy_keeps_shape(sources):
+    plan = explain_files(sources, "SELECT l.id FROM l INNER JOIN r ON l.id = r.k")
+    assert "strategy" not in find_operator(plan, "Join")
+
+
+@pytest.mark.parametrize("strategy", ["hash", "sort_merge"])
+def test_strategy_adds_no_operator_without_join(sources, strategy):
+    plan = explain_files(sources, "SELECT id FROM l WHERE flag = TRUE", join_strategy=strategy)
+    assert operator_kinds(plan) == ["Scan", "Filter", "Project"]
+    assert plan == explain_files(sources, "SELECT id FROM l WHERE flag = TRUE")
+
+
+@pytest.mark.parametrize("bad", ["HASH", "sort-merge", "nested", 7, True])
+def test_explain_invalid_join_strategy_value_error(sources, bad):
+    with pytest.raises(ValueError):
+        explain_files(sources, "SELECT l.id FROM l INNER JOIN r ON l.id = r.k", join_strategy=bad)
+
+
+def test_explain_invalid_join_strategy_before_file_access(tmp_path):
+    missing = {"l": tmp_path / "l.caef", "r": tmp_path / "r.caef"}
+    with pytest.raises(ValueError):
+        explain_files(
+            missing,
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.k",
+            join_strategy="sortmerge",
+        )
+
+
 def test_left_join_output_nullability_and_on_keys_scanned(sources):
     # Nothing projected except COUNT(*): the ON keys must still be scanned.
     plan = explain_files(
@@ -517,6 +576,27 @@ def test_cli_explain_files(sources, capsys):
     payload = json.loads(out)
     assert list(payload.keys()) == ["sources", "operators", "output"]
     assert [s["name"] for s in payload["sources"]] == ["l", "r"]
+
+
+def test_cli_explain_files_join_strategy(sources, capsys):
+    sources_json = json.dumps({k: str(v) for k, v in sources.items()})
+    sql = "SELECT l.id FROM l INNER JOIN r ON l.id = r.k"
+    code = main(
+        ["explain-files", sources_json, sql, "--join-strategy", "sort_merge"]
+    )
+    assert code == 0
+    join = [op for op in json.loads(capsys.readouterr().out)["operators"] if op["operator"] == "Join"][0]
+    assert join["strategy"] == "SORT_MERGE"
+
+
+def test_cli_explain_files_bad_join_strategy_exit_2(sources, capsys):
+    sources_json = json.dumps({k: str(v) for k, v in sources.items()})
+    sql = "SELECT l.id FROM l INNER JOIN r ON l.id = r.k"
+    code = main(["explain-files", sources_json, sql, "--join-strategy", "merge"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "join_strategy" in captured.err
 
 
 def test_cli_byte_identical_on_repeat_and_whitespace(path, capsys):

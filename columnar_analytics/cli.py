@@ -58,12 +58,24 @@ def main(argv: list[str] | None = None) -> int:
     query_files_parser = sub.add_parser("query-files", help="query two columnar files with a join and print JSON")
     query_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
     query_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
+    query_files_parser.add_argument(
+        "--join-strategy",
+        dest="join_strategy",
+        default=None,
+        help="optional join algorithm: hash or sort_merge",
+    )
     explain_parser = sub.add_parser("explain", help="explain a SQL statement against a columnar file and print the plan JSON")
     explain_parser.add_argument("path", help="path to the columnar file")
     explain_parser.add_argument("sql", help="SELECT statement to plan against the file")
     explain_files_parser = sub.add_parser("explain-files", help="explain a SQL statement against mapped tables and print the plan JSON")
     explain_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
     explain_files_parser.add_argument("sql", help="SELECT statement to plan against the mapped tables")
+    explain_files_parser.add_argument(
+        "--join-strategy",
+        dest="join_strategy",
+        default=None,
+        help="optional join algorithm: hash or sort_merge",
+    )
     export_parser = sub.add_parser("export", help="query a columnar file with SQL and export the result as CSV or JSONL")
     export_parser.add_argument("path", help="path to the columnar file")
     export_parser.add_argument("sql", help="SELECT statement to run against the file")
@@ -74,6 +86,12 @@ def main(argv: list[str] | None = None) -> int:
     export_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
     export_files_parser.add_argument("destination", help="path of the file to write")
     export_files_parser.add_argument("--format", default="csv", help="export format: csv (default) or jsonl")
+    export_files_parser.add_argument(
+        "--join-strategy",
+        dest="join_strategy",
+        default=None,
+        help="optional join algorithm: hash or sort_merge",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "version":
@@ -116,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"invalid sources JSON: {exc}", file=sys.stderr)
             return 2
         try:
-            table = query_files(sources, args.sql)
+            table = query_files(sources, args.sql, join_strategy=args.join_strategy)
         except _QUERY_ERRORS as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -146,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"invalid sources JSON: {exc}", file=sys.stderr)
             return 2
         try:
-            plan = explain_files(sources, args.sql)
+            plan = explain_files(sources, args.sql, join_strategy=args.join_strategy)
         except _QUERY_ERRORS as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -179,7 +197,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"invalid sources JSON: {exc}", file=sys.stderr)
             return 2
         try:
-            export_query_files(sources, args.sql, args.destination, args.format)
+            export_query_files(
+                sources,
+                args.sql,
+                args.destination,
+                args.format,
+                join_strategy=args.join_strategy,
+            )
         except _QUERY_ERRORS as exc:
             print(str(exc), file=sys.stderr)
             return 2
