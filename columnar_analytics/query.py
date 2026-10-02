@@ -1643,6 +1643,31 @@ def _validate_sources(sources: Any) -> dict:
     return paths
 
 
+def _referenced_source_paths(sources: Any, sql: str) -> tuple:
+    """Resolve the file paths of the tables the statement actually reads.
+
+    Parsing-only counterpart of :func:`query_files`: no file is ever opened.
+    Returns the paths in ``FROM`` / ``JOIN`` order (one entry for a
+    single-table statement, two for a join).  Source validation raises
+    :class:`ValueError`; lexical / grammatical errors raise
+    :class:`QuerySyntaxError`; unknown or ambiguous table names raise
+    :class:`QueryValidationError`.
+    """
+    paths = _validate_sources(sources)
+    tokens = _tokenize(sql)
+    select = _Parser(tokens, allow_join=True).parse()
+    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
+    referenced = [paths[left_key]]
+    if select.join is not None:
+        right_key = _resolve_table_ref(
+            select.join.table, select.join.table_quoted, tuple(paths)
+        )
+        if right_key == left_key:
+            raise QueryValidationError(f"duplicate table {right_key!r} in join")
+        referenced.append(paths[right_key])
+    return tuple(referenced)
+
+
 def _resolve_table_ref(name: str, quoted: bool, candidates: tuple) -> str:
     """Resolve a table reference against the available canonical names.
 
