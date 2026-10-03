@@ -2123,94 +2123,8 @@ def _require_boolean(node: tuple, context: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Three-valued-logic evaluation
+# Per-row scalar arithmetic helpers (shared by the batch evaluator)
 # ---------------------------------------------------------------------------
-
-
-def _eval(node: tuple, row: tuple) -> bool | None:
-    tag = node[0]
-    if tag == "literal":
-        return node[1]
-    if tag == "column":
-        return row[node[2]]
-    if tag == "unary":
-        value = _eval(node[1], row)
-        if value is None:
-            return None
-        if not node[2]:  # unary plus keeps the value
-            return value
-        return _negate_value(value)
-    if tag == "arith":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
-        if left is None or right is None:
-            return None
-        return _arith_value(node[1], left, right)
-    if tag == "case":
-        # Conditions are tried in written order; only TRUE matches.  FALSE
-        # and UNKNOWN fall through, so unhit results are never evaluated:
-        # their division-by-zero, int64 overflow or non-finite float64
-        # cannot raise.  The chosen result alone is evaluated.
-        for condition, result in node[1]:
-            if _eval(condition, row) is True:
-                value = _eval(result, row)
-                break
-        else:
-            value = None if node[2] is None else _eval(node[2], row)
-        if value is None:
-            return None
-        # int64/float64 results unify to float64; ints become floats.
-        if node[3] == "float64" and isinstance(value, int) and not isinstance(value, bool):
-            return float(value)
-        return value
-    if tag == "isnull":
-        value = _eval(node[1], row)
-        result = value is None
-        return (not result) if node[2] else result
-    if tag == "not":
-        value = _eval(node[1], row)
-        return None if value is None else (not value)
-    if tag in ("and", "or"):
-        # Short-circuit SQL semantics; UNKNOWN propagates only when needed.
-        if tag == "and":
-            left = _eval(node[1], row)
-            if left is False:
-                return False
-            right = _eval(node[2], row)
-            if right is False:
-                return False
-            if left is None or right is None:
-                return None
-            return True
-        left = _eval(node[1], row)
-        if left is True:
-            return True
-        right = _eval(node[2], row)
-        if right is True:
-            return True
-        if left is None or right is None:
-            return None
-        return False
-    if tag == "cmp":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
-        if left is None or right is None:
-            return None
-        op = node[1]
-        if op == "=":
-            result = left == right
-        elif op == "!=":
-            result = left != right
-        elif op == "<":
-            result = left < right
-        elif op == "<=":
-            result = left <= right
-        elif op == ">":
-            result = left > right
-        else:  # ">="
-            result = left >= right
-        return bool(result)
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
 
 
 def _negate_value(value):
@@ -2254,6 +2168,283 @@ def _arith_value(op: str, left, right):
     if not (_INT64_MIN <= result <= _INT64_MAX):
         raise QueryValidationError("int64 arithmetic overflowed the int64 range")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Batch column-vector evaluation
+#
+# The expression stage of the execution chain works a whole batch at a time:
+# every evaluator consumes the table's columns together with a batch of
+# *active* row indices and returns a column-shaped list of values (plus, for
+# predicates, a tristate array).  The batch is the whole WHERE-selected row
+# set, so WHERE, ORDER BY keys, SELECT expressions and the pre-DISTINCT
+# projection share one evaluator and one set of evaluation rules.
+#
+# The vector rules are the scalar SQL semantics applied independently to
+# every active row:
+#
+# * a predicate column holds ``True`` / ``False`` / ``None`` (UNKNOWN), and
+#   NULL operands propagate exactly as three-valued logic says;
+# * AND / OR short-circuit per row, so an operand is vector-evaluated only
+#   for the rows on which it can still influence the result;
+# * CASE routes each row to its first TRUE branch and only the chosen result
+#   (or ELSE) is evaluated for that row, so errors in unhit branches never
+#   surface;
+# * a value column uses ``None`` for NULL.  Arithmetic evaluates both
+#   operand vectors, but the operator itself runs only on rows where both
+#   sides are non-NULL; the per-row int64 / float64 promotion, overflow,
+#   division-by-zero and non-finite checks go through the shared scalar
+#   helpers, so the first offending row raises the same
+#   :class:`QueryValidationError` at the same stage.
+#
+# An empty batch is a degenerate vector with no active rows, so empty tables
+# and fully pruned row-group sets behave exactly as a non-empty one.
+# ---------------------------------------------------------------------------
+
+
+def _gather_column(source_columns, index: int, rows) -> list:
+    """Project one stored column onto a batch of row indices."""
+    column = source_columns[index]
+    return [column[i] for i in rows]
+
+
+def _vector_literal(node: tuple, rows) -> list:
+    value = node[1]
+    return [value] * len(rows)
+
+
+def _vector_value(node: tuple, source_columns, rows) -> list:
+    """Evaluate a bound *value* expression over one batch of active rows.
+
+    Returns a list aligned with ``rows``; ``None`` entries are NULLs.
+    """
+    tag = node[0]
+    if tag == "literal":
+        return _vector_literal(node, rows)
+    if tag == "column":
+        return _gather_column(source_columns, node[2], rows)
+    if tag == "unary":
+        operand = _vector_value(node[1], source_columns, rows)
+        negate = node[2]
+        out: list = [None] * len(rows)
+        for p, value in enumerate(operand):
+            if value is None:
+                continue
+            if not negate:
+                out[p] = value  # unary plus keeps the value
+            else:
+                out[p] = _negate_value(value)
+        return out
+    if tag == "arith":
+        left = _vector_value(node[2], source_columns, rows)
+        right = _vector_value(node[3], source_columns, rows)
+        op = node[1]
+        out = [None] * len(rows)
+        for p in range(len(rows)):
+            lv = left[p]
+            rv = right[p]
+            # Any NULL operand makes the result NULL; both operand vectors
+            # were still evaluated above, so NULL suppresses only the
+            # operator itself (matching the scalar semantics).
+            if lv is None or rv is None:
+                continue
+            out[p] = _arith_value(op, lv, rv)
+        return out
+    if tag == "case":
+        return _vector_case(node, source_columns, rows)
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _vector_case(node: tuple, source_columns, rows) -> list:
+    """Vectorise a searched CASE with per-row branch routing.
+
+    Each row keeps its own *active* state; a WHEN condition is evaluated only
+    for rows still awaiting a result, and a THEN result only for rows routed
+    to it by this branch.  Fall-through rows (FALSE / UNKNOWN) reach the next
+    WHEN, rows left over after every branch take the ELSE (or implicit NULL),
+    and an int64 result of a float64-unified CASE is promoted per row.
+    """
+    out = [None] * len(rows)
+    pending: list[int] = []  # batch positions still awaiting a branch
+    for p in range(len(rows)):
+        pending.append(p)
+    for condition, result in node[1]:
+        if not pending:
+            break
+        cond_rows = [rows[p] for p in pending]
+        flags = _vector_predicate(condition, source_columns, cond_rows)
+        hit: list[int] = []
+        still_pending: list[int] = []
+        for k, flag in enumerate(flags):
+            position = pending[k]
+            if flag is True:
+                hit.append(position)
+            else:
+                # FALSE and UNKNOWN both fall through.
+                still_pending.append(position)
+        if hit:
+            hit_rows = [rows[p] for p in hit]
+            values = _vector_value(result, source_columns, hit_rows)
+            for k, position in enumerate(hit):
+                out[position] = values[k]
+        pending = still_pending
+    if pending:
+        if node[2] is None:
+            # Missing ELSE: the unmatched rows stay NULL (already None).
+            pass
+        else:
+            else_rows = [rows[p] for p in pending]
+            values = _vector_value(node[2], source_columns, else_rows)
+            for k, position in enumerate(pending):
+                out[position] = values[k]
+    if node[3] == "float64":
+        # int64/float64 results unify to float64; bool results never reach a
+        # numeric CASE (type unification rejects mixing them).
+        for p, value in enumerate(out):
+            if value is not None and isinstance(value, int) and not isinstance(
+                value, bool
+            ):
+                out[p] = float(value)
+    return out
+
+
+def _vector_predicate(node: tuple, source_columns, rows) -> list:
+    """Evaluate a bound boolean expression over one batch.
+
+    Returns a list of ``True`` / ``False`` / ``None`` aligned with ``rows``.
+    """
+    tag = node[0]
+    if tag == "literal":
+        return _vector_literal(node, rows)
+    if tag == "column":
+        # A directly-used bool column (possibly nullable) is its own flag.
+        return _gather_column(source_columns, node[2], rows)
+    if tag == "not":
+        operand = _vector_predicate(node[1], source_columns, rows)
+        return [None if value is None else (not value) for value in operand]
+    if tag in ("and", "or"):
+        return _vector_and_or(tag, node, source_columns, rows)
+    if tag == "isnull":
+        operand = _vector_value(node[1], source_columns, rows)
+        if node[2]:  # IS NOT NULL
+            return [value is not None for value in operand]
+        return [value is None for value in operand]
+    if tag == "case":
+        # A CASE whose static type is bool may itself be a predicate.
+        return _vector_value(node, source_columns, rows)
+    if tag == "cmp":
+        return _vector_compare(node, source_columns, rows)
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _vector_and_or(tag: str, node: tuple, source_columns, rows) -> list:
+    """Vectorised AND / OR with per-row SQL short-circuiting.
+
+    The left side is evaluated for every row; the right side only for rows
+    whose left result has not already fixed the answer (FALSE fixes AND,
+    TRUE fixes OR).  UNKNOWN propagates through the remaining rows exactly
+    as SQL three-valued logic specifies (TRUE only when both sides are TRUE,
+    FALSE when either is FALSE, UNKNOWN otherwise).
+    """
+    n = len(rows)
+    left = _vector_predicate(node[1], source_columns, rows)
+    if tag == "and":
+        short_value = False
+    else:
+        short_value = True
+    need_right: list[int] = []
+    out: list = [None] * n
+    for p, value in enumerate(left):
+        if value is short_value:
+            out[p] = short_value
+        else:
+            need_right.append(p)
+    if need_right:
+        right = _vector_predicate(
+            node[2], source_columns, [rows[p] for p in need_right]
+        )
+        for k, position in enumerate(need_right):
+            lv = left[position]
+            rv = right[k]
+            if tag == "and":
+                if rv is False:
+                    out[position] = False
+                elif lv is None or rv is None:
+                    out[position] = None
+                else:
+                    out[position] = True
+            else:
+                if rv is True:
+                    out[position] = True
+                elif lv is None or rv is None:
+                    out[position] = None
+                else:
+                    out[position] = False
+    return out
+
+
+def _vector_compare(node: tuple, source_columns, rows) -> list:
+    left = _vector_value(node[2], source_columns, rows)
+    right = _vector_value(node[3], source_columns, rows)
+    op = node[1]
+    out: list = [None] * len(rows)
+    for p in range(len(rows)):
+        lv = left[p]
+        rv = right[p]
+        if lv is None or rv is None:
+            continue
+        if op == "=":
+            result = lv == rv
+        elif op == "!=":
+            result = lv != rv
+        elif op == "<":
+            result = lv < rv
+        elif op == "<=":
+            result = lv <= rv
+        elif op == ">":
+            result = lv > rv
+        else:  # ">="
+            result = lv >= rv
+        out[p] = bool(result)
+    return out
+
+
+def _select_rows_batch(where: tuple, source_columns, row_count: int) -> list[int]:
+    """Indices of the rows for which the WHERE predicate is TRUE.
+
+    FALSE and UNKNOWN rows are both dropped.  The predicate is evaluated as a
+    single batch over the whole scan/join result; an empty or fully filtered
+    input simply yields an empty selection.
+    """
+    flags = _vector_predicate(where, source_columns, list(range(row_count)))
+    return [i for i, flag in enumerate(flags) if flag is True]
+
+
+def _project_value_column(item, source_columns, rows) -> tuple:
+    """One SELECT / ORDER-BY-expression column over a batch (tuple storage)."""
+    return tuple(_vector_value(item.expr, source_columns, rows))
+
+
+def _project_items_batch(items, source_columns, rows) -> list:
+    """Evaluate the projection items over ``rows`` as output columns."""
+    out_columns = []
+    for item in items:
+        if item.kind == "column":
+            out_columns.append(_gather_column(source_columns, item.col_index, rows))
+        else:  # "expr"
+            out_columns.append(_project_value_column(item, source_columns, rows))
+    return out_columns
+
+
+def _project_rows_batch(items, source_columns, rows) -> list[tuple]:
+    """Evaluate the projection over ``rows`` as materialised result rows.
+
+    The items are evaluated column by column (one shared batch per
+    expression), then re-presented row-wise for whole-row deduplication.
+    """
+    columns = _project_items_batch(items, source_columns, rows)
+    width = len(items)
+    return [tuple(columns[c][p] for c in range(width)) for p in range(len(rows))]
 
 
 # ---------------------------------------------------------------------------
@@ -2344,8 +2535,8 @@ def _distinct_values(col, arg_type: str, rows) -> list:
 # its statistics prove the pushed condition can never be TRUE for any of its
 # rows; anything else (OR, NOT, CASE, arithmetic, column-to-column or
 # cross-source comparisons, or simply undecidable ranges) keeps the group,
-# and the surviving rows are still filtered row by row with the full WHERE
-# condition.
+# and the surviving rows are still filtered with the full WHERE condition
+# evaluated as one batch.
 #
 # In a multi-table statement only a chain made entirely of INNER JOINs is
 # eligible: every source row that can reach the WHERE result must reach it
@@ -3276,14 +3467,13 @@ def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
     row_count = table.row_count
     where = bound["where"]
 
+    # WHERE is one batch predicate over the whole scan/join result: only the
+    # TRUE rows survive; FALSE and UNKNOWN are both dropped.  Join padding
+    # NULLs and all-NULL columns flow through the same vector path.
     if where is None:
         selected = list(range(row_count))
     else:
-        selected = [
-            i
-            for i in range(row_count)
-            if _eval(where, tuple(col[i] for col in source_columns)) is True
-        ]
+        selected = _select_rows_batch(where, source_columns, row_count)
 
     if bound["mode"] == "plain":
         return _run_plain(table, select, bound, selected)
@@ -3306,7 +3496,8 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
     if not bound.get("distinct"):
         # Execution order: WHERE (done by the caller) -> sort keys -> stable
         # sort -> LIMIT -> result expressions, so rows filtered out or cut by
-        # LIMIT never evaluate the SELECT expressions.
+        # LIMIT never evaluate the SELECT expressions.  The sort keys are one
+        # batch expression each, evaluated over the whole filtered batch.
         if order_by is not None:
             comparator = _make_row_comparator(source_columns, order_by, selected)
             selected = sorted(selected, key=cmp_to_key(comparator))
@@ -3314,14 +3505,15 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
         if select.limit is not None:
             selected = selected[: select.limit]
 
-        out_columns = _project_items(items, source_columns, selected)
+        out_columns = _project_items_batch(items, source_columns, selected)
         return Table._from_storage(out_schema, out_columns)
 
-    # DISTINCT: WHERE -> project every surviving input row -> deduplicate the
-    # full result rows -> sort -> LIMIT.  Projection happens before the sort
-    # so ORDER BY compares deduplicated output values, and before LIMIT so a
-    # row LIMIT would cut still surfaces a real division-by-zero/overflow.
-    rows = _project_item_rows(items, source_columns, selected)
+    # DISTINCT: WHERE -> project every surviving input row (one batch per
+    # expression) -> deduplicate the full result rows -> sort -> LIMIT.
+    # Projection happens before the sort so ORDER BY compares deduplicated
+    # output values, and before LIMIT so a row LIMIT would cut still surfaces a
+    # real division-by-zero/overflow.
+    rows = _project_rows_batch(items, source_columns, selected)
     rows = _deduplicate_rows(rows, out_schema)
 
     if order_by is not None:
@@ -3334,35 +3526,6 @@ def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Tab
     width = len(items)
     out_columns = [tuple(row[c] for row in rows) for c in range(width)]
     return Table._from_storage(out_schema, out_columns)
-
-
-def _project_items(items, source_columns, selected) -> list:
-    out_columns = []
-    for item in items:
-        if item.kind == "column":
-            out_columns.append(
-                tuple(source_columns[item.col_index][i] for i in selected)
-            )
-        else:  # "expr"
-            out_columns.append(
-                tuple(
-                    _eval(item.expr, _row_values(source_columns, i))
-                    for i in selected
-                )
-            )
-    return out_columns
-
-
-def _project_item_rows(items, source_columns, selected) -> list[tuple]:
-    return [
-        tuple(
-            source_columns[item.col_index][i]
-            if item.kind == "column"
-            else _eval(item.expr, _row_values(source_columns, i))
-            for item in items
-        )
-        for i in selected
-    ]
 
 
 def _deduplicate_rows(rows: list[tuple], schema: Schema) -> list[tuple]:
@@ -3546,26 +3709,23 @@ def _build_groups(
     return [tuple(groups[key]) for key in order]
 
 
-def _row_values(source_columns: tuple[tuple, ...], i: int) -> tuple:
-    return tuple(col[i] for col in source_columns)
-
-
 def _make_row_comparator(
     source_columns: tuple[tuple, ...],
     order_by: tuple[tuple, ...],
     selected: list[int],
 ):
     # Sort keys are computed for every row that passed WHERE, before the
-    # stable sort and LIMIT; expression keys (SELECT aliases) are evaluated
-    # here, so their errors surface even for rows LIMIT would cut.
+    # stable sort and LIMIT; expression keys (SELECT aliases) are evaluated as
+    # one batch over the whole filtered row set here, so their errors surface
+    # even for rows LIMIT would cut, at the same (first filtered-row) point as
+    # the row-wise evaluation did.
     key_sources: list[tuple] = []
     for entry in order_by:
         if entry[0] == "col":
             key_sources.append((source_columns[entry[1]], entry[2], entry[3]))
         else:  # "expr"
-            values = {
-                i: _eval(entry[1], _row_values(source_columns, i)) for i in selected
-            }
+            evaluated = _vector_value(entry[1], source_columns, selected)
+            values = {row_index: evaluated[k] for k, row_index in enumerate(selected)}
             key_sources.append((values, entry[2], entry[3]))
 
     def compare(a: int, b: int) -> int:
