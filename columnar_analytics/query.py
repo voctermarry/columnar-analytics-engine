@@ -223,6 +223,25 @@ FROM/JOIN order with ``required_columns`` attributed to each source, then
 one Join operator per step in the same order, recording the step type and
 the two normalised qualified keys (the earlier table on the left, the
 freshly introduced table on the right).
+
+Row-group-partitioned (v2) files are read selectively: every query decodes
+only the column blocks its plan actually references (a join chain
+additionally reads each table's ON keys), and single-file statements --
+:func:`query_file` and JOIN-less :func:`query_files` -- push the
+AND-connected, type-compatible comparisons and IS [NOT] NULL conditions of
+WHERE down to the per-group statistics.  A row group is skipped only when
+its statistics prove the pushed condition can never be TRUE for any of its
+rows; OR, NOT, CASE, arithmetic, column-to-column comparisons and
+undecidable ranges keep the group, and surviving rows are still filtered
+row by row with the full WHERE condition.  When every group is excluded
+the statement simply sees zero rows, so empty results, ``COUNT(*)``, other
+global aggregates and HAVING keep their usual semantics.  Both format
+versions return identical column descriptions, values, row order, sorting,
+LIMIT, join and export results for the same data and statement.  In the
+explain plan a v2 single-source Scan operator additionally carries
+``row_groups_total``, ``row_groups_selected`` and ``pushed_condition``
+(the pushed-down subset of the WHERE condition as a condition tree, or
+null); v1 plans are unchanged.
 """
 
 from __future__ import annotations
@@ -235,7 +254,16 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
 
-from .format import ColumnSchema, Schema, Table, inspect_file, read_file
+from .format import (
+    FORMAT_VERSION_PARTITIONED,
+    ColumnSchema,
+    Schema,
+    Table,
+    _read_partitioned_table,
+    inspect_file,
+    inspect_row_groups,
+    read_file,
+)
 
 __all__ = [
     "QuerySyntaxError",
@@ -2282,6 +2310,141 @@ def _distinct_values(col, arg_type: str, rows) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Row-group statistics pushdown (v2 files)
+# ---------------------------------------------------------------------------
+#
+# For row-group-partitioned (v2) files the AND-connected, type-compatible
+# comparisons and IS [NOT] NULL conditions of a WHERE clause are evaluated
+# against each group's per-column statistics.  A group is skipped only when
+# its statistics prove the condition can never be TRUE for any of its rows;
+# anything else (OR, NOT, CASE, arithmetic, column-to-column comparisons or
+# simply undecidable ranges) keeps the group, and the surviving rows are
+# still filtered row by row with the full WHERE condition.
+
+_FLIP_CMP_OP = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
+
+
+def _is_pushable_leaf(node: tuple) -> bool:
+    """Whether a bound WHERE leaf can be checked against column statistics."""
+    tag = node[0]
+    if tag == "isnull":
+        return node[1][0] == "column"
+    if tag == "cmp":
+        left, right = node[2], node[3]
+        return (left[0] == "column" and right[0] == "literal") or (
+            left[0] == "literal" and right[0] == "column"
+        )
+    return False
+
+
+def _extract_pushable(where: tuple | None) -> list:
+    """The AND-connected pushable leaves of a bound WHERE tree, in order."""
+    conditions: list = []
+
+    def walk(node: tuple) -> None:
+        if node[0] == "and":
+            walk(node[1])
+            walk(node[2])
+        elif _is_pushable_leaf(node):
+            conditions.append(node)
+
+    if where is not None:
+        walk(where)
+    return conditions
+
+
+def _condition_possible(cond: tuple, group: Mapping, schema: Schema) -> bool:
+    """Whether ``cond`` could be TRUE for some row of ``group``.
+
+    Only a provable "cannot be TRUE" returns False; anything undecidable
+    keeps the group.
+    """
+    group_rows = group["row_count"]
+    if cond[0] == "isnull":
+        stats = group["columns"][cond[1][2]]
+        if cond[2]:  # IS NOT NULL
+            return stats["null_count"] < group_rows
+        return stats["null_count"] > 0
+    # A column-vs-literal comparison (normalised to column OP literal).
+    op = cond[1]
+    left, right = cond[2], cond[3]
+    if left[0] == "column":
+        col_index = left[2]
+        literal = right[1]
+    else:
+        col_index = right[2]
+        literal = left[1]
+        op = _FLIP_CMP_OP[op]
+    stats = group["columns"][col_index]
+    if stats["null_count"] == group_rows:
+        # All values NULL: a comparison is never TRUE.
+        return False
+    minimum = stats["min"]
+    maximum = stats["max"]
+    if op == "=":
+        return minimum <= literal <= maximum
+    if op == "!=":
+        return not (minimum == maximum == literal)
+    if op == "<":
+        return minimum < literal
+    if op == "<=":
+        return minimum <= literal
+    if op == ">":
+        return maximum > literal
+    return maximum >= literal  # ">="
+
+
+def _select_row_groups(groups: list, pushed: list, schema: Schema) -> list[int]:
+    """Indices of the row groups whose statistics do not rule them out."""
+    if not pushed:
+        return list(range(len(groups)))
+    return [
+        index
+        for index, group in enumerate(groups)
+        if all(_condition_possible(cond, group, schema) for cond in pushed)
+    ]
+
+
+def _pushed_condition_json(pushed: list) -> dict | None:
+    """Render the pushed-down condition set as one condition tree (or null)."""
+    if not pushed:
+        return None
+    node = pushed[0]
+    for cond in pushed[1:]:
+        node = ("and", node, cond)
+    return _expr_json(node)
+
+
+def _scan_pushdown_info(groups: list, bound: Mapping, schema: Schema) -> dict:
+    """The v2 Scan statistics: group counts and the pushed condition tree."""
+    pushed = _extract_pushable(bound["where"])
+    selected = _select_row_groups(groups, pushed, schema)
+    return {
+        "row_groups_total": len(groups),
+        "row_groups_selected": len(selected),
+        "pushed_condition": _pushed_condition_json(pushed),
+    }
+
+
+def _query_partitioned(
+    path: Any, select: _Select, schema: Schema, expected_table
+) -> Table:
+    """Execute a single-source statement against a v2 (partitioned) file.
+
+    Only the columns the bound plan references are decoded, and only the
+    row groups whose statistics do not exclude them.
+    """
+    bound = _bind_select(select, schema, expected_table=expected_table)
+    required = _collect_required_indices(bound)
+    groups = inspect_row_groups(path)
+    pushed = _extract_pushable(bound["where"])
+    selected = _select_row_groups(groups, pushed, schema)
+    columns = {schema.columns[i].name for i in required}
+    table = _read_partitioned_table(path, columns=columns, row_groups=selected)
+    return _run_query(table, select, expected_table=expected_table)
+
+
+# ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
@@ -2305,6 +2468,12 @@ def query_file(path: Any, sql: str) -> Table:
     """
     tokens = _tokenize(sql)
     select = _Parser(tokens).parse()
+    metadata = inspect_file(path)
+    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
+        # Row-group-partitioned file: decode only the referenced columns
+        # and the row groups their statistics cannot exclude.
+        schema = _schema_from_metadata(metadata)
+        return _query_partitioned(path, select, schema, _SINGLE_TABLE_NAME)
     table = read_file(path)
     return _run_query(table, select)
 
@@ -2351,6 +2520,14 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     )
     if not steps:
         rewritten = _rewrite_select(select, _single_table_resolver(from_key))
+        metadata = inspect_file(paths[from_key])
+        if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
+            # Row-group-partitioned file: decode only the referenced
+            # columns and the row groups their statistics cannot exclude.
+            schema = _schema_from_metadata(metadata)
+            return _query_partitioned(
+                paths[from_key], rewritten, schema, expected_table=None
+            )
         table = read_file(paths[from_key])
         return _run_query(table, rewritten, expected_table=None)
 
@@ -2358,6 +2535,18 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any read.
     rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
+
+    # The partitioned read path applies as soon as one source is a v2
+    # file; the version peek only reads the 5-byte prefix and treats an
+    # unreadable or unrecognisable prefix as v1, so all-v1 chains keep the
+    # historical read order and error behaviour exactly.
+    if any(
+        _peek_format_version(paths[key]) == FORMAT_VERSION_PARTITIONED
+        for key in table_keys
+    ):
+        return _run_join_chain_partitioned(
+            paths, rewritten, from_key, steps, strategy, table_keys
+        )
 
     # Each step takes the materialised intermediate result as its left input
     # and the one freshly introduced table as its right input; WHERE /
@@ -2368,6 +2557,75 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     for step in steps:
         new_table = read_file(paths[step.new_key])
         combined = _execute_join_step(combined, new_table, step, strategy)
+    return _run_query(combined, rewritten, expected_table=None)
+
+
+def _peek_format_version(path: Any) -> int | None:
+    """Best-effort read of a file's format version byte (no validation).
+
+    Returns ``None`` for unreadable or unrecognisable files; callers treat
+    that as "not v2" so the legacy read path reports the proper error.
+    """
+    try:
+        with open(path, "rb") as handle:
+            prefix = handle.read(5)
+    except OSError:
+        return None
+    if len(prefix) < 5 or prefix[:4] != b"CAEF":
+        return None
+    return prefix[4]
+
+
+def _run_join_chain_partitioned(
+    paths, rewritten: _Select, from_key: str, steps, strategy, table_keys
+) -> Table:
+    """Join chain with at least one v2 (partitioned) source.
+
+    Every v2 source is read restricted to the columns the plan actually
+    references (its join keys included); v1 sources keep the historical
+    full read.  No row-group statistics pushdown is applied: WHERE runs
+    after the whole chain has been built.
+    """
+    schemas = {}
+    versions = {}
+    for key in table_keys:
+        metadata = inspect_file(paths[key])
+        schemas[key] = _schema_from_metadata(metadata)
+        versions[key] = metadata["format_version"]
+    combined_schema = Schema(
+        tuple(
+            ColumnSchema(f"{from_key}.{col.name}", col.type, col.nullable)
+            for col in schemas[from_key].columns
+        )
+    )
+    for step in steps:
+        combined_schema = _build_joined_schema(
+            combined_schema, schemas[step.new_key], step
+        )
+    bound = _bind_select(rewritten, combined_schema, expected_table=None)
+    referenced = _collect_required_indices(bound)
+    for step in steps:
+        referenced.add(combined_schema.index(f"{step.prior_key}.{step.prior_col}"))
+        referenced.add(combined_schema.index(f"{step.new_key}.{step.new_col}"))
+    referenced_names = {combined_schema.columns[i].name for i in referenced}
+
+    def read_source(key: str) -> Table:
+        if versions[key] != FORMAT_VERSION_PARTITIONED:
+            return read_file(paths[key])
+        required = [
+            col.name
+            for col in schemas[key].columns
+            if f"{key}.{col.name}" in referenced_names
+        ]
+        return _read_partitioned_table(paths[key], columns=set(required)).project(
+            required
+        )
+
+    combined = _qualify_table(read_source(from_key), from_key)
+    for step in steps:
+        combined = _execute_join_step(
+            combined, read_source(step.new_key), step, strategy
+        )
     return _run_query(combined, rewritten, expected_table=None)
 
 
@@ -3230,7 +3488,10 @@ def explain_file(path: Any, sql: str) -> dict:
     schema = _schema_from_metadata(metadata)
     sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
     bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    return _build_explain(sources, schema, select, bound, steps=())
+    scan_extra = None
+    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
+        scan_extra = _scan_pushdown_info(inspect_row_groups(path), bound, schema)
+    return _build_explain(sources, schema, select, bound, steps=(), scan_extra=scan_extra)
 
 
 def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
@@ -3271,7 +3532,14 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         from_schema = _schema_from_metadata(from_metadata)
         sources = ((from_key, from_metadata, from_schema),)
         bound = _bind_select(rewritten, from_schema, expected_table=None)
-        return _build_explain(sources, from_schema, rewritten, bound, steps=())
+        scan_extra = None
+        if from_metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
+            scan_extra = _scan_pushdown_info(
+                inspect_row_groups(paths[from_key]), bound, from_schema
+            )
+        return _build_explain(
+            sources, from_schema, rewritten, bound, steps=(), scan_extra=scan_extra
+        )
 
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any metadata is read.
@@ -3561,6 +3829,7 @@ def _build_explain(
     bound: Mapping,
     steps: tuple[_JoinStep, ...] = (),
     strategy: str | None = None,
+    scan_extra: Mapping | None = None,
 ) -> dict:
     referenced = _collect_required_indices(bound)
     for step in steps:
@@ -3580,9 +3849,15 @@ def _build_explain(
                 for col in source_schema.columns
                 if f"{prefix}{col.name}" in referenced_names
             ]
-        operators.append(
-            {"operator": "Scan", "source": key, "required_columns": required}
-        )
+        scan_operator = {"operator": "Scan", "source": key, "required_columns": required}
+        if scan_extra is not None:
+            # v2 (row-group-partitioned) single-source scans report the
+            # statistics pushdown: total/selected row groups and the
+            # pushed-down condition tree (null when nothing was pushed).
+            scan_operator["row_groups_total"] = scan_extra["row_groups_total"]
+            scan_operator["row_groups_selected"] = scan_extra["row_groups_selected"]
+            scan_operator["pushed_condition"] = scan_extra["pushed_condition"]
+        operators.append(scan_operator)
 
     # One Join operator per step, in FROM/JOIN order; each reports the two
     # qualified ON keys normalised to prior-table (intermediate) left and

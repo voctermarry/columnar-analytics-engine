@@ -10,8 +10,10 @@ from .format import (
     Schema,
     Table,
     inspect_file,
+    inspect_row_groups,
     read_file,
     write_file,
+    write_partitioned_file,
 )
 from .query import (
     QuerySyntaxError,
@@ -30,8 +32,10 @@ __all__ = [
     "Schema",
     "Table",
     "write_file",
+    "write_partitioned_file",
     "read_file",
     "inspect_file",
+    "inspect_row_groups",
     "QuerySyntaxError",
     "QueryValidationError",
     "explain_file",

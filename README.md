@@ -147,9 +147,16 @@ Python 入口 `export_query_file(path, sql, destination, format="csv")` 与
 包 `columnar_analytics` 导出：
 
 - `Schema` / `ColumnSchema` / `Table`：有序 schema 与按列数据表
-- `write_file(path, table, *, compression="none", dictionary_encoding=())`：确定性、原子写出
-- `read_file(path, *, columns=None)`：读回表；`columns` 按调用方顺序投影部分列
-- `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
+- `write_file(path, table, *, compression="none", dictionary_encoding=())`：确定性、原子写出（v1 格式）
+- `write_partitioned_file(path, table, row_group_size, *, compression="none", dictionary_encoding=())`：
+  按原始行序切成连续行组、确定性原子写出 v2 格式；每组记录行数与各列
+  `null_count`/`min`/`max`，各列块独立校验、解压、解码；`row_group_size`
+  非正整数或编码参数非法时抛 `ValueError` 且不创建或改变目标文件
+- `read_file(path, *, columns=None)`：读回表（同时支持 v1/v2）；`columns` 按调用方顺序投影部分列，
+  读取 v2 时只解压、解码被请求的列块
+- `inspect_file(path)`：只读元数据（格式版本、行数、每列 NULL 数、min/max；v2 为各组统计的汇总）
+- `inspect_row_groups(path)`：只读元数据，按文件顺序返回 v2 各行组的行数与 schema 顺序的列统计；
+  v1 文件返回空列表
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
 - `query_files(sources, sql, join_strategy=None)`：对表名→路径映射执行 SQL（FROM 后可连续连接多个表），成功返回 `Table`；
   `join_strategy` 可选 `"hash"` / `"sort_merge"`，显式指定时应用于每一步，两种策略结果与行序完全相同，
@@ -396,6 +403,18 @@ SELECT ... FROM 起始表
 （覆盖此前全部字节）+ 结束标记 `END1`。相同输入与选项重复写出的字节完全一致。
 读取时拒绝错误魔数、未知版本、截断、校验不一致与非法元数据，统一抛
 `ColumnarFormatError`。
+
+格式版本 2（`write_partitioned_file`）把行按原始顺序切成定长连续行组，头部记录
+每组行数及每列 `null_count`/`min`/`max` 统计；每个（行组 × 列）块独立存放、
+独立 CRC-32 校验，可按列独立 zlib 压缩与解码，尾部为裸 `END1` 标记。
+`read_file` / `inspect_file` 同时识别两个版本；`inspect_row_groups` 按文件顺序
+返回 v2 各组行数与 schema 顺序的列统计（v1 返回空列表）。读取 v2 时只解压、
+解码实际请求的列块；单文件查询与不含 JOIN 的多文件查询还会把 WHERE 中由 AND
+连接的、类型兼容的比较和 `IS [NOT] NULL` 条件下推到组统计——仅当统计能证明
+条件不可能为 TRUE 时才跳过整组（OR、NOT、CASE、算术、列间比较等仍逐行过滤），
+被排除的行组不会被解压或解码，两种版本对同一数据和语句返回完全相同的结果。
+explain 计划中 v2 单源 Scan 算子额外携带 `row_groups_total`、
+`row_groups_selected` 与 `pushed_condition`（下推条件树，无下推时为 null）。
 
 ## 限制
 

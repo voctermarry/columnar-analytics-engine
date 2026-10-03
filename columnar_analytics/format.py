@@ -3,20 +3,34 @@
 Public API:
 
 * :class:`ColumnSchema` / :class:`Schema` / :class:`Table` -- in-memory model
-* :func:`write_file` -- deterministic, atomic write
+* :func:`write_file` -- deterministic, atomic write of the v1 format
+* :func:`write_partitioned_file` -- deterministic, atomic write of the
+  row-group-partitioned v2 format
 * :func:`read_file` -- strict, validating read with optional projection
-* :func:`inspect_file` -- metadata-only read
+  (both format versions)
+* :func:`inspect_file` -- metadata-only read (both format versions)
+* :func:`inspect_row_groups` -- metadata-only per-row-group statistics
 * :class:`ColumnarFormatError` -- raised for every malformed-file condition
 
 File layout (little-endian)::
 
     b"CAEF"            magic
-    uint8              format version
+    uint8              format version (1 or 2)
     uint32             header byte length
     <header bytes>     UTF-8 JSON, schema + per-column stats/chunk pointers
     <data section>     raw concatenated column payloads, or zlib of the same
-    uint32             CRC-32 of every preceding byte
+    uint32             CRC-32 of every preceding byte   (version 1 only)
     b"END1"            end marker
+
+Version 1 stores one chunk per column and optionally zlib-compresses the
+whole data section.  Version 2 (written by :func:`write_partitioned_file`)
+splits the rows into consecutive row groups of a fixed size; every group
+carries its row count and per-column ``null_count`` / ``min`` / ``max``
+statistics, and every (group, column) block is stored -- and optionally
+zlib-compressed -- independently, so a single block can be located,
+checksummed, decompressed and decoded without touching the others.  The v2
+trailer is the bare ``END1`` marker; integrity comes from the declared
+sizes and the per-block CRC-32 checksums of the blocks actually read.
 
 The same schema, values and options always produce identical bytes: the JSON
 header uses a fixed key order and compact separators, there are no timestamps,
@@ -36,16 +50,22 @@ from typing import Any
 
 __all__ = [
     "FORMAT_VERSION",
+    "FORMAT_VERSION_PARTITIONED",
     "ColumnarFormatError",
     "ColumnSchema",
     "Schema",
     "Table",
     "write_file",
+    "write_partitioned_file",
     "read_file",
     "inspect_file",
+    "inspect_row_groups",
 ]
 
 FORMAT_VERSION = 1
+# Version 2: the row-group-partitioned layout written by
+# ``write_partitioned_file``.  Readers dispatch on the version byte.
+FORMAT_VERSION_PARTITIONED = 2
 
 _MAGIC = b"CAEF"
 _FOOTER_MARKER = b"END1"
@@ -59,8 +79,17 @@ _COLUMN_KEYS = frozenset(
     ("name", "type", "nullable", "encoding", "offset", "length", "crc32",
      "null_count", "min", "max")
 )
+_V2_HEADER_KEYS = frozenset(
+    ("compression", "row_count", "row_group_size", "data_length", "columns", "row_groups")
+)
+_V2_COLUMN_KEYS = frozenset(("name", "type", "nullable", "encoding"))
+_V2_GROUP_KEYS = frozenset(("row_count", "columns"))
+_V2_BLOCK_KEYS = frozenset(
+    ("offset", "length", "crc32", "uncompressed_length", "null_count", "min", "max")
+)
 _PREFIX_LEN = 9  # magic(4) + version(1) + header length uint32
 _FOOTER_LEN = 8  # crc32 uint32 + marker
+_V2_TRAILER_LEN = 4  # bare end marker
 _MAX_HEADER_BYTES = 256 * 1024 * 1024
 
 
@@ -677,25 +706,170 @@ def _is_finite_json_float(value: Any) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))
 
 
+def _validate_header_v2(header: Any) -> dict:
+    """Validate the JSON header of a row-group-partitioned (v2) file."""
+    if not isinstance(header, dict):
+        raise ColumnarFormatError("header must be a JSON object")
+    unknown = set(header) - _V2_HEADER_KEYS
+    if unknown:
+        raise ColumnarFormatError(f"unknown header key(s): {sorted(unknown)!r}")
+    compression = header.get("compression")
+    if compression not in _COMPRESSION_NAMES:
+        raise ColumnarFormatError(f"unknown compression in header: {compression!r}")
+    row_count = header.get("row_count")
+    if not _is_nonneg_int(row_count):
+        raise ColumnarFormatError("header row_count must be a non-negative integer")
+    row_group_size = header.get("row_group_size")
+    if (
+        not isinstance(row_group_size, int)
+        or isinstance(row_group_size, bool)
+        or row_group_size < 1
+    ):
+        raise ColumnarFormatError("header row_group_size must be a positive integer")
+    data_length = header.get("data_length")
+    if not _is_nonneg_int(data_length):
+        raise ColumnarFormatError("header data_length must be a non-negative integer")
+    entries = header.get("columns")
+    if not isinstance(entries, list) or not entries:
+        raise ColumnarFormatError("header must list at least one column")
+
+    columns: list[dict] = []
+    seen: set[str] = set()
+    for pos, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ColumnarFormatError(f"column header #{pos} must be an object")
+        unknown_col = set(entry) - _V2_COLUMN_KEYS
+        if unknown_col:
+            raise ColumnarFormatError(
+                f"column header #{pos}: unknown key(s) {sorted(unknown_col)!r}"
+            )
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ColumnarFormatError(f"column header #{pos}: name must be a non-empty string")
+        if name in seen:
+            raise ColumnarFormatError(f"duplicate column in header: {name!r}")
+        seen.add(name)
+        col_type = entry.get("type")
+        if col_type not in _TYPE_NAMES:
+            raise ColumnarFormatError(f"column {name!r}: unknown type {col_type!r}")
+        nullable = entry.get("nullable")
+        if not isinstance(nullable, bool):
+            raise ColumnarFormatError(f"column {name!r}: nullable must be true or false")
+        encoding = entry.get("encoding")
+        if encoding not in _ENCODING_NAMES:
+            raise ColumnarFormatError(f"column {name!r}: unknown encoding {encoding!r}")
+        if encoding == "dictionary" and col_type != "utf8":
+            raise ColumnarFormatError(f"column {name!r}: dictionary encoding requires utf8")
+        columns.append(entry)
+
+    groups = header.get("row_groups")
+    if not isinstance(groups, list):
+        raise ColumnarFormatError("header row_groups must be a list")
+    total_rows = 0
+    next_offset = 0
+    for pos, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise ColumnarFormatError(f"row group #{pos} must be an object")
+        unknown_group = set(group) - _V2_GROUP_KEYS
+        if unknown_group:
+            raise ColumnarFormatError(
+                f"row group #{pos}: unknown key(s) {sorted(unknown_group)!r}"
+            )
+        group_rows = group.get("row_count")
+        if (
+            not isinstance(group_rows, int)
+            or isinstance(group_rows, bool)
+            or group_rows < 1
+        ):
+            raise ColumnarFormatError(
+                f"row group #{pos}: row_count must be a positive integer"
+            )
+        if pos < len(groups) - 1 and group_rows != row_group_size:
+            raise ColumnarFormatError(
+                f"row group #{pos}: row_count does not match row_group_size"
+            )
+        if group_rows > row_group_size:
+            raise ColumnarFormatError(
+                f"row group #{pos}: row_count exceeds row_group_size"
+            )
+        total_rows += group_rows
+        blocks = group.get("columns")
+        if not isinstance(blocks, list) or len(blocks) != len(columns):
+            raise ColumnarFormatError(
+                f"row group #{pos}: must carry one block per column"
+            )
+        for col, block in zip(columns, blocks):
+            name = col["name"]
+            if not isinstance(block, dict):
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: block must be an object"
+                )
+            unknown_block = set(block) - _V2_BLOCK_KEYS
+            if unknown_block:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: unknown key(s) "
+                    f"{sorted(unknown_block)!r}"
+                )
+            for key in ("offset", "length", "uncompressed_length", "null_count"):
+                if not _is_nonneg_int(block.get(key)):
+                    raise ColumnarFormatError(
+                        f"row group #{pos} column {name!r}: {key} must be a "
+                        "non-negative integer"
+                    )
+            if not _is_uint32(block.get("crc32")):
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: crc32 must be a uint32"
+                )
+            if compression == "none" and block["length"] != block["uncompressed_length"]:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: uncompressed block "
+                    "length mismatch"
+                )
+            if block["offset"] != next_offset:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: blocks are not contiguous"
+                )
+            next_offset += block["length"]
+            null_count = block["null_count"]
+            if null_count > group_rows:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: null_count exceeds group row_count"
+                )
+            if not col["nullable"] and null_count:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: NULL count set for "
+                    "non-nullable column"
+                )
+            if "min" not in block or "max" not in block:
+                raise ColumnarFormatError(
+                    f"row group #{pos} column {name!r}: min and max keys are required"
+                )
+            _validate_stats(
+                {"name": name, "min": block["min"], "max": block["max"]},
+                col["type"],
+                group_rows,
+                null_count,
+            )
+    if total_rows != row_count:
+        raise ColumnarFormatError("row group row counts do not add up to row_count")
+    if next_offset != data_length:
+        raise ColumnarFormatError("declared data length does not match column blocks")
+    return header
+
+
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
 
 
-def write_file(
-    path: str | os.PathLike,
-    table: Table,
-    *,
-    compression: str = "none",
-    dictionary_encoding: Sequence[str] = (),
-) -> None:
-    """Write ``table`` to ``path`` deterministically and atomically.
+def _validate_write_options(
+    table: Table, compression: Any, dictionary_encoding: Any
+) -> frozenset:
+    """Shared write-option validation; returns the dictionary column set.
 
-    All validation happens before any file is created, so invalid arguments
+    Everything is checked before any file is created, so invalid arguments
     never create or alter the destination.
     """
-    if not isinstance(table, Table):
-        raise TypeError("table must be a Table instance")
     if compression not in _COMPRESSION_NAMES:
         raise ValueError(f"unknown compression: {compression!r}")
     if isinstance(dictionary_encoding, str):
@@ -712,7 +886,24 @@ def write_file(
             raise ValueError(
                 f"dictionary encoding is only valid for utf8 columns, not {col.name!r} ({col.type})"
             )
-    dict_set = set(dict_names)
+    return frozenset(dict_names)
+
+
+def write_file(
+    path: str | os.PathLike,
+    table: Table,
+    *,
+    compression: str = "none",
+    dictionary_encoding: Sequence[str] = (),
+) -> None:
+    """Write ``table`` to ``path`` deterministically and atomically.
+
+    All validation happens before any file is created, so invalid arguments
+    never create or alter the destination.
+    """
+    if not isinstance(table, Table):
+        raise TypeError("table must be a Table instance")
+    dict_set = _validate_write_options(table, compression, dictionary_encoding)
 
     raw_section = bytearray()
     chunk_info: list[dict] = []
@@ -754,6 +945,108 @@ def write_file(
     _atomic_write(path, blob)
 
 
+def write_partitioned_file(
+    path: str | os.PathLike,
+    table: Table,
+    row_group_size: int,
+    *,
+    compression: str = "none",
+    dictionary_encoding: Sequence[str] = (),
+) -> None:
+    """Write ``table`` as a row-group-partitioned (v2) columnar file.
+
+    Rows are split, in their original order, into consecutive groups of
+    ``row_group_size`` rows (the last group holds the remainder; an empty
+    table yields no groups).  Every group records its row count and, per
+    column, ``null_count`` / ``min`` / ``max`` statistics; every
+    (group, column) block is checksummed and -- with ``compression="zlib"``
+    -- compressed independently, so readers can verify, decompress and
+    decode exactly the blocks they need.
+
+    The same inputs and options always produce identical bytes, and the
+    destination is replaced atomically.  All validation happens before any
+    file is created: a non-positive (or non-integer) ``row_group_size`` and
+    invalid ``compression`` / ``dictionary_encoding`` arguments raise
+    :class:`ValueError` without creating or altering the target.
+    """
+    if not isinstance(table, Table):
+        raise TypeError("table must be a Table instance")
+    if (
+        not isinstance(row_group_size, int)
+        or isinstance(row_group_size, bool)
+        or row_group_size < 1
+    ):
+        raise ValueError("row_group_size must be a positive integer")
+    dict_set = _validate_write_options(table, compression, dictionary_encoding)
+
+    row_count = table.row_count
+    group_bounds: list[tuple[int, int]] = []
+    start = 0
+    while start < row_count:
+        end = min(start + row_group_size, row_count)
+        group_bounds.append((start, end))
+        start = end
+
+    data_section = bytearray()
+    group_headers: list[dict] = []
+    for group_start, group_end in group_bounds:
+        block_info: list[dict] = []
+        for i, col in enumerate(table.schema.columns):
+            values = table._columns[i][group_start:group_end]
+            payload, null_count, minimum, maximum = _encode_payload(
+                col, values, use_dictionary=col.name in dict_set
+            )
+            if compression == "zlib":
+                stored = zlib.compress(payload, level=6)
+            else:
+                stored = payload
+            block_info.append(
+                {
+                    "offset": len(data_section),
+                    "length": len(stored),
+                    "crc32": zlib.crc32(stored) & 0xFFFFFFFF,
+                    "uncompressed_length": len(payload),
+                    "null_count": null_count,
+                    "min": _stats_json(minimum),
+                    "max": _stats_json(maximum),
+                }
+            )
+            data_section.extend(stored)
+        group_headers.append(
+            {"row_count": group_end - group_start, "columns": block_info}
+        )
+
+    header = {
+        "compression": compression,
+        "row_count": row_count,
+        "row_group_size": row_group_size,
+        "data_length": len(data_section),
+        "columns": [
+            {
+                "name": col.name,
+                "type": col.type,
+                "nullable": col.nullable,
+                "encoding": "dictionary" if col.name in dict_set else "plain",
+            }
+            for col in table.schema.columns
+        ],
+        "row_groups": group_headers,
+    }
+    header_bytes = _dump_json(header)
+    if len(header_bytes) > _MAX_HEADER_BYTES:
+        raise ValueError("serialized header exceeds the size limit")
+
+    blob = (
+        _MAGIC
+        + bytes([FORMAT_VERSION_PARTITIONED])
+        + struct.pack("<I", len(header_bytes))
+        + header_bytes
+        + bytes(data_section)
+        + _FOOTER_MARKER
+    )
+    _atomic_write(path, blob)
+
+
 def _atomic_write(path: str | os.PathLike, blob: bytes) -> None:
     path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path))
@@ -784,11 +1077,12 @@ def _read_exact(handle, size: int, what: str) -> bytes:
     return data
 
 
-def _read_header(path: str | os.PathLike) -> tuple[bytes, bytes, dict, int]:
+def _read_header(path: str | os.PathLike) -> tuple[bytes, bytes, dict, int, int]:
     """Read prefix + JSON header and fstat the declared total size.
 
     Metadata-only: no data bytes are touched. Returns the raw prefix, raw
-    header bytes, the validated header dict and the on-disk file size.
+    header bytes, the validated header dict, the on-disk file size and the
+    format version.  Both v1 and v2 headers are accepted.
     """
     with open(path, "rb") as handle:
         prefix = handle.read(_PREFIX_LEN)
@@ -801,7 +1095,7 @@ def _read_header(path: str | os.PathLike) -> tuple[bytes, bytes, dict, int]:
         if prefix[:4] != _MAGIC:
             raise ColumnarFormatError("bad magic number")
         version = prefix[4]
-        if version != FORMAT_VERSION:
+        if version not in (FORMAT_VERSION, FORMAT_VERSION_PARTITIONED):
             raise ColumnarFormatError(f"unsupported format version: {version}")
         (header_length,) = struct.unpack("<I", prefix[5:9])
         if header_length == 0 or header_length > _MAX_HEADER_BYTES:
@@ -817,21 +1111,51 @@ def _read_header(path: str | os.PathLike) -> tuple[bytes, bytes, dict, int]:
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ColumnarFormatError(f"invalid header JSON: {exc}") from None
-    header = _validate_header(header)
+    if version == FORMAT_VERSION_PARTITIONED:
+        header = _validate_header_v2(header)
+        trailer_len = _V2_TRAILER_LEN
+    else:
+        header = _validate_header(header)
+        trailer_len = _FOOTER_LEN
 
-    expected_size = _PREFIX_LEN + header_length + header["data_length"] + _FOOTER_LEN
+    expected_size = _PREFIX_LEN + header_length + header["data_length"] + trailer_len
     if actual_size != expected_size:
         raise ColumnarFormatError(
             f"file size {actual_size} does not match declared size {expected_size}"
         )
-    return prefix, header_bytes, header, actual_size
+    return prefix, header_bytes, header, actual_size, version
 
 
 def read_file(
     path: str | os.PathLike, *, columns: Sequence[str] | None = None
 ) -> Table:
-    """Read a table, optionally projecting ``columns`` in the given order."""
-    prefix, header_bytes, header, _ = _read_header(path)
+    """Read a table, optionally projecting ``columns`` in the given order.
+
+    Both format versions are accepted.  For v2 (row-group-partitioned)
+    files only the blocks of the requested columns are decompressed and
+    decoded; unreferenced column blocks are never touched beyond their
+    declared sizes.
+    """
+    if columns is not None and not isinstance(columns, str):
+        # Materialise once so one-shot iterables survive both the decode
+        # set computation and the final projection.
+        columns = tuple(columns)
+    prefix, header_bytes, header, _, version = _read_header(path)
+    if version == FORMAT_VERSION_PARTITIONED:
+        table = _read_partitioned_table(
+            path,
+            columns=None if columns is None else set(columns),
+            row_groups=None,
+            _header=(header, _PREFIX_LEN + len(header_bytes)),
+        )
+    else:
+        table = _read_v1(path, prefix, header_bytes, header)
+    if columns is not None:
+        table = table.project(columns)
+    return table
+
+
+def _read_v1(path: str | os.PathLike, prefix: bytes, header_bytes: bytes, header: dict) -> Table:
     with open(path, "rb") as handle:
         handle.seek(_PREFIX_LEN + len(header_bytes))
         data_section = _read_exact(handle, header["data_length"], "data section")
@@ -864,10 +1188,143 @@ def read_file(
         decoded_columns.append(values)
 
     schema = Schema(schema_cols)
-    table = Table._from_storage(schema, decoded_columns)
-    if columns is not None:
-        table = table.project(columns)
+    return Table._from_storage(schema, decoded_columns)
+
+
+class _UnreadColumn:
+    """Placeholder for a v2 column whose blocks were not decoded.
+
+    The query engine's bound plans only ever index referenced (decoded)
+    columns, so placeholders are never actually read; any access yields
+    ``None`` rather than failing loudly.
+    """
+
+    __slots__ = ("_length",)
+
+    def __init__(self, length: int):
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index):
+        return None
+
+
+def _schema_from_header_v2(header: dict) -> Schema:
+    return Schema(
+        [
+            ColumnSchema(entry["name"], entry["type"], entry["nullable"])
+            for entry in header["columns"]
+        ]
+    )
+
+
+def _row_groups_from_header_v2(header: dict) -> list[dict]:
+    """Per-group statistics of a validated v2 header, in file order."""
+    names = [entry["name"] for entry in header["columns"]]
+    return [
+        {
+            "row_count": group["row_count"],
+            "columns": [
+                {
+                    "name": name,
+                    "null_count": block["null_count"],
+                    "min": block["min"],
+                    "max": block["max"],
+                }
+                for name, block in zip(names, group["columns"])
+            ],
+        }
+        for group in header["row_groups"]
+    ]
+
+
+def _read_partitioned_table(
+    path: str | os.PathLike,
+    columns: set[str] | None = None,
+    row_groups: Sequence[int] | None = None,
+    _header: tuple[dict, int] | None = None,
+) -> Table:
+    """Read selected columns and row groups of a v2 file.
+
+    ``columns`` restricts which column blocks are decompressed and decoded
+    (``None`` decodes all); ``row_groups`` restricts which groups contribute
+    rows, in file order (``None`` takes every group).  The returned table
+    carries the full schema; columns that were not decoded are inert
+    placeholders.  Only the blocks actually read have their checksums,
+    decompressed lengths and statistics verified.
+    """
+    if _header is None:
+        _, header_bytes, header, _, version = _read_header(path)
+        if version != FORMAT_VERSION_PARTITIONED:
+            raise ColumnarFormatError("not a partitioned (v2) file")
+        data_start = _PREFIX_LEN + len(header_bytes)
+    else:
+        header, data_start = _header
+    schema = _schema_from_header_v2(header)
+    names = schema.names
+    if columns is None:
+        decode_indices = set(range(len(names)))
+    else:
+        decode_indices = {i for i, name in enumerate(names) if name in columns}
+    groups = header["row_groups"]
+    group_indices = range(len(groups)) if row_groups is None else row_groups
+    encodings = [entry["encoding"] for entry in header["columns"]]
+    compression = header["compression"]
+
+    decoded: dict[int, list] = {i: [] for i in decode_indices}
+    total_rows = 0
+    with open(path, "rb") as handle:
+        handle.seek(-_V2_TRAILER_LEN, os.SEEK_END)
+        if handle.read(_V2_TRAILER_LEN) != _FOOTER_MARKER:
+            raise ColumnarFormatError("bad end marker")
+        for group_index in group_indices:
+            group = groups[group_index]
+            group_rows = group["row_count"]
+            total_rows += group_rows
+            blocks = group["columns"]
+            for i in decode_indices:
+                block = blocks[i]
+                handle.seek(data_start + block["offset"])
+                stored = _read_exact(
+                    handle, block["length"], f"block of column {names[i]!r}"
+                )
+                if (zlib.crc32(stored) & 0xFFFFFFFF) != block["crc32"]:
+                    raise ColumnarFormatError(
+                        f"column {names[i]!r}: block checksum mismatch"
+                    )
+                payload = _inflate_block(compression, stored, block)
+                values = _decode_column(
+                    schema.columns[i], encodings[i], group_rows, payload
+                )
+                _verify_stats(schema.columns[i], values, block)
+                decoded[i].extend(values)
+
+    out_columns: list = []
+    for i in range(len(names)):
+        if i in decode_indices:
+            out_columns.append(tuple(decoded[i]))
+        else:
+            out_columns.append(_UnreadColumn(total_rows))
+    table = Table.__new__(Table)
+    table.schema = schema
+    table._row_count = total_rows
+    table._columns = tuple(out_columns)
     return table
+
+
+def _inflate_block(compression: str, stored: bytes, block: dict) -> bytes:
+    if compression == "zlib":
+        try:
+            payload = zlib.decompress(stored)
+        except zlib.error as exc:
+            raise ColumnarFormatError(f"cannot decompress column block: {exc}") from None
+    else:
+        payload = stored
+    if len(payload) != block["uncompressed_length"]:
+        raise ColumnarFormatError("uncompressed block length mismatch")
+    return payload
 
 
 def _inflate(header: dict, data_section: bytes) -> bytes:
@@ -911,8 +1368,41 @@ def inspect_file(path: str | os.PathLike) -> dict:
     Returns a dict with fixed key order: ``format_version``, ``row_count``,
     ``columns``; columns stay in schema order, each with keys ``name``,
     ``type``, ``nullable``, ``row_count``, ``null_count``, ``min``, ``max``.
+    For v2 (row-group-partitioned) files the column statistics are the
+    aggregates of the per-group statistics.
     """
-    _, _, header, _ = _read_header(path)
+    _, _, header, _, version = _read_header(path)
+    if version == FORMAT_VERSION_PARTITIONED:
+        groups = _row_groups_from_header_v2(header)
+        columns = []
+        for i, entry in enumerate(header["columns"]):
+            null_count = sum(group["columns"][i]["null_count"] for group in groups)
+            present_min = [
+                group["columns"][i]["min"]
+                for group in groups
+                if group["columns"][i]["min"] is not None
+            ]
+            present_max = [
+                group["columns"][i]["max"]
+                for group in groups
+                if group["columns"][i]["max"] is not None
+            ]
+            columns.append(
+                {
+                    "name": entry["name"],
+                    "type": entry["type"],
+                    "nullable": entry["nullable"],
+                    "row_count": header["row_count"],
+                    "null_count": null_count,
+                    "min": min(present_min) if present_min else None,
+                    "max": max(present_max) if present_max else None,
+                }
+            )
+        return {
+            "format_version": FORMAT_VERSION_PARTITIONED,
+            "row_count": header["row_count"],
+            "columns": columns,
+        }
     return {
         "format_version": FORMAT_VERSION,
         "row_count": header["row_count"],
@@ -929,3 +1419,18 @@ def inspect_file(path: str | os.PathLike) -> dict:
             for entry in header["columns"]
         ],
     }
+
+
+def inspect_row_groups(path: str | os.PathLike) -> list[dict]:
+    """Read only the file metadata and return per-row-group statistics.
+
+    For a v2 (row-group-partitioned) file the result lists one entry per
+    row group, in file order; each entry carries the group's ``row_count``
+    and its per-column statistics (``name``, ``null_count``, ``min``,
+    ``max``) in schema order.  A v1 file has no row groups and yields an
+    empty list.  No data bytes are read, decompressed or decoded.
+    """
+    _, _, header, _, version = _read_header(path)
+    if version != FORMAT_VERSION_PARTITIONED:
+        return []
+    return _row_groups_from_header_v2(header)
