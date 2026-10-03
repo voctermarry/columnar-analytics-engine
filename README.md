@@ -79,6 +79,10 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
   连接与过滤阶段之后按 `Project`、`Distinct`、`Sort`、`Limit` 的顺序给出；缺少的阶段省略：
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
     （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
+    单源语句与全 INNER 连接链中的 v2 源，其 `Scan` 在 `required_columns` 之后依次携带
+    `row_groups_total`、`row_groups_selected` 与 `pushed_condition`（归属该源的下推叶子
+    按 SQL 出现顺序组合成的条件树，保留限定列名；无合格叶子时选中数等于总数且
+    `pushed_condition` 为 null）；v1 源与含外连接链的 `Scan` 不增加这些字段。
   - 每个连接步骤一个 `Join`（与对应步骤同序），给出 `type`（`INNER`/`LEFT`/`RIGHT`/`FULL`）
     与 `left`、`right` 两侧限定键（`table`、`column`；左侧为该步之前已引入的表，右侧为该步
     新引入的表，与 ON 书写方向无关）；显式传入 `join_strategy` 时每个 `Join` 额外给出
@@ -409,12 +413,20 @@ SELECT ... FROM 起始表
 独立 CRC-32 校验，可按列独立 zlib 压缩与解码，尾部为裸 `END1` 标记。
 `read_file` / `inspect_file` 同时识别两个版本；`inspect_row_groups` 按文件顺序
 返回 v2 各组行数与 schema 顺序的列统计（v1 返回空列表）。读取 v2 时只解压、
-解码实际请求的列块；单文件查询与不含 JOIN 的多文件查询还会把 WHERE 中由 AND
-连接的、类型兼容的比较和 `IS [NOT] NULL` 条件下推到组统计——仅当统计能证明
-条件不可能为 TRUE 时才跳过整组（OR、NOT、CASE、算术、列间比较等仍逐行过滤），
-被排除的行组不会被解压或解码，两种版本对同一数据和语句返回完全相同的结果。
-explain 计划中 v2 单源 Scan 算子额外携带 `row_groups_total`、
-`row_groups_selected` 与 `pushed_condition`（下推条件树，无下推时为 null）。
+解码实际请求的列块；单文件查询、不含 JOIN 的多文件查询以及整条连接链均为
+INNER JOIN 的多文件查询，还会把 WHERE 顶层 AND 中只引用一个来源的合格叶子
+（限定列与类型兼容字面量间的 `=`/`!=`/`<`/`<=`/`>`/`>=`，字面量在任一侧等价，
+以及该限定列的 `IS [NOT] NULL`）按来源分别下推到组统计——同一来源的多个叶子按
+AND 合并，仅当统计能证明它们不可能在该组某行同时为 TRUE 时才跳过整组
+（OR、NOT、CASE、算术、列间或跨来源比较、统计无法判定的范围不参与裁剪，也不阻止
+同级合格叶子下推）；链中含任一 LEFT/RIGHT/FULL OUTER JOIN 时不做行组裁剪，
+v1 源始终完整读取，混合 v1/v2 的全 INNER 链只裁剪 v2 源。被排除的行组即使其
+数据块损坏也不会被读取，入选组的损坏块抛 `ColumnarFormatError`；两种版本对同一
+数据和语句返回完全相同的结果，完整 WHERE 仍对连接结果逐行求值。explain 计划中
+合格的 v2 `Scan` 算子在 `required_columns` 之后携带 `row_groups_total`、
+`row_groups_selected` 与 `pushed_condition`（归属该源的下推叶子按 SQL 出现顺序
+组合的条件树，保留限定列名；无合格叶子时选中数等于总数且为 null），其计数与
+查询实际读取的行组一致；v1 `Scan` 与含外连接链的 `Scan` 结构不变。
 
 ## 限制
 

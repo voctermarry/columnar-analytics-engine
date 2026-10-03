@@ -417,14 +417,25 @@ def test_join_equivalence(join_files, sql, strategy):
         assert actual.columns == expected.columns
 
 
-def test_join_explain_keeps_scan_shape(join_files):
+def test_join_explain_scan_shape(join_files):
     left_v2, right_v2 = join_files["v2"]
     plan = explain_files(
         {"l": left_v2, "r": right_v2}, "SELECT l.id FROM l INNER JOIN r ON l.id = r.k"
     )
-    scan = plan["operators"][0]
-    assert "row_groups_total" not in scan
-    assert "pushed_condition" not in scan
+    scans = [op for op in plan["operators"] if op["operator"] == "Scan"]
+    # An all-INNER chain annotates every v2 Scan even without a WHERE:
+    # selected == total and pushed_condition is null.
+    assert scans[0]["operator"] == "Scan"
+    assert scans[0]["source"] == "l"
+    assert scans[0]["required_columns"] == ["id"]
+    assert scans[0]["row_groups_total"] == 4
+    assert scans[0]["row_groups_selected"] == 4
+    assert scans[0]["pushed_condition"] is None
+    assert scans[1]["source"] == "r"
+    assert scans[1]["required_columns"] == ["k"]
+    assert scans[1]["row_groups_total"] == 2
+    assert scans[1]["row_groups_selected"] == 2
+    assert scans[1]["pushed_condition"] is None
 
 
 def test_join_reads_only_referenced_columns(join_files):
