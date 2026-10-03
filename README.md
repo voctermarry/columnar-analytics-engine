@@ -147,9 +147,16 @@ Python 入口 `export_query_file(path, sql, destination, format="csv")` 与
 包 `columnar_analytics` 导出：
 
 - `Schema` / `ColumnSchema` / `Table`：有序 schema 与按列数据表
-- `write_file(path, table, *, compression="none", dictionary_encoding=())`：确定性、原子写出
-- `read_file(path, *, columns=None)`：读回表；`columns` 按调用方顺序投影部分列
-- `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
+- `write_file(path, table, *, compression="none", dictionary_encoding=())`：确定性、原子写出 CAEF v1（字节格式保持不变）
+- `write_partitioned_file(path, table, row_group_size, *, compression="none", dictionary_encoding=())`：
+  按原始行序把表切成连续行组，确定性、原子写出 CAEF v2；`row_group_size` 必须为正整数，
+  否则或编码参数非法时抛 `ValueError` 且不创建/改变目标文件
+- `read_file(path, *, columns=None, row_groups=None)`：读回表；`columns` 按调用方顺序投影部分列
+  （v1/v2 均支持），`row_groups` 仅对 v2 生效、按文件顺序只取给定行组；未引用列块与被排除
+  行组不读取、不解压、不解码
+- `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max），v1/v2 返回结构相同（v2 统计为各组聚合）
+- `inspect_row_groups(path)`：按文件顺序返回 v2 各组行数与 schema 顺序的各组列统计
+  （`format_version`、`row_count`、`row_groups`）；v1 文件返回空行组列表
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
 - `query_files(sources, sql, join_strategy=None)`：对表名→路径映射执行 SQL（FROM 后可连续连接多个表），成功返回 `Table`；
   `join_strategy` 可选 `"hash"` / `"sort_merge"`，显式指定时应用于每一步，两种策略结果与行序完全相同，
@@ -396,6 +403,61 @@ SELECT ... FROM 起始表
 （覆盖此前全部字节）+ 结束标记 `END1`。相同输入与选项重复写出的字节完全一致。
 读取时拒绝错误魔数、未知版本、截断、校验不一致与非法元数据，统一抛
 `ColumnarFormatError`。
+
+格式有两个版本：
+
+- **v1**（`write_file`，魔数后版本字节为 1）：整文件一个数据段、每列一个整块、
+  一组全文件列统计，`compression="zlib"` 时整段一起压缩。v1 字节格式保持不变，
+  旧文件可被全部读取、查询、解释、导出入口直接读取。
+- **v2**（`write_partitioned_file(path, table, row_group_size, ...)`，版本字节为 2）：
+  按原始行序把表切成连续行组（除最后一组外每组恰为 `row_group_size` 行），
+  每个行组 × 每列各存一个**可独立校验、解压、解码**的列块（chunks 在数据段中
+  按行组顺序、组内按列顺序紧密排列）；每块自带 CRC-32 与该组该列的
+  `null_count`/`min`/`max`。`compression` 与 `dictionary_encoding` 参数与
+  `write_file` 完全一致，`zlib` 按块独立压缩。空表写出 0 个行组。相同输入、
+  行组大小与编码参数重复写出字节完全一致并原子替换；`row_group_size` 不是正整数
+  （0、负数、小数、字符串、布尔等）或压缩/字典参数非法时抛 `ValueError`，
+  且不创建或改变目标文件。
+
+`read_file(path, *, columns=None, row_groups=None)` 同时支持 v1、v2：v1 忽略
+`row_groups`；v2 的 `columns` 仍按调用方顺序投影，`row_groups` 可只取部分行组
+（按文件顺序拼接），未请求的列块与被排除行组的列块**不读取、不解压、不解码**。
+`inspect_file` 对两版本返回结构不变（v2 的全文件统计由各组统计聚合：`null_count`
+求和、`min`/`max` 取各组非空统计的最小/最大）；新增
+`inspect_row_groups(path)`，按文件顺序返回 v2 各组 `row_count` 及 schema 顺序的
+`columns`（每项 `name`、`type`、`nullable`、`null_count`、`min`、`max`），
+顶层键固定为 `format_version`、`row_count`、`row_groups`，v1 文件返回空
+`row_groups` 列表。文件头、声明尺寸、已读取块校验和或统计与实际解码值不一致均抛
+`ColumnarFormatError`；文件系统失败保留 `OSError`。
+
+### v2 的按需解码与统计下推
+
+读取 v2 时：
+
+- `read_file` 只解码 `columns` 请求的列（不给则全部列）；
+- 单文件查询与不含 JOIN 的 `query_files` 只解码计划实际引用的列（仅 `COUNT(*)`
+  这类零引用查询不读取任何数据块，只用各组行数），并利用行组统计下推 WHERE：
+  对由 AND 连接的「单列与类型兼容字面量的比较」（`=`/`!=`/`<`/`<=`/`>`/
+  `>=`）以及裸列的 `IS NULL` / `IS NOT NULL`，用该组该列的
+  `min`/`max`/`null_count` 判断条件**是否可能为 TRUE**；仅当统计能证明某条件对该组
+  必不为 TRUE 时才跳过该组。OR、NOT、CASE、算术表达式、列与列的比较以及无法
+  判断的条件仍逐行过滤，不会导致排除；边界值（min/max 本身）按保守规则保留所在组。
+- JOIN 查询不做行组下推（WHERE 在整条连接链之后求值），但每个被引用源仍只投影
+  解码自己被引用的列。
+- 全部行组被排除时：普通查询返回保留列描述的空结果；无 GROUP BY 的全局聚合仍返回
+  一行（`COUNT(*)` 为 0、其余聚合为 null），再经 HAVING 过滤；有 GROUP BY 时
+  返回零组——与 v1 语义完全一致。
+- v2 与 v1 对同一数据和 SQL 返回相同的列描述、值、稳定行序、排序、LIMIT、连接
+  （hash 与 sort_merge 两种策略）与导出结果。未引用列块及被排除行组不会被解压或
+  解码；整体 CRC-32 仍覆盖整个数据段。
+
+`explain` / `explain-files` 的 `Scan` 算子对 v2 文件额外给出
+`row_groups_total`（行组总数）、`row_groups_selected`（下推后保留组数）与
+`pushed_condition`（沿用既有递归条件树结构的已下推条件，无可下推谓词时为
+`null`；AND 中只有可安全下推的合取项出现在其中）；v1 文件的 Scan 计划结构
+完全不变（不出现这三个键）。含 JOIN 的计划中每个 v2 源 Scan 都给出这三个字段，
+但 `pushed_condition` 为 `null`、`row_groups_selected` 等于
+`row_groups_total`（连接不下推统计）。
 
 ## 限制
 

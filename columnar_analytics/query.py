@@ -235,7 +235,15 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any
 
-from .format import ColumnSchema, Schema, Table, inspect_file, read_file
+from .format import (
+    FORMAT_VERSION_V2,
+    ColumnSchema,
+    Schema,
+    Table,
+    inspect_file,
+    inspect_row_groups,
+    read_file,
+)
 
 __all__ = [
     "QuerySyntaxError",
@@ -2302,11 +2310,13 @@ def query_file(path: Any, sql: str) -> Table:
     raise :class:`QueryValidationError`;
     malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
+
+    Version 2 files decode only the columns the plan references and skip
+    row groups whose statistics prove the WHERE condition impossible.
     """
     tokens = _tokenize(sql)
     select = _Parser(tokens).parse()
-    table = read_file(path)
-    return _run_query(table, select)
+    return _scan_and_run(path, select, expected_table=_SINGLE_TABLE_NAME)
 
 
 def query_table(table: Table, sql: str) -> Table:
@@ -2351,24 +2361,63 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     )
     if not steps:
         rewritten = _rewrite_select(select, _single_table_resolver(from_key))
-        table = read_file(paths[from_key])
-        return _run_query(table, rewritten, expected_table=None)
+        return _scan_and_run(
+            paths[from_key], rewritten, expected_table=None
+        )
 
     table_keys = (from_key, *(step.new_key for step in steps))
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any read.
     rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
 
-    # Each step takes the materialised intermediate result as its left input
-    # and the one freshly introduced table as its right input; WHERE /
-    # GROUP BY / HAVING / projection / DISTINCT / ORDER BY / LIMIT run only
-    # after the whole chain has been built.  The FROM table is qualified up
-    # front so every step sees uniformly "table.column" column names.
-    combined = _qualify_table(read_file(paths[from_key]), from_key)
+    # Metadata resolves every referenced source's schema and version without
+    # touching any data bytes.
+    source_entries = []
+    from_metadata = inspect_file(paths[from_key])
+    current_schema = _schema_from_metadata(from_metadata)
+    source_entries.append((from_key, paths[from_key], from_metadata, current_schema))
+    current_schema = Schema(
+        tuple(
+            ColumnSchema(f"{from_key}.{col.name}", col.type, col.nullable)
+            for col in current_schema.columns
+        )
+    )
     for step in steps:
-        new_table = read_file(paths[step.new_key])
+        metadata = inspect_file(paths[step.new_key])
+        new_schema = _schema_from_metadata(metadata)
+        source_entries.append((step.new_key, paths[step.new_key], metadata, new_schema))
+        current_schema = _build_joined_schema(current_schema, new_schema, step)
+
+    # Binding uses only the combined metadata schema; every source is then scanned
+    # (v1 fully, v2 with a projection of its referenced columns).  Row-group
+    # statistics are never pushed into a join: the WHERE runs over the joined rows.
+    bound = _bind_select(rewritten, current_schema, expected_table=None)
+    referenced = _collect_required_indices(bound)
+    for step in steps:
+        referenced.add(current_schema.index(f"{step.prior_key}.{step.prior_col}"))
+        referenced.add(current_schema.index(f"{step.new_key}.{step.new_col}"))
+    referenced_names = {current_schema.columns[i].name for i in referenced}
+
+    def scan_source(key: str, path: Any, metadata: Mapping, source_schema: Schema) -> Table:
+        if metadata["format_version"] != FORMAT_VERSION_V2:
+            return read_file(path)
+        prefix = f"{key}."
+        local_required = [
+            col.name
+            for col in source_schema.columns
+            if f"{prefix}{col.name}" in referenced_names
+        ]
+        return _scan_one_source(path, metadata, source_schema, local_required)
+
+    from_schema = _schema_from_metadata(from_metadata)
+    combined = _qualify_table(
+        scan_source(from_key, paths[from_key], from_metadata, from_schema), from_key
+    )
+    for key, path, metadata, new_schema in source_entries[1:]:
+        step = next(s for s in steps if s.new_key == key)
+        new_table = scan_source(key, path, metadata, new_schema)
         combined = _execute_join_step(combined, new_table, step, strategy)
-    return _run_query(combined, rewritten, expected_table=None)
+    return _run_bound(combined, rewritten, bound)
 
 
 def _qualify_table(table: Table, key: str) -> Table:
@@ -2869,6 +2918,10 @@ def _emit_join_columns(
 
 def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
     bound = _bind_select(select, table.schema, expected_table)
+    return _run_bound(table, select, bound)
+
+
+def _run_bound(table: Table, select: _Select, bound: Mapping) -> Table:
     source_columns = table._columns
     row_count = table.row_count
     where = bound["where"]
@@ -2885,6 +2938,169 @@ def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
     if bound["mode"] == "plain":
         return _run_plain(table, select, bound, selected)
     return _run_aggregate(table, select, bound, selected)
+
+
+# ---------------------------------------------------------------------------
+# Version 2 scans: column projection and row-group statistics pushdown
+# ---------------------------------------------------------------------------
+
+
+def _scan_and_run(path: Any, select: _Select, expected_table) -> Table:
+    """Scan one file for ``select``, honouring v2 projection/pruning.
+
+    The plan is bound against the file metadata before any data byte is read.
+    Version 1 files scan fully; version 2 files decode only the referenced
+    columns and only the row groups whose statistics cannot prove the WHERE
+    clause impossible.  The remaining (still row-by-row) filtering runs with
+    the unchanged engine so results are identical in every case.
+    """
+    metadata = inspect_file(path)
+    schema = _schema_from_metadata(metadata)
+    if metadata["format_version"] != FORMAT_VERSION_V2:
+        # Legacy v1 path keeps its original order exactly: the whole file is read
+        # (and fully validated) before binding/execution, so a corrupt data
+        # section surfaces as ColumnarFormatError ahead of any binding error.
+        return _run_query(read_file(path), select, expected_table)
+    bound = _bind_select(select, schema, expected_table)
+
+    groups = inspect_row_groups(path)["row_groups"]
+    kept, _predicates = _select_row_groups(bound["where"], schema, groups)
+    table = _read_v2_scan(path, schema, bound, kept)
+    return _run_bound(table, select, bound)
+
+
+def _read_v2_scan(path: Any, schema: Schema, bound: Mapping, kept_groups: list[int]) -> Table:
+    """Read only the plan-referenced columns of the selected v2 row groups.
+
+    The returned table keeps the full schema: unreferenced columns are
+    NULL placeholders that the already-bound plan never evaluates.
+    """
+    required = _collect_required_indices(bound)
+    ordered_names = [
+        col.name for index, col in enumerate(schema.columns) if index in required
+    ]
+    projected = read_file(path, columns=ordered_names, row_groups=kept_groups)
+    return _restore_full_schema(schema, ordered_names, projected)
+
+
+def _restore_full_schema(
+    schema: Schema, read_names: Sequence[str], projected: Table
+) -> Table:
+    """Pad a projected v2 scan with NULL placeholders for unread columns."""
+    row_count = projected.row_count
+    decoded = {name: projected._columns[i] for i, name in enumerate(read_names)}
+    full_columns = [decoded.get(col.name, (None,) * row_count) for col in schema.columns]
+    return Table._from_storage(schema, full_columns)
+
+
+def _scan_one_source(
+    path: Any, metadata: Mapping, schema: Schema, required_names: Sequence[str]
+) -> Table:
+    """Scan one join source: full read for v1, projected read for v2."""
+    if metadata["format_version"] != FORMAT_VERSION_V2:
+        return read_file(path)
+    projected = read_file(path, columns=list(required_names))
+    return _restore_full_schema(schema, required_names, projected)
+
+
+def _and_conjuncts(node: tuple | None) -> list[tuple]:
+    """Flatten the top-level AND chain of a bound predicate tree."""
+    if node is None:
+        return []
+    if node[0] == "and":
+        return _and_conjuncts(node[1]) + _and_conjuncts(node[2])
+    return [node]
+
+
+def _pushdown_predicates(where: tuple | None) -> list[tuple]:
+    """The AND-conjoined predicates safe to evaluate against row-group statistics.
+
+    Only a comparison of one bare column with a typed literal constant, and
+    ``IS [NOT] NULL`` on a bare column, are pushed.  OR, NOT, CASE,
+    arithmetic, column-to-column comparisons and anything that cannot be
+    decided from min/max/null_count stay a row-level filter.
+    """
+    pushed: list[tuple] = []
+    for conjunct in _and_conjuncts(where):
+        tag = conjunct[0]
+        if tag == "cmp":
+            left, right = conjunct[2], conjunct[3]
+            if left[0] == "column" and right[0] == "literal":
+                pushed.append(conjunct)
+            elif right[0] == "column" and left[0] == "literal":
+                pushed.append(conjunct)
+        elif tag == "isnull" and conjunct[1][0] == "column":
+            pushed.append(conjunct)
+    return pushed
+
+
+def _select_row_groups(
+    where: tuple | None, schema: Schema, groups: list[dict]
+) -> tuple[list[int], list[tuple]]:
+    """Return (kept group indices, pushable predicates).
+
+    A group is excluded only when one pushed predicate is provably never TRUE
+    given the group's min/max/null_count statistics.
+    """
+    predicates = _pushdown_predicates(where)
+    kept: list[int] = []
+    for index, group in enumerate(groups):
+        stats = {entry["name"]: entry for entry in group["columns"]}
+        if all(
+            _predicate_possible(pred, stats, group["row_count"]) for pred in predicates
+        ):
+            kept.append(index)
+    return kept, predicates
+
+
+def _predicate_possible(node: tuple, stats: Mapping, group_rows: int) -> bool:
+    """Whether ``node`` could evaluate to TRUE for any row in the group."""
+    tag = node[0]
+    if tag == "isnull":
+        column = node[1]
+        entry = stats[column[1]]
+        if node[2]:  # IS NOT NULL
+            return entry["null_count"] < group_rows
+        return entry["null_count"] > 0
+    # A pushed comparison always has exactly one bare column operand.
+    op = node[1]
+    left, right = node[2], node[3]
+    if left[0] == "column":
+        return _comparison_possible(op, stats[left[1]], right, True, group_rows)
+    return _comparison_possible(op, stats[right[1]], left, False, group_rows)
+
+
+def _comparison_possible(
+    op: str, entry: Mapping, literal_node: tuple, column_left: bool, group_rows: int
+) -> bool:
+    """Stats test for ``column op literal`` (or the mirrored orientation)."""
+    value = _eval(literal_node, ())
+    if value is None:
+        return False
+    if entry["null_count"] == group_rows:
+        # Every value is NULL: no comparison can be TRUE.
+        return False
+    minimum, maximum = entry["min"], entry["max"]
+    if op in ("=", "!="):
+        in_range = minimum <= value <= maximum
+        if op == "=":
+            return in_range
+        # != is impossible only when every non-NULL value equals ``value``.
+        return not (minimum == maximum == value)
+    if not column_left:
+        # Literal on the left mirrors the operator: lit <op> column.
+        op = _mirror_op(op)
+    if op == "<":
+        return minimum < value
+    if op == "<=":
+        return minimum <= value
+    if op == ">":
+        return maximum > value
+    return maximum >= value  # ">="
+
+
+def _mirror_op(op: str) -> str:
+    return {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}[op]
 
 
 def _run_plain(table: Table, select: _Select, bound, selected: list[int]) -> Table:
@@ -3230,7 +3446,12 @@ def explain_file(path: Any, sql: str) -> dict:
     schema = _schema_from_metadata(metadata)
     sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
     bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    return _build_explain(sources, schema, select, bound, steps=())
+    pushdowns = {
+        _SINGLE_TABLE_NAME: _pushdown_info(path, metadata, schema, bound)
+    }
+    return _build_explain(
+        sources, schema, select, bound, steps=(), pushdowns=pushdowns
+    )
 
 
 def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
@@ -3271,7 +3492,12 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         from_schema = _schema_from_metadata(from_metadata)
         sources = ((from_key, from_metadata, from_schema),)
         bound = _bind_select(rewritten, from_schema, expected_table=None)
-        return _build_explain(sources, from_schema, rewritten, bound, steps=())
+        pushdowns = {
+            from_key: _pushdown_info(paths[from_key], from_metadata, from_schema, bound)
+        }
+        return _build_explain(
+            sources, from_schema, rewritten, bound, steps=(), pushdowns=pushdowns
+        )
 
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any metadata is read.
@@ -3297,6 +3523,13 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         current_schema = _build_joined_schema(current_schema, new_schema, step)
 
     bound = _bind_select(rewritten, current_schema, expected_table=None)
+    # Join scans never push WHERE statistics: the predicate runs after the
+    # whole chain, so each source selects all of its row groups.
+    pushdowns = {}
+    for key, metadata, _source_schema in source_entries:
+        if metadata["format_version"] == FORMAT_VERSION_V2:
+            total = len(inspect_row_groups(paths[key])["row_groups"])
+            pushdowns[key] = (total, total, None)
     return _build_explain(
         tuple(source_entries),
         current_schema,
@@ -3304,6 +3537,7 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         bound,
         steps=steps,
         strategy=strategy,
+        pushdowns=pushdowns,
     )
 
 
@@ -3554,6 +3788,34 @@ def _aggregate_json(item, schema: Schema) -> dict:
     return entry
 
 
+def _combine_conjuncts(conjuncts: Sequence[tuple]) -> tuple | None:
+    """Join flattened AND conjuncts back into one bound predicate tree."""
+    if not conjuncts:
+        return None
+    node = conjuncts[0]
+    for following in conjuncts[1:]:
+        node = ("and", node, following)
+    return node
+
+
+def _pushdown_info(
+    path: Any, metadata: Mapping, schema: Schema, bound: Mapping
+) -> tuple[int, int, dict | None] | None:
+    """Scan-level row-group pushdown information for one v2 source.
+
+    Returns ``(total groups, selected groups, pushed condition JSON)`` or
+    ``None`` for version 1 sources (whose Scan plan is unchanged).
+    """
+    if metadata["format_version"] != FORMAT_VERSION_V2:
+        return None
+    groups = inspect_row_groups(path)["row_groups"]
+    total = len(groups)
+    kept, predicates = _select_row_groups(bound["where"], schema, groups)
+    pushed_tree = _combine_conjuncts(predicates)
+    condition = _expr_json(pushed_tree) if pushed_tree is not None else None
+    return total, len(kept), condition
+
+
 def _build_explain(
     sources: tuple,
     schema: Schema,
@@ -3561,7 +3823,9 @@ def _build_explain(
     bound: Mapping,
     steps: tuple[_JoinStep, ...] = (),
     strategy: str | None = None,
+    pushdowns: Mapping | None = None,
 ) -> dict:
+    pushdowns = pushdowns or {}
     referenced = _collect_required_indices(bound)
     for step in steps:
         # The ON keys feed the join even when neither is projected.
@@ -3580,9 +3844,14 @@ def _build_explain(
                 for col in source_schema.columns
                 if f"{prefix}{col.name}" in referenced_names
             ]
-        operators.append(
-            {"operator": "Scan", "source": key, "required_columns": required}
-        )
+        scan = {"operator": "Scan", "source": key, "required_columns": required}
+        info = pushdowns.get(key)
+        if info is not None:
+            total, selected, condition = info
+            scan["row_groups_total"] = total
+            scan["row_groups_selected"] = selected
+            scan["pushed_condition"] = condition
+        operators.append(scan)
 
     # One Join operator per step, in FROM/JOIN order; each reports the two
     # qualified ON keys normalised to prior-table (intermediate) left and
