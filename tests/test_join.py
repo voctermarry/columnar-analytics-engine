@@ -13,6 +13,7 @@ from columnar_analytics import (
     QueryValidationError,
     Schema,
     Table,
+    explain_files,
     query_file,
     query_files,
     write_file,
@@ -364,14 +365,27 @@ def test_query_files_unreferenced_source_not_read(tmp_path):
         "SELECT * FROM l INNER JOIN r ON l.k > r.k",          # non-equality ON
         "SELECT * FROM l INNER JOIN r ON k = r.k",            # unqualified ON key
         "SELECT * FROM l INNER JOIN r ON l.k = r.k AND l.id = 1",  # compound ON
-        "SELECT * FROM l INNER JOIN r ON l.k = r.k INNER JOIN r ON l.k = r.k",  # two joins
-        "SELECT * FROM l INNER JOIN r ON l.k = r.k LEFT JOIN r ON l.k = r.k",
         "SELECT * FROM l x INNER JOIN r ON l.k = r.k",        # alias
     ],
 )
 def test_join_syntax_errors_before_file_access(sql):
     missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
     with pytest.raises(QuerySyntaxError):
+        query_files(missing, sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A repeated table is no longer a syntax problem (chains are legal);
+        # it is rejected as a validation error before any file is read.
+        "SELECT * FROM l INNER JOIN r ON l.k = r.k INNER JOIN r ON l.k = r.k",
+        "SELECT * FROM l INNER JOIN r ON l.k = r.k LEFT JOIN r ON l.k = r.k",
+    ],
+)
+def test_duplicate_table_in_chain_is_validation_error(sql):
+    missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
+    with pytest.raises(QueryValidationError):
         query_files(missing, sql)
 
 
@@ -425,9 +439,20 @@ def test_unknown_table_qualifier(paths):
         query_files(paths, "SELECT z.id FROM l INNER JOIN r ON l.k = r.k")
 
 
-def test_on_key_from_wrong_side(paths):
-    with pytest.raises(QueryValidationError):
-        query_files(paths, "SELECT * FROM l INNER JOIN r ON r.k = l.k")
+def test_on_key_sides_are_swap_symmetric(paths):
+    # The ON equality accepts its two sides in either written order.
+    forward = "SELECT * FROM l INNER JOIN r ON l.k = r.k"
+    reversed_sql = "SELECT * FROM l INNER JOIN r ON r.k = l.k"
+    assert joined_rows(query_files(paths, reversed_sql)) == joined_rows(
+        query_files(paths, forward)
+    )
+    # A swapped ON in a later chain step works too, with the explain plan
+    # always reporting the preceding table as "left" and the new one as
+    # "right".
+    plan = explain_files(paths, "SELECT * FROM l LEFT JOIN r ON r.k = l.k")
+    join = next(op for op in plan["operators"] if op["operator"] == "Join")
+    assert join["left"] == {"table": "l", "column": "k"}
+    assert join["right"] == {"table": "r", "column": "k"}
 
 
 def test_on_key_same_table(paths):

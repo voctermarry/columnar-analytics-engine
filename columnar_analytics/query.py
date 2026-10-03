@@ -4,8 +4,8 @@ Public API:
 
 * :func:`query_file` -- run a ``SELECT ... FROM input [WHERE ...]`` query
   against one columnar file and return a :class:`~columnar_analytics.format.Table`
-* :func:`query_files` -- run a statement (optionally with one equi-join)
-  against a table-name to path mapping
+* :func:`query_files` -- run a statement (optionally with a chain of
+  equi-joins) against a table-name to path mapping
 * :func:`explain_file` / :func:`explain_files` -- parse, bind and plan the
   same statements without executing them; only file metadata is read
 * :class:`QuerySyntaxError` -- lexical / grammatical errors
@@ -164,43 +164,65 @@ and aggregates an aggregate query over zero selected rows still yields one
 output row (COUNT 0, the other aggregates NULL), unless HAVING removes it;
 with GROUP BY it yields zero rows.
 
-Two-file queries (:func:`query_files`) add one equi-join to the grammar::
+Multi-file queries (:func:`query_files`) add a deterministic chain of
+zero or more equi-joins to the grammar::
 
-    query := SELECT ... FROM left_table [join_kind JOIN right_table
-             ON left_table.column = right_table.column] ...
-    join_kind := INNER | LEFT | RIGHT | FULL OUTER
+    query := SELECT ... FROM t0
+             [(INNER | LEFT | RIGHT | FULL OUTER) JOIN t1
+              ON <qualified key> = <qualified key>
+              [(INNER | LEFT | RIGHT | FULL OUTER) JOIN t2
+               ON <qualified key> = <qualified key> ...]] ...
+
+Each JOIN step introduces exactly one table that has not appeared
+earlier in the statement; there are no aliases and a table may not
+repeat.  The ON clause of a step is a single equality; one side is a
+qualified column of the newly introduced table and the other side is a
+qualified column of any table introduced earlier (the two sides are
+accepted in either order).  Steps are evaluated in written order, each
+with the accumulated intermediate result on its left and the freshly
+scanned new table on its right, so the column schema is the FROM table
+followed by each joined table in JOIN order.
 
 ``sources`` maps table names to file paths; only the tables referenced by
-the statement are read.  Aliases, compound ON conditions, other join
-types, ``FULL`` without ``OUTER`` and a second join are rejected as syntax
-errors before any file is opened.  In a join query every column reference
-outside ``COUNT(*)`` must be qualified as ``table.column`` (either part may
-be a double-quoted identifier).  ``SELECT *`` emits the left schema
-followed by the right schema with ``table.column`` names; explicit
-projections keep their qualified names and aggregates keep the uppercase
-``FUNC(table.column)`` labels.  Join keys may share a type or mix int64
-with float64; NULL keys never match.  INNER JOIN emits every matching
-combination, LEFT JOIN also emits unmatched left rows with the right-side
-values set to NULL (the right result columns are nullable), RIGHT JOIN
-emits all right rows in right-file order (one right row's matches expand
-in left-file order) padding the left side with NULL (the left result
-columns are nullable), and FULL OUTER JOIN emits the LEFT JOIN output and
-then appends the unmatched right rows in right-file order (both sides are
-nullable).  Matched combinations always expand in left-file order (within
-one left row in right-file order) before WHERE / GROUP BY / HAVING /
-ORDER BY / LIMIT apply with their usual semantics.
+the statement are read -- a source that never appears in FROM/JOIN is
+never opened.  Aliases, compound ON conditions, non-equality ON
+conditions, other join types and ``FULL`` without ``OUTER`` are rejected
+as syntax errors before any file is opened.  In a statement containing
+at least one JOIN every column reference outside ``COUNT(*)`` must be
+qualified as ``table.column`` (either part may be a double-quoted
+identifier).  ``SELECT *`` emits the schemas in FROM/JOIN order with
+``table.column`` names; explicit projections keep their qualified names
+and aggregates keep the uppercase ``FUNC(table.column)`` labels.
+
+At every step the join keys may share a type or mix int64 with
+float64; NULL keys never match and duplicate keys produce the full
+combination.  INNER JOIN emits every matching combination, LEFT JOIN
+also emits unmatched intermediate rows with the new side set to NULL
+(the new table's result columns become nullable), RIGHT JOIN emits all
+new-table rows in the new file's order (one new row's matches expand in
+intermediate-result order) padding the intermediate side with NULL
+(those result columns become nullable), and FULL OUTER JOIN emits the
+LEFT JOIN output and then appends the unmatched new-table rows in the
+new file's order (both sides become nullable).  The intermediate result
+is the left input of each step, so its current row order drives INNER /
+LEFT / FULL expansion and RIGHT JOIN orders its matches by that same
+current order; outer padding of an earlier step is preserved by every
+later step.  WHERE / GROUP BY / HAVING / projection / DISTINCT / stable
+sorting / LIMIT all run only after the whole chain has been built.
 
 The multi-file entry points (:func:`query_files`, :func:`explain_files`)
-take an optional ``join_strategy`` of ``"hash"`` or ``"sort_merge"``.
-Both strategies accept the same statements and return identical column
-descriptions, values, NULL placement and row order; they differ only in
-how matching right rows are located (a right-key hash index versus
-sorting both sides on the key and merging equal-key runs).  With the
-argument omitted the historical join path is used and the explain plan
-is unchanged; with an explicit strategy the plan's Join operator gains a
-``strategy`` field of ``HASH`` or ``SORT_MERGE``.  A JOIN-less statement
-accepts either strategy but gains no extra operator, and an invalid
-strategy raises :class:`ValueError` before any source file is opened.
+take an optional ``join_strategy`` of ``"hash"`` or ``"sort_merge"``;
+an explicit strategy is applied to every join step.  Both strategies
+accept the same statements and return identical column descriptions,
+values, NULL placement and row order; they differ only in how matching
+right rows are located (a right-key hash index versus sorting both
+sides on the key and merging equal-key runs).  With the argument
+omitted the historical join path is used and the explain plan carries
+no strategy fields; with an explicit strategy every Join operator in
+the plan gains a ``strategy`` field of ``HASH`` or ``SORT_MERGE``.  A
+JOIN-less statement accepts either strategy but gains no extra
+operator, and an invalid strategy raises :class:`ValueError` before any
+source file is opened.
 """
 
 from __future__ import annotations
@@ -508,10 +530,16 @@ class _RefItem:
 
 @dataclass(frozen=True)
 class _Join:
-    """The single optional equi-join of a two-table query."""
+    """One equi-join step of a continuous (possibly multi-table) query.
+
+    Each step introduces one so-far-unused table as its right side; the
+    accumulated intermediate result is the left side.  ``left_key`` /
+    ``right_key`` carry the keys exactly as written -- either side may name
+    the new table, since ``ON`` accepts the equality in either order.
+    """
 
     kind: str  # "inner" | "left" | "right" | "full"
-    table: str  # right table name as spelled
+    table: str  # newly introduced table name as spelled
     table_quoted: bool
     left_key: tuple  # (table, table_quoted, column)
     right_key: tuple  # (table, table_quoted, column)
@@ -529,7 +557,9 @@ class _Select:
     having: tuple | None
     order_by: tuple[_RefItem, ...] | None
     limit: int | None
-    join: _Join | None = None
+    # Zero or more consecutive equi-join steps following FROM, in written
+    # order; the empty tuple is a single-table statement.
+    joins: tuple[_Join, ...] = ()
     # SELECT DISTINCT: deduplicate the projected rows (non-aggregate only).
     distinct: bool = False
 
@@ -570,24 +600,29 @@ class _Parser:
         items = tuple(self._parse_projection())
         self._expect_keyword("from")
         table_tok = self._expect_table_name()
-        join = None
+        joins: list[_Join] = []
         if self._allow_join:
-            if self._accept_keyword("inner"):
-                self._expect_keyword("join")
-                join = self._parse_join("inner")
-            elif self._accept_keyword("left"):
-                self._expect_keyword("join")
-                join = self._parse_join("left")
-            elif self._accept_word("right"):
-                self._expect_keyword("join")
-                join = self._parse_join("right")
-            elif self._accept_word("full"):
-                # Only the explicit FULL OUTER JOIN spelling is accepted;
-                # "right" / "full" / "outer" stay ordinary identifiers away
-                # from this clause so single-file behaviour is unchanged.
-                self._expect_word("outer")
-                self._expect_keyword("join")
-                join = self._parse_join("full")
+            # Zero or more consecutive join steps; each introduces exactly
+            # one so-far-unused table with a single-equality ON clause.
+            while True:
+                if self._accept_keyword("inner"):
+                    self._expect_keyword("join")
+                    joins.append(self._parse_join("inner"))
+                elif self._accept_keyword("left"):
+                    self._expect_keyword("join")
+                    joins.append(self._parse_join("left"))
+                elif self._accept_word("right"):
+                    self._expect_keyword("join")
+                    joins.append(self._parse_join("right"))
+                elif self._accept_word("full"):
+                    # Only the explicit FULL OUTER JOIN spelling is accepted;
+                    # "right" / "full" / "outer" stay ordinary identifiers away
+                    # from this clause so single-file behaviour is unchanged.
+                    self._expect_word("outer")
+                    self._expect_keyword("join")
+                    joins.append(self._parse_join("full"))
+                else:
+                    break
         where = None
         if self._accept_keyword("where"):
             where = self._parse_or()
@@ -620,7 +655,7 @@ class _Parser:
             having=having,
             order_by=order_by,
             limit=limit,
-            join=join,
+            joins=tuple(joins),
             distinct=distinct,
         )
 
@@ -2282,58 +2317,65 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     """Run ``sql`` against the tables named by ``sources``.
 
     ``sources`` maps table names to columnar file paths; only the tables
-    referenced by the statement are read.  The statement may join two of
-    them once (``INNER JOIN`` / ``LEFT JOIN`` / ``RIGHT JOIN`` /
-    ``FULL OUTER JOIN ... ON t1.col = t2.col``); see the module docstring
-    for the exact grammar and semantics.
+    referenced by the statement are read.  The statement may chain any
+    number of equi-joins (``INNER JOIN`` / ``LEFT JOIN`` / ``RIGHT JOIN`` /
+    ``FULL OUTER JOIN`` ... ``ON a.col = b.col``); each step introduces one
+    so-far-unused table and is evaluated with the accumulated intermediate
+    result on its left and the new table on its right.  See the module
+    docstring for the exact grammar and semantics.
 
-    ``join_strategy`` optionally selects the join algorithm: ``"hash"``
-    (a right-key hash lookup) or ``"sort_merge"`` (sort both sides on the
-    join key and merge the runs).  Both strategies accept the same
-    statements and return identical columns, values and row order; when
-    omitted the implicit historical join path (the hash path) is used.  A
-    statement without a JOIN accepts either strategy, which then adds no
-    operator and changes nothing.  A non-string or otherwise invalid
-    ``join_strategy`` raises :class:`ValueError` before any file is opened.
+    ``join_strategy`` optionally selects the join algorithm used for every
+    step: ``"hash"`` (a right-key hash lookup) or ``"sort_merge"`` (sort
+    both sides on the key and merge the runs).  Both strategies accept the
+    same statements and return identical columns, values and row order;
+    when omitted the implicit historical join path (the hash path) is
+    used.  A statement without a JOIN accepts either strategy, which then
+    adds no operator and changes nothing.  A non-string or otherwise
+    invalid ``join_strategy`` raises :class:`ValueError` before any file is
+    opened.
 
     A non-mapping or empty ``sources``, non-string keys or non-path values
     raise :class:`ValueError` before any file is touched.  Lexical and
-    grammatical errors (including join-keyword, ON and multiple-join
-    problems) raise :class:`QuerySyntaxError` before any file is read.
-    Unknown tables or columns, unqualified column references in a join
-    query, duplicate tables, misattributed or type-incompatible join keys
-    and duplicate result columns raise :class:`QueryValidationError`;
-    malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
-    other I/O failures propagate as :class:`OSError`.
+    grammatical errors (including join-keyword and ON problems) raise
+    :class:`QuerySyntaxError` before any file is read.  Unknown or
+    duplicate tables, ON clauses that do not connect the new table to a
+    preceding one, unknown or unqualified columns, type-incompatible join
+    keys and duplicate result columns raise
+    :class:`QueryValidationError`; malformed files raise
+    :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
+    failures propagate as :class:`OSError`.
     """
     strategy = _validate_join_strategy(join_strategy)
     paths = _validate_sources(sources)
     tokens = _tokenize(sql)
     select = _Parser(tokens, allow_join=True).parse()
-    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
-    if select.join is None:
-        rewritten = _rewrite_select(select, _single_table_resolver(left_key))
-        table = read_file(paths[left_key])
+    keys, steps = _resolve_join_chain(select, paths)
+    if not steps:
+        rewritten = _rewrite_select(select, _single_table_resolver(keys[0]))
+        table = read_file(paths[keys[0]])
         return _run_query(table, rewritten, expected_table=None)
 
-    join = select.join
-    right_key = _resolve_table_ref(join.table, join.table_quoted, tuple(paths))
-    if right_key == left_key:
-        raise QueryValidationError(f"duplicate table {right_key!r} in join")
-    on_left = _resolve_table_ref(join.left_key[0], join.left_key[1], (left_key, right_key))
-    on_right = _resolve_table_ref(join.right_key[0], join.right_key[1], (left_key, right_key))
-    if on_left != left_key or on_right != right_key:
-        raise QueryValidationError(
-            "ON keys must reference the left and right tables respectively"
-        )
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any read.
-    rewritten = _rewrite_select(select, _join_resolver(left_key, right_key))
-    left_table = read_file(paths[left_key])
-    right_table = read_file(paths[right_key])
-    combined = _build_joined_table(
-        left_key, left_table, right_key, right_table, join, strategy
-    )
+    rewritten = _rewrite_select(select, _chain_resolver(keys))
+
+    # The base table's columns carry "table.column" names from the first
+    # step on; every later step prefixes its own newly introduced columns.
+    combined = _qualify_table(read_file(paths[keys[0]]), keys[0])
+    for kind, new_key, prev_key, prev_col, new_col in steps:
+        right = read_file(paths[new_key])
+        schema = _join_step_schema(
+            combined.schema, new_key, right.schema, prev_key, prev_col, new_col, kind
+        )
+        left_idx = combined.schema.index(f"{prev_key}.{prev_col}")
+        right_idx = right.schema.index(new_col)
+        if strategy == "sort_merge":
+            columns = _sort_merge_join_columns(
+                combined, right, left_idx, right_idx, kind
+            )
+        else:
+            columns = _join_columns(combined, right, left_idx, right_idx, kind)
+        combined = Table._from_storage(schema, columns)
     return _run_query(combined, rewritten, expected_table=None)
 
 
@@ -2357,25 +2399,61 @@ def _referenced_source_paths(sources: Any, sql: str, join_strategy: Any = None) 
 
     Parsing-only counterpart of :func:`query_files`: no file is ever opened.
     Returns the paths in ``FROM`` / ``JOIN`` order (one entry for a
-    single-table statement, two for a join).  Source and join-strategy
-    validation raise :class:`ValueError`; lexical / grammatical errors
-    raise :class:`QuerySyntaxError`; unknown or ambiguous table names
-    raise :class:`QueryValidationError`.
+    single-table statement, one per join step plus the base otherwise).
+    Source and join-strategy validation raise :class:`ValueError`; lexical /
+    grammatical errors raise :class:`QuerySyntaxError`; unknown or
+    duplicate table names or an ON clause that does not connect the new
+    table to a preceding one raise :class:`QueryValidationError`.
     """
     _validate_join_strategy(join_strategy)
     paths = _validate_sources(sources)
     tokens = _tokenize(sql)
     select = _Parser(tokens, allow_join=True).parse()
-    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
-    referenced = [paths[left_key]]
-    if select.join is not None:
-        right_key = _resolve_table_ref(
-            select.join.table, select.join.table_quoted, tuple(paths)
-        )
-        if right_key == left_key:
-            raise QueryValidationError(f"duplicate table {right_key!r} in join")
-        referenced.append(paths[right_key])
-    return tuple(referenced)
+    keys, _steps = _resolve_join_chain(select, paths)
+    return tuple(paths[key] for key in keys)
+
+
+def _resolve_join_chain(select: _Select, paths: Mapping) -> tuple:
+    """Resolve the parsed FROM/JOIN chain against the ``sources`` mapping.
+
+    Returns ``(keys, steps)``: ``keys`` are the canonical table names in
+    ``FROM`` / ``JOIN`` order; ``steps`` has one oriented entry per join,
+    ``(kind, new_key, prev_key, prev_col, new_col)``, where ``prev_*``
+    names the qualified key on any preceding table and ``new_*`` the key
+    of the table the step introduces (the two ON sides are accepted in
+    either written order).  No file is touched: unknown / duplicate tables
+    and ON clauses that do not connect the new table to a preceding one
+    raise :class:`QueryValidationError`.
+    """
+    base_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
+    keys: list[str] = [base_key]
+    steps: list[tuple] = []
+    for join in select.joins:
+        new_key = _resolve_table_ref(join.table, join.table_quoted, tuple(paths))
+        if new_key in keys:
+            raise QueryValidationError(f"duplicate table {new_key!r} in join")
+        # The ON table refs may only name the new table or one introduced
+        # earlier in the chain -- a table joined later is still unknown here.
+        available = tuple(keys) + (new_key,)
+        first_key = _resolve_table_ref(join.left_key[0], join.left_key[1], available)
+        second_key = _resolve_table_ref(join.right_key[0], join.right_key[1], available)
+        first_is_new = first_key == new_key
+        second_is_new = second_key == new_key
+        if first_is_new == second_is_new:
+            # Either both sides name the new table or neither does: the ON
+            # clause does not connect the new table to a preceding one.
+            raise QueryValidationError(
+                "ON keys must connect the new table with a preceding table"
+            )
+        if first_is_new:
+            prev_key, prev_col = second_key, join.right_key[2]
+            new_col = join.left_key[2]
+        else:
+            prev_key, prev_col = first_key, join.left_key[2]
+            new_col = join.right_key[2]
+        steps.append((join.kind, new_key, prev_key, prev_col, new_col))
+        keys.append(new_key)
+    return tuple(keys), tuple(steps)
 
 
 def _resolve_table_ref(name: str, quoted: bool, candidates: tuple) -> str:
@@ -2405,13 +2483,15 @@ def _single_table_resolver(table_key: str):
     return resolve
 
 
-def _join_resolver(left_key: str, right_key: str):
+def _chain_resolver(table_keys: tuple):
+    available = tuple(table_keys)
+
     def resolve(table, table_quoted, column):
         if table is None:
             raise QueryValidationError(
                 f"column reference {column!r} must be qualified with a table name"
             )
-        key = _resolve_table_ref(table, table_quoted, (left_key, right_key))
+        key = _resolve_table_ref(table, table_quoted, available)
         return f"{key}.{column}"
 
     return resolve
@@ -2452,6 +2532,7 @@ def _rewrite_select(select: _Select, resolve) -> _Select:
         having=having,
         order_by=order_by,
         limit=select.limit,
+        joins=select.joins,
         distinct=select.distinct,
     )
 
@@ -2549,78 +2630,77 @@ def _rewrite_having_expr(node: tuple, resolve) -> tuple:
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
-def _build_joined_schema(
-    left_key: str,
+def _qualify_table(table: Table, key: str) -> Table:
+    """Prefix every column name of a freshly scanned source with ``"key."``.
+
+    The storage values are untouched; only the schema names change, so the
+    base table can participate in the same qualified-name binding as the
+    intermediate results of later join steps.
+    """
+    columns = [
+        ColumnSchema(f"{key}.{col.name}", col.type, col.nullable)
+        for col in table.schema.columns
+    ]
+    return Table._from_storage(Schema(columns), table._columns)
+
+
+def _join_step_schema(
     left_schema: Schema,
-    right_key: str,
-    right_schema: Schema,
-    join: _Join,
+    new_key: str,
+    new_schema: Schema,
+    prev_key: str,
+    prev_col: str,
+    new_col: str,
+    kind: str,
 ) -> Schema:
-    """Validate the ON keys and derive the combined post-join schema."""
-    left_col = join.left_key[2]
-    right_col = join.right_key[2]
+    """Validate one step's ON keys and derive its post-join schema.
+
+    The intermediate result keeps its already-prefixed columns; the newly
+    introduced table's columns are appended as ``"table.column"``.  An
+    outer side whose unmatched rows are padded with NULL gains nullable
+    result columns: LEFT pads the new side, RIGHT pads the intermediate
+    side, FULL pads both; INNER keeps the current nullability.
+    """
     try:
-        left_idx = left_schema.index(left_col)
+        left_idx = left_schema.index(f"{prev_key}.{prev_col}")
     except KeyError:
         raise QueryValidationError(
-            f"unknown column: {f'{left_key}.{left_col}'!r}"
+            f"unknown column: {f'{prev_key}.{prev_col}'!r}"
         ) from None
     try:
-        right_idx = right_schema.index(right_col)
+        right_idx = new_schema.index(new_col)
     except KeyError:
         raise QueryValidationError(
-            f"unknown column: {f'{right_key}.{right_col}'!r}"
+            f"unknown column: {f'{new_key}.{new_col}'!r}"
         ) from None
     left_type = left_schema.columns[left_idx].type
-    right_type = right_schema.columns[right_idx].type
+    right_type = new_schema.columns[right_idx].type
     if left_type != right_type and not {left_type, right_type} <= {"int64", "float64"}:
         raise QueryValidationError(
             f"join key types are incompatible: {left_type} and {right_type}"
         )
 
-    # The combined schema is left columns then right columns, named
-    # "table.column".  An outer side whose unmatched rows are padded with
-    # NULL gains nullable result columns: LEFT pads the right side, RIGHT
-    # pads the left side, FULL pads both; INNER keeps the file nullability.
-    pad_left = join.kind in ("right", "full")
-    pad_right = join.kind in ("left", "full")
+    # The intermediate schema stays first (FROM/JOIN order), the new
+    # table's columns follow it.  Padding follows the outer-join kind:
+    # RIGHT pads the accumulated left side, LEFT pads the new right side,
+    # FULL pads both; INNER keeps the file / previous-step nullability.
+    pad_left = kind in ("right", "full")
+    pad_right = kind in ("left", "full")
     combined_columns = [
-        ColumnSchema(f"{left_key}.{col.name}", col.type, True if pad_left else col.nullable)
+        ColumnSchema(col.name, col.type, True if pad_left else col.nullable)
         for col in left_schema.columns
     ] + [
         ColumnSchema(
-            f"{right_key}.{col.name}",
+            f"{new_key}.{col.name}",
             col.type,
             True if pad_right else col.nullable,
         )
-        for col in right_schema.columns
+        for col in new_schema.columns
     ]
     names = [col.name for col in combined_columns]
     if len(set(names)) != len(names):
         raise QueryValidationError("joined tables produce duplicate column names")
     return Schema(combined_columns)
-
-
-def _build_joined_table(
-    left_key: str,
-    left: Table,
-    right_key: str,
-    right: Table,
-    join: _Join,
-    strategy: str | None = None,
-) -> Table:
-    schema = _build_joined_schema(
-        left_key, left.schema, right_key, right.schema, join
-    )
-    left_idx = left.schema.index(join.left_key[2])
-    right_idx = right.schema.index(join.right_key[2])
-    if strategy == "sort_merge":
-        columns = _sort_merge_join_columns(
-            left, right, left_idx, right_idx, join.kind
-        )
-    else:
-        columns = _join_columns(left, right, left_idx, right_idx, join.kind)
-    return Table._from_storage(schema, columns)
 
 
 def _join_columns(
@@ -3135,7 +3215,7 @@ def explain_file(path: Any, sql: str) -> dict:
     schema = _schema_from_metadata(metadata)
     sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
     bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    return _build_explain(sources, schema, select, bound, join=None)
+    return _build_explain(sources, schema, select, bound, joins=())
 
 
 def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
@@ -3145,20 +3225,22 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     but only the metadata of the referenced files is read: unreferenced
     sources are never opened and no data section is ever touched.  The
     returned value is a JSON-serialisable ordered dict with the fixed
-    top-level keys ``sources``, ``operators`` and ``output``.
+    top-level keys ``sources``, ``operators`` and ``output``; a chained
+    statement lists its sources, Scans and Join operators in
+    ``FROM`` / ``JOIN`` order (one Join per step).
 
     ``join_strategy`` accepts the same ``"hash"`` / ``"sort_merge"``
-    values as :func:`query_files`; with an explicit strategy the plan's
-    ``Join`` operator carries a ``strategy`` field (``HASH`` /
-    ``SORT_MERGE``) matching the strategy the query and export entries
-    would use.  A statement without a JOIN accepts either strategy but
-    gains no join operator.  An invalid ``join_strategy`` raises
-    :class:`ValueError` before any file is touched.
+    values as :func:`query_files` and applies to every join step: with an
+    explicit strategy each ``Join`` operator carries a ``strategy`` field
+    (``HASH`` / ``SORT_MERGE``) matching the strategy the query and export
+    entries would use.  A statement without a JOIN accepts either
+    strategy but gains no join operator.  An invalid ``join_strategy``
+    raises :class:`ValueError` before any file is touched.
 
     A non-mapping or empty ``sources``, non-string keys or non-path
     values raise :class:`ValueError` before any file is touched;
     :class:`QuerySyntaxError` is raised before files are read as well.
-    Unknown tables or columns and other binding problems raise
+    Unknown or duplicate tables and other binding problems raise
     :class:`QueryValidationError`; malformed metadata or a declared-size
     mismatch raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
@@ -3167,46 +3249,48 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     paths = _validate_sources(sources)
     tokens = _tokenize(sql)
     select = _Parser(tokens, allow_join=True).parse()
-    left_key = _resolve_table_ref(select.table, select.table_quoted, tuple(paths))
-    if select.join is None:
-        rewritten = _rewrite_select(select, _single_table_resolver(left_key))
-        left_metadata = inspect_file(paths[left_key])
-        left_schema = _schema_from_metadata(left_metadata)
-        sources = ((left_key, left_metadata, left_schema),)
-        bound = _bind_select(rewritten, left_schema, expected_table=None)
-        return _build_explain(sources, left_schema, rewritten, bound, join=None)
+    keys, steps = _resolve_join_chain(select, paths)
+    if not steps:
+        rewritten = _rewrite_select(select, _single_table_resolver(keys[0]))
+        base_metadata = inspect_file(paths[keys[0]])
+        base_schema = _schema_from_metadata(base_metadata)
+        sources_desc = ((keys[0], base_metadata, base_schema),)
+        bound = _bind_select(rewritten, base_schema, expected_table=None)
+        return _build_explain(sources_desc, base_schema, rewritten, bound, joins=())
 
-    join = select.join
-    right_key = _resolve_table_ref(join.table, join.table_quoted, tuple(paths))
-    if right_key == left_key:
-        raise QueryValidationError(f"duplicate table {right_key!r} in join")
-    on_left = _resolve_table_ref(join.left_key[0], join.left_key[1], (left_key, right_key))
-    on_right = _resolve_table_ref(join.right_key[0], join.right_key[1], (left_key, right_key))
-    if on_left != left_key or on_right != right_key:
-        raise QueryValidationError(
-            "ON keys must reference the left and right tables respectively"
-        )
     # Qualifier checks (unqualified / unknown-table column references) do
     # not need the files and run before any metadata is read.
-    rewritten = _rewrite_select(select, _join_resolver(left_key, right_key))
-    left_metadata = inspect_file(paths[left_key])
-    right_metadata = inspect_file(paths[right_key])
-    left_schema = _schema_from_metadata(left_metadata)
-    right_schema = _schema_from_metadata(right_metadata)
-    combined_schema = _build_joined_schema(
-        left_key, left_schema, right_key, right_schema, join
-    )
-    sources = (
-        (left_key, left_metadata, left_schema),
-        (right_key, right_metadata, right_schema),
-    )
+    rewritten = _rewrite_select(select, _chain_resolver(keys))
+
+    sources_desc = []
+    combined_schema: Schema | None = None
+    for position, key in enumerate(keys):
+        metadata = inspect_file(paths[key])
+        schema = _schema_from_metadata(metadata)
+        sources_desc.append((key, metadata, schema))
+        if position == 0:
+            # The base table's post-step schema already uses "table.column".
+            combined_schema = Schema(
+                tuple(
+                    ColumnSchema(f"{key}.{col.name}", col.type, col.nullable)
+                    for col in schema.columns
+                )
+            )
+        else:
+            kind, _new_key, prev_key, prev_col, new_col = steps[position - 1]
+            # Metadata-only replay of the nullable / name derivation the
+            # execution path applies at each step; key compatibility is
+            # checked here as well, before binding.
+            combined_schema = _join_step_schema(
+                combined_schema, key, schema, prev_key, prev_col, new_col, kind
+            )
     bound = _bind_select(rewritten, combined_schema, expected_table=None)
     return _build_explain(
-        sources,
+        tuple(sources_desc),
         combined_schema,
         rewritten,
         bound,
-        join=(left_key, right_key, join),
+        joins=steps,
         strategy=strategy,
     )
 
@@ -3463,23 +3547,21 @@ def _build_explain(
     schema: Schema,
     select: _Select,
     bound: Mapping,
-    join: tuple | None,
+    joins: tuple,
     strategy: str | None = None,
 ) -> dict:
     referenced = _collect_required_indices(bound)
-    if join is not None:
-        # The ON keys feed the join even when neither is projected.
-        left_key, right_key, join_node = join
-        for key_name, column_name in (
-            (left_key, join_node.left_key[2]),
-            (right_key, join_node.right_key[2]),
-        ):
-            referenced.add(schema.index(f"{key_name}.{column_name}"))
+    # Every step's ON keys feed its join even when neither is projected.
+    # Each step is (kind, new_table, prev_table, prev_column, new_column).
+    if joins:
+        for _kind, new_key, prev_key, prev_col, new_col in joins:
+            referenced.add(schema.index(f"{prev_key}.{prev_col}"))
+            referenced.add(schema.index(f"{new_key}.{new_col}"))
 
     operators: list = []
     referenced_names = {schema.columns[i].name for i in referenced}
     for key, _metadata, source_schema in sources:
-        if join is None:
+        if not joins:
             required = [col.name for col in schema.columns if col.name in referenced_names]
         else:
             prefix = f"{key}."
@@ -3492,19 +3574,24 @@ def _build_explain(
             {"operator": "Scan", "source": key, "required_columns": required}
         )
 
-    if join is not None:
-        join_operator = {
-            "operator": "Join",
-            "type": join_node.kind.upper(),
-            "left": {"table": left_key, "column": join_node.left_key[2]},
-            "right": {"table": right_key, "column": join_node.right_key[2]},
-        }
-        # An explicitly requested strategy is reported on the Join operator;
-        # the implicit path (join_strategy omitted) keeps the historical
-        # operator shape with no strategy field.
-        if strategy is not None:
-            join_operator["strategy"] = _JOIN_STRATEGY_LABELS[strategy]
-        operators.append(join_operator)
+    if joins:
+        # One Join per step, in the same FROM/JOIN order as the Scans
+        # above.  "left" is the qualified key on a preceding table and
+        # "right" the key of the table the step introduces, regardless of
+        # the order they were written in ON.
+        for kind, new_key, prev_key, prev_col, new_col in joins:
+            join_operator = {
+                "operator": "Join",
+                "type": kind.upper(),
+                "left": {"table": prev_key, "column": prev_col},
+                "right": {"table": new_key, "column": new_col},
+            }
+            # An explicitly requested strategy is reported on every Join
+            # operator; the implicit path (join_strategy omitted) keeps the
+            # historical operator shape with no strategy field.
+            if strategy is not None:
+                join_operator["strategy"] = _JOIN_STRATEGY_LABELS[strategy]
+            operators.append(join_operator)
 
     if bound["where"] is not None:
         operators.append({"operator": "Filter", "condition": _expr_json(bound["where"])})
