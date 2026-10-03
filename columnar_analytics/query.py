@@ -229,19 +229,29 @@ only the column blocks its plan actually references (a join chain
 additionally reads each table's ON keys), and single-file statements --
 :func:`query_file` and JOIN-less :func:`query_files` -- push the
 AND-connected, type-compatible comparisons and IS [NOT] NULL conditions of
-WHERE down to the per-group statistics.  A row group is skipped only when
+WHERE down to the per-group statistics.  The same pushdown applies to a
+join chain whose every step is an INNER JOIN: each top-level AND leaf of
+WHERE that references a single source (a qualified column compared to a
+type-compatible literal, or a qualified column's IS [NOT] NULL) is pushed
+to that source's statistics, and each v2 source reads only the row groups
+its own pushed leaves cannot exclude; a chain containing a LEFT, RIGHT or
+FULL OUTER JOIN applies no row-group pushdown at all, and v1 sources in an
+all-INNER chain are still read in full.  A row group is skipped only when
 its statistics prove the pushed condition can never be TRUE for any of its
-rows; OR, NOT, CASE, arithmetic, column-to-column comparisons and
-undecidable ranges keep the group, and surviving rows are still filtered
-row by row with the full WHERE condition.  When every group is excluded
-the statement simply sees zero rows, so empty results, ``COUNT(*)``, other
+rows; OR, NOT, CASE, arithmetic, column-to-column or cross-source
+comparisons and undecidable ranges keep the group (without blocking the
+qualifying sibling leaves), and surviving rows are still filtered row by
+row with the full WHERE condition.  When every group is excluded the
+statement simply sees zero rows, so empty results, ``COUNT(*)``, other
 global aggregates and HAVING keep their usual semantics.  Both format
 versions return identical column descriptions, values, row order, sorting,
 LIMIT, join and export results for the same data and statement.  In the
-explain plan a v2 single-source Scan operator additionally carries
-``row_groups_total``, ``row_groups_selected`` and ``pushed_condition``
-(the pushed-down subset of the WHERE condition as a condition tree, or
-null); v1 plans are unchanged.
+explain plan a v2 Scan operator of a single-source statement or of an
+all-INNER join chain additionally carries ``row_groups_total``,
+``row_groups_selected`` and ``pushed_condition`` (the pushed-down subset
+of the WHERE condition as a condition tree, or null when the source has no
+qualifying leaf); v1 plans and the scans of outer-join chains are
+unchanged.
 """
 
 from __future__ import annotations
@@ -2426,6 +2436,71 @@ def _scan_pushdown_info(groups: list, bound: Mapping, schema: Schema) -> dict:
     }
 
 
+def _pushable_leaf_column(cond: tuple) -> tuple:
+    """The single bound column node of a pushable leaf."""
+    if cond[0] == "isnull":
+        return cond[1]
+    left, right = cond[2], cond[3]
+    return left if left[0] == "column" else right
+
+
+def _localise_pushable(cond: tuple, offset: int) -> tuple:
+    """Rebase a bound pushable leaf's column index to its source's schema.
+
+    The qualified ``table.column`` name is kept so the plan's condition
+    tree still shows the name as written in the join query.
+    """
+
+    def localise(node: tuple) -> tuple:
+        return ("column", node[1], node[2] - offset, node[3], node[4])
+
+    if cond[0] == "isnull":
+        return ("isnull", localise(cond[1]), cond[2])
+    left, right = cond[2], cond[3]
+    if left[0] == "column":
+        left = localise(left)
+    else:
+        right = localise(right)
+    return ("cmp", cond[1], left, right)
+
+
+def _extract_join_pushable(where, table_keys: tuple, schemas: Mapping) -> dict:
+    """Group the pushable AND-leaves of a bound join-chain WHERE per source.
+
+    ``schemas`` maps each table key to its own (unqualified) schema; the
+    combined schema the WHERE tree was bound against is the concatenation
+    of those schemas in ``table_keys`` order, so a bound column index maps
+    back to exactly one source.  Every pushable leaf references a single
+    qualified column, hence a single source; the returned leaves keep the
+    qualified column names but carry source-local column indices, ready
+    for :func:`_select_row_groups` against that source's group statistics.
+    """
+    spans = {}
+    start = 0
+    for key in table_keys:
+        spans[key] = (start, start + len(schemas[key].columns))
+        start = spans[key][1]
+    pushed: dict[str, list] = {key: [] for key in table_keys}
+    for cond in _extract_pushable(where):
+        index = _pushable_leaf_column(cond)[2]
+        for key in table_keys:
+            low, high = spans[key]
+            if low <= index < high:
+                pushed[key].append(_localise_pushable(cond, low))
+                break
+    return pushed
+
+
+def _join_scan_pushdown_info(groups: list, pushed: list, schema: Schema) -> dict:
+    """The v2 Scan statistics of one all-INNER-chain source."""
+    selected = _select_row_groups(groups, pushed, schema)
+    return {
+        "row_groups_total": len(groups),
+        "row_groups_selected": len(selected),
+        "pushed_condition": _pushed_condition_json(pushed),
+    }
+
+
 def _query_partitioned(
     path: Any, select: _Select, schema: Schema, expected_table
 ) -> Table:
@@ -2583,8 +2658,11 @@ def _run_join_chain_partitioned(
 
     Every v2 source is read restricted to the columns the plan actually
     references (its join keys included); v1 sources keep the historical
-    full read.  No row-group statistics pushdown is applied: WHERE runs
-    after the whole chain has been built.
+    full read.  When every step is an INNER JOIN, the WHERE clause's
+    pushable leaves are additionally pushed down to each v2 source's
+    row-group statistics: a pruned group could never contribute a joined
+    row whose full WHERE condition is TRUE.  A chain containing any outer
+    join applies no row-group pushdown and reads every group.
     """
     schemas = {}
     versions = {}
@@ -2609,6 +2687,11 @@ def _run_join_chain_partitioned(
         referenced.add(combined_schema.index(f"{step.new_key}.{step.new_col}"))
     referenced_names = {combined_schema.columns[i].name for i in referenced}
 
+    # Row-group statistics pushdown is only valid for an all-INNER chain.
+    pushed_by_key = None
+    if all(step.kind == "inner" for step in steps):
+        pushed_by_key = _extract_join_pushable(bound["where"], table_keys, schemas)
+
     def read_source(key: str) -> Table:
         if versions[key] != FORMAT_VERSION_PARTITIONED:
             return read_file(paths[key])
@@ -2617,9 +2700,15 @@ def _run_join_chain_partitioned(
             for col in schemas[key].columns
             if f"{key}.{col.name}" in referenced_names
         ]
-        return _read_partitioned_table(paths[key], columns=set(required)).project(
-            required
-        )
+        row_groups = None
+        if pushed_by_key is not None:
+            groups = inspect_row_groups(paths[key])
+            row_groups = _select_row_groups(
+                groups, pushed_by_key[key], schemas[key]
+            )
+        return _read_partitioned_table(
+            paths[key], columns=set(required), row_groups=row_groups
+        ).project(required)
 
     combined = _qualify_table(read_source(from_key), from_key)
     for step in steps:
@@ -3488,10 +3577,16 @@ def explain_file(path: Any, sql: str) -> dict:
     schema = _schema_from_metadata(metadata)
     sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
     bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    scan_extra = None
+    scan_extras = None
     if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-        scan_extra = _scan_pushdown_info(inspect_row_groups(path), bound, schema)
-    return _build_explain(sources, schema, select, bound, steps=(), scan_extra=scan_extra)
+        scan_extras = {
+            _SINGLE_TABLE_NAME: _scan_pushdown_info(
+                inspect_row_groups(path), bound, schema
+            )
+        }
+    return _build_explain(
+        sources, schema, select, bound, steps=(), scan_extras=scan_extras
+    )
 
 
 def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
@@ -3510,9 +3605,15 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     the query and export entries would use.  Sources and Scans are listed
     in FROM/JOIN order, one Join operator follows per step, and each
     source's ``required_columns`` cover only its own referenced columns.
-    A statement without a JOIN accepts either strategy but gains no join
-    operator.  An invalid ``join_strategy`` raises :class:`ValueError`
-    before any file is touched.
+    When every join step is an INNER JOIN, each v2 (row-group-partitioned)
+    source's Scan additionally carries ``row_groups_total``,
+    ``row_groups_selected`` and ``pushed_condition`` -- the same
+    statistics pushdown the query applies (a source without qualifying
+    WHERE leaves selects every group and reports a null condition); v1
+    sources and every scan of a chain containing an outer join keep the
+    plain Scan shape.  A statement without a JOIN accepts either strategy
+    but gains no join operator.  An invalid ``join_strategy`` raises
+    :class:`ValueError` before any file is touched.
 
     A non-mapping or empty ``sources``, non-string keys or non-path
     values raise :class:`ValueError` before any file is touched;
@@ -3532,13 +3633,15 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         from_schema = _schema_from_metadata(from_metadata)
         sources = ((from_key, from_metadata, from_schema),)
         bound = _bind_select(rewritten, from_schema, expected_table=None)
-        scan_extra = None
+        scan_extras = None
         if from_metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-            scan_extra = _scan_pushdown_info(
-                inspect_row_groups(paths[from_key]), bound, from_schema
-            )
+            scan_extras = {
+                from_key: _scan_pushdown_info(
+                    inspect_row_groups(paths[from_key]), bound, from_schema
+                )
+            }
         return _build_explain(
-            sources, from_schema, rewritten, bound, steps=(), scan_extra=scan_extra
+            sources, from_schema, rewritten, bound, steps=(), scan_extras=scan_extras
         )
 
     # Qualifier checks (unqualified / unknown-table column references) do
@@ -3565,6 +3668,27 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         current_schema = _build_joined_schema(current_schema, new_schema, step)
 
     bound = _bind_select(rewritten, current_schema, expected_table=None)
+
+    # An all-INNER chain pushes each source's qualifying WHERE leaves down
+    # to its row-group statistics, so every v2 Scan reports the same group
+    # counts the query would read; a chain with any outer join (and every
+    # v1 source) keeps the plain Scan shape.
+    scan_extras = None
+    if all(step.kind == "inner" for step in steps):
+        schemas_by_key = {
+            key: source_schema for key, _metadata, source_schema in source_entries
+        }
+        pushed_by_key = _extract_join_pushable(
+            bound["where"], table_keys, schemas_by_key
+        )
+        scan_extras = {}
+        for key, metadata, source_schema in source_entries:
+            if metadata["format_version"] != FORMAT_VERSION_PARTITIONED:
+                continue
+            scan_extras[key] = _join_scan_pushdown_info(
+                inspect_row_groups(paths[key]), pushed_by_key[key], source_schema
+            )
+
     return _build_explain(
         tuple(source_entries),
         current_schema,
@@ -3572,6 +3696,7 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
         bound,
         steps=steps,
         strategy=strategy,
+        scan_extras=scan_extras,
     )
 
 
@@ -3829,7 +3954,7 @@ def _build_explain(
     bound: Mapping,
     steps: tuple[_JoinStep, ...] = (),
     strategy: str | None = None,
-    scan_extra: Mapping | None = None,
+    scan_extras: Mapping | None = None,
 ) -> dict:
     referenced = _collect_required_indices(bound)
     for step in steps:
@@ -3850,13 +3975,14 @@ def _build_explain(
                 if f"{prefix}{col.name}" in referenced_names
             ]
         scan_operator = {"operator": "Scan", "source": key, "required_columns": required}
-        if scan_extra is not None:
-            # v2 (row-group-partitioned) single-source scans report the
-            # statistics pushdown: total/selected row groups and the
-            # pushed-down condition tree (null when nothing was pushed).
-            scan_operator["row_groups_total"] = scan_extra["row_groups_total"]
-            scan_operator["row_groups_selected"] = scan_extra["row_groups_selected"]
-            scan_operator["pushed_condition"] = scan_extra["pushed_condition"]
+        extra = scan_extras.get(key) if scan_extras is not None else None
+        if extra is not None:
+            # v2 (row-group-partitioned) scans report the statistics
+            # pushdown: total/selected row groups and the pushed-down
+            # condition tree (null when nothing was pushed).
+            scan_operator["row_groups_total"] = extra["row_groups_total"]
+            scan_operator["row_groups_selected"] = extra["row_groups_selected"]
+            scan_operator["pushed_condition"] = extra["pushed_condition"]
         operators.append(scan_operator)
 
     # One Join operator per step, in FROM/JOIN order; each reports the two

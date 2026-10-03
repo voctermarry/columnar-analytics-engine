@@ -389,6 +389,10 @@ JOIN_QUERIES = [
     "SELECT l.id, r.tag FROM l RIGHT JOIN r ON l.id = r.k",
     "SELECT l.id, r.tag FROM l FULL OUTER JOIN r ON l.id = r.k",
     "SELECT r.tag, COUNT(*) FROM l INNER JOIN r ON l.id = r.k GROUP BY r.tag ORDER BY r.tag",
+    "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k WHERE l.n > 5 AND r.rid >= 150",
+    "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k WHERE l.n > 5 OR r.rid >= 150",
+    "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k WHERE l.n IS NOT NULL AND r.rid < 250 ORDER BY l.id DESC LIMIT 1",
+    "SELECT DISTINCT r.tag FROM l INNER JOIN r ON l.id = r.k WHERE l.id <= 10 AND r.rid != 300",
 ]
 
 
@@ -417,14 +421,143 @@ def test_join_equivalence(join_files, sql, strategy):
         assert actual.columns == expected.columns
 
 
-def test_join_explain_keeps_scan_shape(join_files):
+def test_join_explain_inner_chain_pushdown_fields(join_files):
     left_v2, right_v2 = join_files["v2"]
+    plan = explain_files(
+        {"l": left_v2, "r": right_v2},
+        "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k "
+        "WHERE l.n > 50 AND r.rid > 250",
+    )
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    # l.n > 50 excludes the first left group (n max 30 there).
+    assert scans["l"]["row_groups_total"] == 4
+    assert scans["l"]["row_groups_selected"] == 3
+    assert scans["l"]["pushed_condition"] == {
+        "kind": "comparison",
+        "operator": ">",
+        "operands": [
+            {"kind": "column", "name": "l.n"},
+            {"kind": "literal", "type": "int64", "value": 50},
+        ],
+    }
+    # r.rid > 250 excludes the first right group (rid max 200 there).
+    assert scans["r"]["row_groups_total"] == 2
+    assert scans["r"]["row_groups_selected"] == 1
+    assert scans["r"]["pushed_condition"] == {
+        "kind": "comparison",
+        "operator": ">",
+        "operands": [
+            {"kind": "column", "name": "r.rid"},
+            {"kind": "literal", "type": "int64", "value": 250},
+        ],
+    }
+    # The Filter operator still carries the full condition.
+    assert "Filter" in [op["operator"] for op in plan["operators"]]
+
+
+def test_join_explain_pushdown_field_order_and_combination(join_files):
+    left_v2, right_v2 = join_files["v2"]
+    plan = explain_files(
+        {"l": left_v2, "r": right_v2},
+        "SELECT l.id FROM l INNER JOIN r ON l.id = r.k "
+        "WHERE l.n > 50 AND l.s IS NOT NULL AND r.rid > 1000",
+    )
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    # The pushdown fields follow required_columns in a fixed order.
+    assert list(scans["l"]) == [
+        "operator",
+        "source",
+        "required_columns",
+        "row_groups_total",
+        "row_groups_selected",
+        "pushed_condition",
+    ]
+    # Same-source leaves combine as AND in SQL order, keeping qualified names.
+    pushed = scans["l"]["pushed_condition"]
+    assert pushed["kind"] == "logic"
+    assert pushed["operator"] == "AND"
+    left_leaf, right_leaf = pushed["operands"]
+    assert left_leaf["operands"][0] == {"kind": "column", "name": "l.n"}
+    assert right_leaf["kind"] == "is_null"
+    assert right_leaf["operator"] == "IS NOT NULL"
+    assert right_leaf["operands"][0] == {"kind": "column", "name": "l.s"}
+    # r.rid > 1000 excludes every right group.
+    assert scans["r"]["row_groups_selected"] == 0
+    # The same plan is byte-stable.
+    assert json.dumps(plan) == json.dumps(
+        explain_files(
+            {"l": left_v2, "r": right_v2},
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.k "
+            "WHERE l.n > 50 AND l.s IS NOT NULL AND r.rid > 1000",
+        )
+    )
+
+
+def test_join_explain_no_qualifying_leaf(join_files):
+    left_v2, right_v2 = join_files["v2"]
+    # No WHERE at all: every group selected, null pushed conditions.
     plan = explain_files(
         {"l": left_v2, "r": right_v2}, "SELECT l.id FROM l INNER JOIN r ON l.id = r.k"
     )
-    scan = plan["operators"][0]
-    assert "row_groups_total" not in scan
-    assert "pushed_condition" not in scan
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    assert scans["l"]["row_groups_total"] == 4
+    assert scans["l"]["row_groups_selected"] == 4
+    assert scans["l"]["pushed_condition"] is None
+    assert scans["r"]["row_groups_total"] == 2
+    assert scans["r"]["row_groups_selected"] == 2
+    assert scans["r"]["pushed_condition"] is None
+
+    # OR / cross-source comparisons do not participate but do not block the
+    # qualifying sibling leaves either.
+    plan = explain_files(
+        {"l": left_v2, "r": right_v2},
+        "SELECT l.id FROM l INNER JOIN r ON l.id = r.k "
+        "WHERE (l.n > 1000 OR r.rid = 100) AND l.id = r.rid AND r.rid > 250",
+    )
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    assert scans["l"]["row_groups_selected"] == 4
+    assert scans["l"]["pushed_condition"] is None
+    assert scans["r"]["row_groups_selected"] == 1
+    assert scans["r"]["pushed_condition"]["operator"] == ">"
+
+
+def test_join_explain_mixed_versions(join_files):
+    (left_v1, _), (_, right_v2) = join_files["v1"], join_files["v2"]
+    plan = explain_files(
+        {"l": left_v1, "r": right_v2},
+        "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k WHERE r.rid > 250",
+    )
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    # v1 scans keep the historical shape even in an all-INNER chain.
+    assert scans["l"] == {
+        "operator": "Scan",
+        "source": "l",
+        "required_columns": ["id"],
+    }
+    assert scans["r"]["row_groups_total"] == 2
+    assert scans["r"]["row_groups_selected"] == 1
+    assert scans["r"]["pushed_condition"] is not None
+
+
+def test_join_explain_keeps_scan_shape(join_files):
+    left_v2, right_v2 = join_files["v2"]
+    # A chain containing any outer join applies no row-group pushdown.
+    for sql in (
+        "SELECT l.id FROM l LEFT JOIN r ON l.id = r.k WHERE l.n > 50",
+        "SELECT l.id FROM l RIGHT JOIN r ON l.id = r.k WHERE l.n > 50",
+        "SELECT l.id FROM l FULL OUTER JOIN r ON l.id = r.k WHERE l.n > 50",
+        "SELECT l.id FROM l INNER JOIN r ON l.id = r.k "
+        "LEFT JOIN r2 ON l.id = r2.k WHERE l.n > 50",
+    ):
+        sources = {"l": left_v2, "r": right_v2}
+        if "r2" in sql:
+            sources["r2"] = right_v2
+        plan = explain_files(sources, sql)
+        for op in plan["operators"]:
+            if op["operator"] == "Scan":
+                assert "row_groups_total" not in op
+                assert "row_groups_selected" not in op
+                assert "pushed_condition" not in op
 
 
 def test_join_reads_only_referenced_columns(join_files):
@@ -437,6 +570,68 @@ def test_join_reads_only_referenced_columns(join_files):
     assert result.column("r.tag") == ["x", "y"]
     with pytest.raises(ColumnarFormatError):
         query_files({"l": left_v2, "r": right_v2}, "SELECT r.rid FROM l INNER JOIN r ON l.id = r.k")
+
+
+@pytest.mark.parametrize("strategy", [None, "hash", "sort_merge"])
+def test_join_excluded_row_group_not_decoded(join_files, strategy):
+    left_v2, right_v2 = join_files["v2"]
+    # Group 2 of the left table holds n in [70, 80, 90]; "l.n < 50"
+    # excludes it, so its corrupted block is never read.
+    _corrupt_block(left_v2, 2, "n")
+    sql = "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k WHERE l.n < 50"
+    result = query_files({"l": left_v2, "r": right_v2}, sql, strategy)
+    assert result.column("l.id") == [1]
+    assert result.column("r.tag") == ["x"]
+    # A condition that keeps the corrupted group surfaces the block error.
+    with pytest.raises(ColumnarFormatError):
+        query_files(
+            {"l": left_v2, "r": right_v2},
+            "SELECT l.id FROM l INNER JOIN r ON l.id = r.k WHERE l.n > 5",
+            strategy,
+        )
+    # An outer join in the chain disables the pushdown: every group is read.
+    with pytest.raises(ColumnarFormatError):
+        query_files(
+            {"l": left_v2, "r": right_v2},
+            "SELECT l.id FROM l LEFT JOIN r ON l.id = r.k WHERE l.n < 50",
+            strategy,
+        )
+
+
+@pytest.mark.parametrize("strategy", [None, "hash", "sort_merge"])
+def test_join_pushdown_on_each_source(join_files, strategy):
+    left_v2, right_v2 = join_files["v2"]
+    # Both sources get a pushed leaf; the excluded groups on either side
+    # are corrupted and must stay unread.
+    _corrupt_block(left_v2, 0, "n")  # n in [10, None, 30]
+    _corrupt_block(right_v2, 0, "rid")  # rid in [100, 200]
+    sql = (
+        "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k "
+        "WHERE l.n > 50 AND r.rid > 250"
+    )
+    result = query_files({"l": left_v2, "r": right_v2}, sql, strategy)
+    assert result.row_count == 0
+    # The plan reports the same selected groups the query read.
+    plan = explain_files({"l": left_v2, "r": right_v2}, sql, strategy)
+    scans = {op["source"]: op for op in plan["operators"] if op["operator"] == "Scan"}
+    assert scans["l"]["row_groups_selected"] == 3
+    assert scans["r"]["row_groups_selected"] == 1
+
+
+def test_join_pushdown_mixed_versions(join_files):
+    (left_v1, _), (_, right_v2) = join_files["v1"], join_files["v2"]
+    # Only the v2 source is pruned; the corrupt excluded block stays unread.
+    _corrupt_block(right_v2, 0, "rid")
+    sql = (
+        "SELECT l.id, r.tag FROM l INNER JOIN r ON l.id = r.k "
+        "WHERE l.n < 50 AND r.rid > 250"
+    )
+    result = query_files({"l": left_v1, "r": right_v2}, sql)
+    assert result.row_count == 0
+    # The same statement against the all-v1 pair agrees.
+    left_v1b, right_v1 = join_files["v1"]
+    expected = query_files({"l": left_v1b, "r": right_v1}, sql)
+    assert result.columns == expected.columns
 
 
 @pytest.mark.parametrize("format", ["csv", "jsonl"])
