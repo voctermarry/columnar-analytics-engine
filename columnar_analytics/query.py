@@ -117,6 +117,18 @@ described above and stays an aggregate query.  A missing projection, a
 repeated DISTINCT or a misplaced DISTINCT keyword raises
 :class:`QuerySyntaxError` before any file is opened.
 
+The row-processing stages (WHERE, the ORDER BY sort keys, the SELECT
+expressions and the projection feeding SELECT DISTINCT) share one batched
+column-vector evaluator: each stage hands the next a set of valid row
+indices, and an expression is evaluated one batch of column values at a
+time instead of row by row.  The batched semantics are exactly the
+per-row semantics described above -- three-valued logic, NULL propagation,
+per-row CASE short-circuit, the int64 / float64 promotion and error rules
+and the stage order (so filtered or LIMIT-cut rows never evaluate the
+expressions of a later stage) are unchanged.  Joins, grouping, aggregation
+and HAVING keep their existing result organisation; the data they hand to
+the expression stages follows the same batched semantics.
+
 Searched CASE expressions
 (``CASE WHEN cond THEN result [WHEN ...] [ELSE result] END``; the simple
 ``CASE value WHEN ...`` form is not supported and at least one WHEN is
@@ -2125,6 +2137,11 @@ def _require_boolean(node: tuple, context: str) -> None:
 # ---------------------------------------------------------------------------
 # Three-valued-logic evaluation
 # ---------------------------------------------------------------------------
+#
+# ``_eval`` is the row-at-a-time reference semantics: every batched path
+# below visits exactly the same (row, subexpression) pairs, and the batch
+# drivers fall back to ``_eval`` to reproduce the historical first error of
+# a batch whenever the vectorised walk raises.
 
 
 def _eval(node: tuple, row: tuple) -> bool | None:
@@ -2196,21 +2213,25 @@ def _eval(node: tuple, row: tuple) -> bool | None:
         right = _eval(node[3], row)
         if left is None or right is None:
             return None
-        op = node[1]
-        if op == "=":
-            result = left == right
-        elif op == "!=":
-            result = left != right
-        elif op == "<":
-            result = left < right
-        elif op == "<=":
-            result = left <= right
-        elif op == ">":
-            result = left > right
-        else:  # ">="
-            result = left >= right
-        return bool(result)
+        return _compare_values(node[1], left, right)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+
+
+def _compare_values(op: str, left, right) -> bool:
+    """The boolean result of one comparison on two non-NULL values."""
+    if op == "=":
+        result = left == right
+    elif op == "!=":
+        result = left != right
+    elif op == "<":
+        result = left < right
+    elif op == "<=":
+        result = left <= right
+    elif op == ">":
+        result = left > right
+    else:  # ">="
+        result = left >= right
+    return bool(result)
 
 
 def _negate_value(value):
@@ -2254,6 +2275,193 @@ def _arith_value(op: str, left, right):
     if not (_INT64_MIN <= result <= _INT64_MAX):
         raise QueryValidationError("int64 arithmetic overflowed the int64 range")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Batched column-vector evaluation
+# ---------------------------------------------------------------------------
+#
+# The row-processing stages -- the WHERE filter, the ORDER BY sort keys,
+# the SELECT expressions and the projection feeding SELECT DISTINCT -- share
+# one batched evaluator.  Each stage hands the next a set of valid row
+# indices; an expression is evaluated one *batch* of rows at a time against
+# the source columns and yields one vector of result values aligned with
+# the batch, instead of re-entering the row-at-a-time control flow for
+# every row.  The semantics are exactly those of :func:`_eval`: NULL
+# propagation, three-valued logic, per-row CASE short-circuit (a result
+# expression is only ever evaluated for the rows routed to its branch) and
+# the int64 / float64 error rules are unchanged.  Because the batched walk
+# visits the same (row, subexpression) pairs as the row-wise walk, any
+# batch that contains a failing row raises; the drivers then re-run that
+# batch row by row so the reported error is byte-identical to the
+# historical one.
+
+_EVAL_BATCH_SIZE = 2048
+
+
+def _iter_batches(indices, size=_EVAL_BATCH_SIZE):
+    """Yield ``indices`` sliced into consecutive batches of at most ``size``."""
+    for start in range(0, len(indices), size):
+        yield indices[start : start + size]
+
+
+def _eval_batch(node, source_columns, batch) -> list:
+    """Evaluate one batch of a bound expression, returning a value vector.
+
+    ``batch`` is the current valid-row set (row indices into
+    ``source_columns``); the returned list holds one value per batch row, in
+    batch order.  A :class:`QueryValidationError` anywhere in the batch is
+    re-raised through the row-wise reference path so the exact historical
+    error (and its row order) surfaces.
+    """
+    try:
+        return _eval_batch_node(node, source_columns, batch)
+    except QueryValidationError:
+        # The batched walk visits the same (row, subexpression) pairs as
+        # _eval, so this row-wise pass raises the same first error the
+        # pre-vectorised engine reported for these rows.
+        return [_eval(node, _row_values(source_columns, i)) for i in batch]
+
+
+def _eval_expr_selection(node, source_columns, selected) -> list:
+    """Evaluate ``node`` over the row indices ``selected``, batch by batch.
+
+    Returns one list of values aligned with ``selected``; shared by the
+    WHERE filter, the ORDER BY sort keys and the SELECT projections.
+    """
+    values: list = []
+    for batch in _iter_batches(selected):
+        values.extend(_eval_batch(node, source_columns, batch))
+    return values
+
+
+def _filter_rows(where: tuple, source_columns, row_count: int) -> list[int]:
+    """The row indices whose WHERE condition evaluates to TRUE.
+
+    Batched counterpart of the historical row loop: rows are evaluated
+    batch by batch in file order, and FALSE and UNKNOWN both drop the row.
+    """
+    selected: list[int] = []
+    for batch in _iter_batches(list(range(row_count))):
+        mask = _eval_batch(where, source_columns, batch)
+        selected.extend(i for i, keep in zip(batch, mask) if keep is True)
+    return selected
+
+
+def _eval_batch_node(node: tuple, source_columns, batch) -> list:
+    """The batched semantics shared by every row-processing stage.
+
+    Evaluates the bound expression ``node`` for the row indices of ``batch``
+    and returns one value per batch row.  Short-circuiting nodes restrict
+    the rows their operands are evaluated on: AND / OR evaluate the right
+    operand only for rows the left operand did not decide, and CASE
+    evaluates each result expression only for the rows routed to it, so an
+    error inside an unhit branch or a decided-away operand never surfaces.
+    """
+    tag = node[0]
+    if tag == "literal":
+        return [node[1]] * len(batch)
+    if tag == "column":
+        column = source_columns[node[2]]
+        return [column[i] for i in batch]
+    if tag == "unary":
+        values = _eval_batch_node(node[1], source_columns, batch)
+        if not node[2]:  # unary plus keeps the value
+            return values
+        return [None if value is None else _negate_value(value) for value in values]
+    if tag == "arith":
+        left = _eval_batch_node(node[2], source_columns, batch)
+        right = _eval_batch_node(node[3], source_columns, batch)
+        op = node[1]
+        return [
+            None if lval is None or rval is None else _arith_value(op, lval, rval)
+            for lval, rval in zip(left, right)
+        ]
+    if tag == "not":
+        values = _eval_batch_node(node[1], source_columns, batch)
+        return [None if value is None else (not value) for value in values]
+    if tag == "isnull":
+        values = _eval_batch_node(node[1], source_columns, batch)
+        if node[2]:  # IS NOT NULL
+            return [value is not None for value in values]
+        return [value is None for value in values]
+    if tag in ("and", "or"):
+        left = _eval_batch_node(node[1], source_columns, batch)
+        # Rows the left operand already decided (FALSE for AND, TRUE for
+        # OR) never evaluate the right operand, exactly as row-wise
+        # short-circuiting; the rest form the sub-batch evaluated next.
+        if tag == "and":
+            undecided = [k for k, value in enumerate(left) if value is not False]
+        else:
+            undecided = [k for k, value in enumerate(left) if value is not True]
+        result = list(left)
+        if undecided:
+            right = _eval_batch_node(
+                node[2], source_columns, [batch[k] for k in undecided]
+            )
+            for k, rval in zip(undecided, right):
+                lval = left[k]
+                if tag == "and":
+                    result[k] = (
+                        False
+                        if rval is False
+                        else (None if lval is None or rval is None else True)
+                    )
+                else:
+                    result[k] = (
+                        True
+                        if rval is True
+                        else (None if lval is None or rval is None else False)
+                    )
+        return result
+    if tag == "cmp":
+        left = _eval_batch_node(node[2], source_columns, batch)
+        right = _eval_batch_node(node[3], source_columns, batch)
+        op = node[1]
+        return [
+            None if lval is None or rval is None else _compare_values(op, lval, rval)
+            for lval, rval in zip(left, right)
+        ]
+    if tag == "case":
+        # Conditions are tried in written order; only TRUE routes a row to
+        # the branch result.  Each result expression is evaluated on the
+        # sub-batch of rows routed to it, so division by zero, int64
+        # overflow or a non-finite float64 inside an unhit branch never
+        # raises; rows no branch claimed fall through to ELSE (or NULL).
+        result: list = [None] * len(batch)
+        remaining = list(range(len(batch)))
+        for condition, result_node in node[1]:
+            if not remaining:
+                break
+            cond_values = _eval_batch_node(
+                condition, source_columns, [batch[k] for k in remaining]
+            )
+            taken = [k for k, cond in zip(remaining, cond_values) if cond is True]
+            remaining = [
+                k for k, cond in zip(remaining, cond_values) if cond is not True
+            ]
+            if taken:
+                values = _eval_batch_node(
+                    result_node, source_columns, [batch[k] for k in taken]
+                )
+                for k, value in zip(taken, values):
+                    result[k] = value
+        if remaining and node[2] is not None:
+            values = _eval_batch_node(
+                node[2], source_columns, [batch[k] for k in remaining]
+            )
+            for k, value in zip(remaining, values):
+                result[k] = value
+        if node[3] == "float64":
+            # int64/float64 results unify to float64; ints become floats.
+            return [
+                float(value)
+                if isinstance(value, int) and not isinstance(value, bool)
+                else value
+                for value in result
+            ]
+        return result
+    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -3276,14 +3484,12 @@ def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
     row_count = table.row_count
     where = bound["where"]
 
+    # The WHERE filter runs batched over the source columns; only rows
+    # whose condition is TRUE reach the later stages.
     if where is None:
         selected = list(range(row_count))
     else:
-        selected = [
-            i
-            for i in range(row_count)
-            if _eval(where, tuple(col[i] for col in source_columns)) is True
-        ]
+        selected = _filter_rows(where, source_columns, row_count)
 
     if bound["mode"] == "plain":
         return _run_plain(table, select, bound, selected)
@@ -3344,25 +3550,45 @@ def _project_items(items, source_columns, selected) -> list:
                 tuple(source_columns[item.col_index][i] for i in selected)
             )
         else:  # "expr"
+            # Item-major like the historical path: the whole expression
+            # column is evaluated (batch by batch) before the next item.
             out_columns.append(
-                tuple(
-                    _eval(item.expr, _row_values(source_columns, i))
-                    for i in selected
-                )
+                tuple(_eval_expr_selection(item.expr, source_columns, selected))
             )
     return out_columns
 
 
 def _project_item_rows(items, source_columns, selected) -> list[tuple]:
-    return [
-        tuple(
-            source_columns[item.col_index][i]
+    # DISTINCT projection: the historical evaluation order is row-major
+    # (every item of a row before the next row), so each batch evaluates
+    # every item over its rows and a failure re-runs the batch row by row
+    # to surface the exact historical error.
+    rows: list[tuple] = []
+    for batch in _iter_batches(selected):
+        rows.extend(_project_item_batch(items, source_columns, batch))
+    return rows
+
+
+def _project_item_batch(items, source_columns, batch) -> list[tuple]:
+    try:
+        columns = [
+            [source_columns[item.col_index][i] for i in batch]
             if item.kind == "column"
-            else _eval(item.expr, _row_values(source_columns, i))
+            else _eval_batch_node(item.expr, source_columns, batch)
             for item in items
-        )
-        for i in selected
-    ]
+        ]
+    except QueryValidationError:
+        # Reproduce the historical row-major error for this batch.
+        return [
+            tuple(
+                source_columns[item.col_index][i]
+                if item.kind == "column"
+                else _eval(item.expr, _row_values(source_columns, i))
+                for item in items
+            )
+            for i in batch
+        ]
+    return [tuple(column[k] for column in columns) for k in range(len(batch))]
 
 
 def _deduplicate_rows(rows: list[tuple], schema: Schema) -> list[tuple]:
@@ -3557,15 +3783,16 @@ def _make_row_comparator(
 ):
     # Sort keys are computed for every row that passed WHERE, before the
     # stable sort and LIMIT; expression keys (SELECT aliases) are evaluated
-    # here, so their errors surface even for rows LIMIT would cut.
+    # here, batch by batch over the surviving rows, so their errors surface
+    # even for rows LIMIT would cut.
     key_sources: list[tuple] = []
     for entry in order_by:
         if entry[0] == "col":
             key_sources.append((source_columns[entry[1]], entry[2], entry[3]))
         else:  # "expr"
-            values = {
-                i: _eval(entry[1], _row_values(source_columns, i)) for i in selected
-            }
+            values = dict(
+                zip(selected, _eval_expr_selection(entry[1], source_columns, selected))
+            )
             key_sources.append((values, entry[2], entry[3]))
 
     def compare(a: int, b: int) -> int:
