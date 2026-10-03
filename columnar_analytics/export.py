@@ -7,12 +7,13 @@ Public API:
 * :class:`ValueError` -- an unknown format or a destination that aliases a
   referenced source file
 
-The exports reuse the existing single-/two-file query layer unchanged: the
-accepted SQL subset, binding rules, join order, NULL and type semantics and
-deterministic ordering are all :mod:`columnar_analytics.query` behaviour.
-``export_query_files`` additionally forwards an optional ``join_strategy``
-(``"hash"`` / ``"sort_merge"``) to the two-file query layer; both
-strategies produce byte-identical exports.  No query syntax is added here.
+The exports reuse the single-/multi-file query layer unchanged: the
+accepted SQL subset, binding rules, chained join order, NULL and type
+semantics and deterministic ordering are all :mod:`columnar_analytics.query`
+behaviour.  ``export_query_files`` additionally forwards an optional
+``join_strategy`` (``"hash"`` / ``"sort_merge"``) which the query layer
+applies to every join step; both strategies produce byte-identical
+exports.  No query syntax is added here.
 
 Both formats are UTF-8 without a BOM and use LF line endings.  CSV always
 writes a header line with the result column names in schema order and quotes

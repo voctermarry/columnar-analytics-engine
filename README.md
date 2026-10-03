@@ -6,7 +6,8 @@
 （`SELECT` 投影、`SELECT DISTINCT` 结果行去重、`WHERE` 过滤、`GROUP BY` 分组与
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
 聚合（均支持参数级 `DISTINCT`，如 `COUNT(DISTINCT 列)`）、分组后 `HAVING` 过滤、`ORDER BY` 稳定排序与 `LIMIT` Top-N）；查询只读取文件、不修改文件。
-另提供两文件查询入口，支持一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接。
+另提供多文件查询入口，支持在 FROM 后确定性地连续连接零个或多个表，每步为
+`INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接。
 对应的 `explain_file` / `explain_files`（命令行 `explain` / `explain-files`）
 只解析、绑定并生成逻辑计划，仅读文件元数据、不执行查询。
 查询结果还可通过 `export_query_file` / `export_query_files`
@@ -34,7 +35,7 @@ python -m pytest
 columnar-analytics-engine version                       # 打印版本号
 columnar-analytics-engine inspect <path>                # 输出文件元数据 JSON
 columnar-analytics-engine query <path> "<sql>"          # 对单个文件执行 SQL，输出结果 JSON
-columnar-analytics-engine query-files <sources-json> "<sql>" [--join-strategy hash|sort_merge]   # 对映射的多表执行 SQL（可含一次连接）
+columnar-analytics-engine query-files <sources-json> "<sql>" [--join-strategy hash|sort_merge]   # 对映射的多表执行 SQL（可含连续连接）
 columnar-analytics-engine explain <path> "<sql>"        # 只解析/绑定并输出单文件语句的计划 JSON
 columnar-analytics-engine explain-files <sources-json> "<sql>" [--join-strategy hash|sort_merge]  # 只解析/绑定并输出多表语句的计划 JSON
 columnar-analytics-engine export <path> "<sql>" <dest> [--format csv|jsonl]   # 执行单文件查询并导出结果文件
@@ -72,15 +73,17 @@ UTF-8 JSON 输出到标准输出，顶层键依次为 `columns`、`rows`；`colu
 
 - `sources` 按 `FROM`、`JOIN` 顺序列出，每项含 `name`、`row_count` 与按源 schema
   顺序的 `columns`（每列 `name`、`type`、`nullable`）。
-- `operators` 依次包含实际存在的阶段：非 DISTINCT 语句的顺序为 `Scan`、`Join`、`Filter`、
+- `operators` 依次包含实际存在的阶段：有连接时所有 `Scan`（按 FROM/JOIN 顺序）
+  先列出，然后每步一个同序 `Join`，之后依次为 `Filter`、
   `Aggregate`、`Having`、`Sort`、`Limit`、`Project`；`SELECT DISTINCT` 语句在扫描、
   连接与过滤阶段之后按 `Project`、`Distinct`、`Sort`、`Limit` 的顺序给出；缺少的阶段省略：
   - 每个被引用源一个 `Scan`，`required_columns` 按源 schema 顺序给出语句引用的列
     （投影、WHERE、GROUP BY、HAVING 分组列与聚合参数、ORDER BY 及连接键；仅 `COUNT(*)` 时为空）。
-  - `Join`（仅连接查询）给出 `type`（`INNER`/`LEFT`/`RIGHT`/`FULL`）与 `left`、`right`
-    两侧限定键（`table`、`column`）；显式传入 `join_strategy` 时额外给出 `strategy`
-    （`HASH`/`SORT_MERGE`），且与对应查询、导出实际使用的策略一致；未传策略时
-    `Join` 算子保持无 `strategy` 字段的既有结构。
+  - 每个连接步骤一个 `Join`（与对应步骤同序），给出 `type`（`INNER`/`LEFT`/`RIGHT`/`FULL`）
+    与 `left`、`right` 两侧限定键（`table`、`column`；左侧为该步之前已引入的表，右侧为该步
+    新引入的表，与 ON 书写方向无关）；显式传入 `join_strategy` 时每个 `Join` 额外给出
+    `strategy`（`HASH`/`SORT_MERGE`），且与对应查询、导出实际使用的策略一致；未传策略时
+    `Join` 算子保持无 `strategy` 字段的结构。
   - `Filter` 的 `condition` 是递归表达式树：内部节点含 `kind`、`operator`、`operands`，
     叶子是带 `type` 的 `literal`（`value` 为类型化字面量）或带 `name` 的绑定 `column`。
     searched CASE 节点的 `kind` 为 `case`，`cases` 按书写顺序给出
@@ -148,12 +151,14 @@ Python 入口 `export_query_file(path, sql, destination, format="csv")` 与
 - `read_file(path, *, columns=None)`：读回表；`columns` 按调用方顺序投影部分列
 - `inspect_file(path)`：只读元数据（行数、每列 NULL 数、min/max）
 - `query_file(path, sql)`：对单个文件执行 SQL，成功返回 `Table`
-- `query_files(sources, sql, join_strategy=None)`：对表名→路径映射执行 SQL（可含一次两表连接），成功返回 `Table`；
-  `join_strategy` 可选 `"hash"` / `"sort_merge"`，二者结果与行序完全相同，省略时使用默认连接路径
+- `query_files(sources, sql, join_strategy=None)`：对表名→路径映射执行 SQL（FROM 后可连续连接多个表），成功返回 `Table`；
+  `join_strategy` 可选 `"hash"` / `"sort_merge"`，显式指定时应用于每一步，两种策略结果与行序完全相同，
+  省略时使用默认连接路径
 - `explain_file(path, sql)`：只读元数据，返回单文件语句的有序计划字典（键为
   `sources`、`operators`、`output`），不执行查询、不读数据段
 - `explain_files(sources, sql, join_strategy=None)`：同上，面向多表语句；未被引用的 sources 不会被打开；
-  显式传入 `join_strategy` 时计划的 `Join` 算子带 `strategy` 字段（`HASH`/`SORT_MERGE`），
+  sources/Scans 与每步一个的 `Join` 按 FROM/JOIN 顺序排列，显式传入 `join_strategy` 时每个
+  `Join` 算子带 `strategy` 字段（`HASH`/`SORT_MERGE`），
   无 JOIN 时策略不产生算子；非法策略在打开任何源文件前抛 `ValueError`
 - `export_query_file(path, sql, destination, format="csv")`：执行单文件查询并把结果
   原子导出到 `destination`（`csv` 或 `jsonl`，默认 `csv`），成功返回写出行数
@@ -327,53 +332,62 @@ FROM input
   缺值/负数/小数/越界等统一抛 `QuerySyntaxError`，且在访问文件之前识别；
   文件损坏仍抛 `ColumnarFormatError`，系统错误保留 `OSError`。
 
-## 两文件连接查询
+## 连续连接查询
 
 `query_files(sources, sql)` 与 `columnar-analytics-engine query-files <sources-json> <sql>`
-在单文件语法基础上支持一次等值连接；`sources` 是表名到文件路径的非空映射
-（命令行用同一结构的 JSON 对象），只有被语句引用的表对应的文件会被读取：
+在单文件语法基础上支持确定性的连续连接；`sources` 是表名到文件路径的非空映射
+（命令行用同一结构的 JSON 对象），只有被语句引用的表对应的文件会被读取。FROM 表之后
+可连续出现零个或多个连接子句，每步引入一个此前未使用的表：
 
 ```sql
-SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN | RIGHT JOIN | FULL OUTER JOIN] 右表 ON 左表.列 = 右表.列
+SELECT ... FROM 起始表
+  {INNER JOIN | LEFT JOIN | RIGHT JOIN | FULL OUTER JOIN} 新表
+  ON (此前任一表.列 = 新表.列 | 新表.列 = 此前任一表.列)
+  [ ...更多连接步骤... ]
 [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 ```
 
-- 不支持别名、复合 `ON`、其他连接类型、`FULL` 后缺 `OUTER`（`RIGHT`/`LEFT` 后不接
-  `OUTER`）或第二次连接；词法错误、连接关键字缺失或错位、非法 `ON`、超过一次连接
+- 不支持别名、重复表、复合 `ON`、非等值 `ON`、其他连接类型、`FULL` 后缺 `OUTER`
+  （`RIGHT`/`LEFT` 后不接 `OUTER`）；词法错误、连接关键字残缺、缺少 `ON`、非法 `ON`
   抛 `QuerySyntaxError`，且在读取任何源文件之前判定。`RIGHT`、`FULL`、`OUTER` 仅在
   连接子句位置具有关键字含义，其他位置（列名、表名）仍按普通标识符处理，单文件
   查询与既有行为完全一致。
 - 连接查询中除 `COUNT(*)` 外的列引用都必须写成 `表名.列名`（两部分都可用双引号
-  标识符，延续精确匹配与 `""` 转义语义）；未限定列、未知表或列、重复表、连接键
-  来源错误（左右颠倒或来自同一表）、键类型不兼容、重复结果列抛
-  `QueryValidationError`。非连接查询沿用单表语义，列可限定也可不限定。
-- `SELECT *` 按左、右 schema 顺序输出，列名为 `表名.列名`；显式投影保留限定名，
-  聚合结果列名沿用大写函数格式并含限定参数（如 `SUM(r.x)`）。
+  标识符，延续精确匹配与 `""` 转义语义）；未限定列、未知或重复表、未知列、ON 未把
+  新表与此前任一表连接（同一侧或两表都不是新表）、键类型不兼容、重复结果列抛
+  `QueryValidationError`。ON 等号两侧可交换。非连接查询沿用单表语义，列可限定也可
+  不限定。
+- `SELECT *` 按 FROM/JOIN 顺序展开所有引用表的 schema，列名为 `表名.列名`；显式投影
+  保留限定名，聚合结果列名沿用大写函数格式并含限定参数（如 `SUM(r.x)`）。
 - 连接键类型须相同，或一为 int64 一为 float64；NULL 键永不匹配，重复键产生完整
-  组合。`INNER JOIN` 输出全部匹配组合；`LEFT JOIN` 还输出未匹配左行并把右侧值置为
-  NULL（右侧结果列 nullable 为 true）；`RIGHT JOIN` 保留全部右行，按右文件原始行序
-  排列，同一右行的匹配组合按左文件原始行序展开，未匹配时左侧列补 NULL（左侧结果列
-  nullable 为 true）；`FULL OUTER JOIN` 先按 LEFT JOIN 顺序输出匹配组合与未匹配左行，
-  再按右文件原始行序追加未匹配右行并把左侧列补 NULL（两侧结果列均 nullable）。
-  匹配组合按左文件原始行序、同一左行内按右文件原始行序展开，之后 `WHERE`、
-  `DISTINCT` 去重、`GROUP BY`、聚合、`HAVING`、`ORDER BY`、`LIMIT` 按单文件语义处理，
-  补出的 NULL 参与既有三值逻辑、分组与排序；没有显式排序时相同输入与 SQL 重复执行
-  输出字节一致。
+  组合。每一步以当前中间结果为左、新表为右：`INNER JOIN` 输出全部匹配组合；
+  `LEFT JOIN` 还输出未匹配的当前行并把新表一侧值置为 NULL（新表结果列 nullable 为
+  true）；`RIGHT JOIN` 按新表文件原始行序输出全部新行，同一新行的匹配组合按当前行序
+  展开，未匹配时把此前所有表的列补 NULL（中间结果各列均变为 nullable）；
+  `FULL OUTER JOIN` 先按 LEFT JOIN 顺序输出匹配组合与未匹配当前行，再按新表文件原始
+  行序追加未匹配新行（全部结果列 nullable）。INNER/LEFT/FULL 按当前行序展开、同一
+  当前行内按新表文件行序展开匹配组合；逐步推导 nullable（某步变 nullable 的列在后续
+  步骤保持 nullable）。全部连接完成后再执行 `WHERE`、`DISTINCT` 去重、`GROUP BY`、
+  聚合、`HAVING`、`ORDER BY`、`LIMIT`，补出的 NULL 参与既有三值逻辑、分组与排序；
+  没有显式排序时相同输入与 SQL 重复执行输出字节一致。
 - 多文件 Python 入口（`query_files`、`explain_files`）与命令行（`query-files`、
   `explain-files`、`export-files` 的 `--join-strategy`）可选指定连接算法：
-  `hash` 对右文件非空键建哈希索引，`sort_merge` 将两侧按键稳定排序后归并等值键段。
-  两种策略接受完全相同的 INNER/LEFT/RIGHT/FULL 等值连接、键类型兼容、NULL 与重复键
-  规则，对相同 sources 与 SQL 返回的列描述、值、NULL 位置和行序完全一致（int64/
-  float64 混合键、正负零、重复值、可空键均无差异），查询 JSON 与导出文件重复执行
-  字节稳定。未传参数时继续使用既有连接路径，调用签名、结果与解释计划结构不变；无
-  JOIN 的合法语句可传任一策略但不产生额外算子。显式传策略时，explain 的 `Join`
-  算子增加 `strategy` 字段（值为 `HASH` 或 `SORT_MERGE`），连接类型分别显示
-  `INNER` / `LEFT` / `RIGHT` / `FULL`，并与查询、导出实际策略一致；解释仍只读被引用
-  源元数据。参数不是字符串或不是两个允许值之一时，Python 入口在打开任何源文件前抛
+  `hash` 对右侧非空键建哈希索引，`sort_merge` 将两侧按键稳定排序后归并等值键段；
+  显式策略应用于每一个连接步骤。两种策略接受完全相同的 INNER/LEFT/RIGHT/FULL 等值
+  连接、键类型兼容、NULL 与重复键规则，对相同 sources 与 SQL 返回的列描述、值、
+  NULL 位置和行序完全一致（int64/float64 混合键、正负零、重复值、可空键均无差异），
+  查询 JSON 与导出文件重复执行字节稳定。未传参数时继续使用默认连接路径，计划中的
+  `Join` 无 `strategy` 字段；无 JOIN 的合法语句可传任一策略但不产生额外算子。显式传
+  策略时，explain 每个 `Join` 算子增加 `strategy` 字段（值为 `HASH` 或
+  `SORT_MERGE`），连接类型分别显示 `INNER` / `LEFT` / `RIGHT` / `FULL`，`left`/`right`
+  分别记录该步此前表与新表的限定键，并与查询、导出实际策略一致；解释仍只读被引用
+  源元数据，sources 与 Scans 按 FROM/JOIN 顺序排列、`required_columns` 归属各源。
+  参数不是字符串或不是两个允许值之一时，Python 入口在打开任何源文件前抛
   `ValueError`，命令行以状态码 2 失败、标准输出为空、标准错误只写异常消息。
 - `sources` 非映射或为空、键不是非空字符串、值不是路径对象时抛 `ValueError`，
-  且不会访问任何文件；已引用文件损坏仍抛 `ColumnarFormatError`，系统错误保留
-  `OSError`。
+  且不会访问任何文件；导出时目标路径与任一实际引用源同路径也抛 `ValueError`，且仅在
+  查询与编码成功后原子替换目标；已引用文件损坏仍抛 `ColumnarFormatError`，系统错误
+  保留 `OSError`。
 
 ## 文件格式概览
 
@@ -392,8 +406,10 @@ SELECT ... FROM 左表 [INNER JOIN | LEFT JOIN | RIGHT JOIN | FULL OUTER JOIN] �
   `ORDER BY`、`LIMIT`；DISTINCT 不与 `GROUP BY`/`HAVING`/聚合投影组合，不支持
   simple CASE、
   裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
-  表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。两文件入口额外支持
-  一次 `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接
-  （无别名、无复合 ON、无第二次连接；`FULL` 必须写作 `FULL OUTER`，`LEFT`/`RIGHT` 不接
-  `OUTER`），连接查询中标量表达式的列引用同样必须限定表名。
+  表达式或未分组列、聚合查询 SELECT 中的标量表达式、连接等。多文件入口额外支持
+  在 FROM 后确定性地连续连接零个或多个表，每步为
+  `INNER JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` 等值连接
+  （每步仅引入一个未使用的表；无别名、无重复表、无复合或非等值 ON；
+  `FULL` 必须写作 `FULL OUTER`，`LEFT`/`RIGHT` 不接 `OUTER`），连接查询中标量
+  表达式的列引用同样必须限定表名。
 - 压缩仅支持 `none` 与 `zlib`；字典编码仅可用于 utf8 列。

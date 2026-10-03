@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     query_parser = sub.add_parser("query", help="query a columnar file with SQL and print JSON")
     query_parser.add_argument("path", help="path to the columnar file")
     query_parser.add_argument("sql", help="SELECT statement to run against the file")
-    query_files_parser = sub.add_parser("query-files", help="query two columnar files with a join and print JSON")
+    query_files_parser = sub.add_parser("query-files", help="query mapped columnar files with a deterministic join chain and print JSON")
     query_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
     query_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
     query_files_parser.add_argument(
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     export_parser.add_argument("sql", help="SELECT statement to run against the file")
     export_parser.add_argument("destination", help="path of the file to write")
     export_parser.add_argument("--format", default="csv", help="export format: csv (default) or jsonl")
-    export_files_parser = sub.add_parser("export-files", help="query mapped tables with a join and export the result as CSV or JSONL")
+    export_files_parser = sub.add_parser("export-files", help="query mapped tables with a join chain and export the result as CSV or JSONL")
     export_files_parser.add_argument("sources", help="JSON object mapping table names to columnar file paths")
     export_files_parser.add_argument("sql", help="SELECT statement to run against the mapped tables")
     export_files_parser.add_argument("destination", help="path of the file to write")

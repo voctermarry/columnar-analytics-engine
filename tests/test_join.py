@@ -1,4 +1,7 @@
-"""Tests for the two-file join query layer and the ``query-files`` CLI command."""
+"""Tests for the (single-step) join query layer and the ``query-files`` CLI command.
+
+Chains of several join steps are covered in ``test_chained_join.py``.
+"""
 
 from __future__ import annotations
 
@@ -364,8 +367,6 @@ def test_query_files_unreferenced_source_not_read(tmp_path):
         "SELECT * FROM l INNER JOIN r ON l.k > r.k",          # non-equality ON
         "SELECT * FROM l INNER JOIN r ON k = r.k",            # unqualified ON key
         "SELECT * FROM l INNER JOIN r ON l.k = r.k AND l.id = 1",  # compound ON
-        "SELECT * FROM l INNER JOIN r ON l.k = r.k INNER JOIN r ON l.k = r.k",  # two joins
-        "SELECT * FROM l INNER JOIN r ON l.k = r.k LEFT JOIN r ON l.k = r.k",
         "SELECT * FROM l x INNER JOIN r ON l.k = r.k",        # alias
     ],
 )
@@ -373,6 +374,18 @@ def test_join_syntax_errors_before_file_access(sql):
     missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
     with pytest.raises(QuerySyntaxError):
         query_files(missing, sql)
+
+
+def test_chained_join_repeated_table_is_validation_error():
+    # Chaining is grammatical; reusing a table is a binding-time error that
+    # still fires before any file is opened.
+    missing = {"l": "/nonexistent/l.caef", "r": "/nonexistent/r.caef"}
+    for sql in (
+        "SELECT * FROM l INNER JOIN r ON l.k = r.k INNER JOIN r ON l.k = r.k",
+        "SELECT * FROM l INNER JOIN r ON l.k = r.k LEFT JOIN r ON l.k = r.k",
+    ):
+        with pytest.raises(QueryValidationError):
+            query_files(missing, sql)
 
 
 def test_query_file_still_rejects_join(paths):
@@ -425,9 +438,13 @@ def test_unknown_table_qualifier(paths):
         query_files(paths, "SELECT z.id FROM l INNER JOIN r ON l.k = r.k")
 
 
-def test_on_key_from_wrong_side(paths):
-    with pytest.raises(QueryValidationError):
-        query_files(paths, "SELECT * FROM l INNER JOIN r ON r.k = l.k")
+def test_on_key_sides_are_exchangeable(paths):
+    # The new-table qualified key may appear on either side of the single
+    # ON equality; both spellings produce the same join.
+    normal = query_files(paths, "SELECT * FROM l INNER JOIN r ON l.k = r.k")
+    swapped = query_files(paths, "SELECT * FROM l INNER JOIN r ON r.k = l.k")
+    assert swapped.column_names == normal.column_names
+    assert joined_rows(swapped) == joined_rows(normal)
 
 
 def test_on_key_same_table(paths):
