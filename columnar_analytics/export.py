@@ -41,9 +41,9 @@ import tempfile
 from typing import Any
 
 from .format import Table
+from .join import _validate_join_strategy
 from .query import (
     _referenced_source_paths,
-    _validate_join_strategy,
     query_file,
     query_files,
 )

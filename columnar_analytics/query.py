@@ -230,6 +230,16 @@ field of ``HASH`` or ``SORT_MERGE``.  A JOIN-less statement accepts either
 strategy but gains no extra operator, and an invalid strategy raises
 :class:`ValueError` before any source file is opened.
 
+The algorithm selection is decoupled from everything described here:
+:mod:`columnar_analytics.join` owns the strategy registry and validation,
+the per-algorithm match lookup, key semantics, match expansion, outer NULL
+padding, deterministic row order and post-step nullability.  Each algorithm
+only produces a match relation; the join layer assembles the result and
+this module keeps parsing, qualified-name binding, key/type validation,
+grouping, sorting, plan description and export.  Adding an algorithm is a
+registry entry there -- no part of the query, explain or export path is
+copied or changed.
+
 The explain plan lists the referenced sources and their Scan operators in
 FROM/JOIN order with ``required_columns`` attributed to each source, then
 one Join operator per step in the same order, recording the step type and
@@ -301,6 +311,12 @@ from .format import (
     inspect_row_groups,
     read_file,
 )
+from .join import (
+    _derive_step_schema,
+    _execute_join,
+    _strategy_label,
+    _validate_join_strategy,
+)
 
 __all__ = [
     "QuerySyntaxError",
@@ -353,30 +369,11 @@ _AGG_NAMES = frozenset(("count", "sum", "avg", "min", "max"))
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
-# Optional join strategies for multi-file (join-chain) queries.  ``None``
-# keeps the implicit historical path (a right-key hash lookup).  ``HASH`` is that same path
-# requested explicitly; ``SORT_MERGE`` sorts both sides on the join key and
-# merges the runs.  Both produce byte-identical results; only the explicit
-# spellings surface in the explain plan.
-_JOIN_STRATEGIES = frozenset(("hash", "sort_merge"))
-_JOIN_STRATEGY_LABELS = {"hash": "HASH", "sort_merge": "SORT_MERGE"}
-
-
-def _validate_join_strategy(join_strategy: Any) -> str | None:
-    """Validate the optional ``join_strategy`` argument.
-
-    Returns the canonical lowercase strategy name, or ``None`` when the
-    caller did not request one.  Any other value (including a non-string)
-    raises :class:`ValueError`; callers run this before opening any file.
-    """
-    if join_strategy is None:
-        return None
-    if not isinstance(join_strategy, str) or join_strategy not in _JOIN_STRATEGIES:
-        allowed = ", ".join(sorted(_JOIN_STRATEGIES))
-        raise ValueError(
-            f"invalid join_strategy: {join_strategy!r}; expected one of {allowed}"
-        )
-    return join_strategy
+# Optional join strategies and their validation live in the join execution
+# layer (:mod:`columnar_analytics.join`), together with the algorithm
+# registry and explain-plan labels; ``_strategy_label`` /
+# ``_validate_join_strategy`` are imported above and reused by the query and
+# explain entry points.
 
 
 class QuerySyntaxError(Exception):
@@ -3262,9 +3259,11 @@ def _build_joined_schema(
 ) -> Schema:
     """Validate one step's ON keys and derive the combined post-step schema.
 
-    The intermediate (prior) schema already names its columns
-    ``table.column``; the freshly introduced table still carries its bare
-    schema and its columns are prefixed with the new table name here.
+    Name resolution, key-type compatibility and duplicate result names are
+    query-layer concerns and stay here (keeping their
+    :class:`QueryValidationError` classification); the resulting column
+    layout and outer-join nullability are derived by the shared join layer
+    so execution and the explain plan can never disagree.
     """
     prior_name = f"{step.prior_key}.{step.prior_col}"
     try:
@@ -3284,33 +3283,16 @@ def _build_joined_schema(
             f"join key types are incompatible: {prior_type} and {new_type}"
         )
 
-    # The combined schema keeps the prior columns (already qualified) and
-    # then appends the new table's columns named "new_table.column".  An
-    # outer side whose unmatched rows are padded with NULL gains nullable
-    # result columns: the intermediate is the join's left side, the new
-    # table its right side; LEFT pads the right side, RIGHT pads the left
-    # side, FULL pads both; INNER keeps the existing nullability.
-    pad_left = step.kind in ("right", "full")
-    pad_right = step.kind in ("left", "full")
-    combined_columns = [
-        ColumnSchema(
-            col.name,
-            col.type,
-            True if pad_left else col.nullable,
-        )
-        for col in prior_schema.columns
-    ] + [
-        ColumnSchema(
-            f"{step.new_key}.{col.name}",
-            col.type,
-            True if pad_right else col.nullable,
-        )
-        for col in new_schema.columns
-    ]
-    names = [col.name for col in combined_columns]
+    schema = _derive_step_schema(
+        prior_schema,
+        new_schema,
+        new_table=step.new_key,
+        kind=step.kind,
+    )
+    names = [col.name for col in schema.columns]
     if len(set(names)) != len(names):
         raise QueryValidationError("joined tables produce duplicate column names")
-    return Schema(combined_columns)
+    return schema
 
 
 def _execute_join_step(
@@ -3319,163 +3301,25 @@ def _execute_join_step(
     step: _JoinStep,
     strategy: str | None = None,
 ) -> Table:
+    """Execute one validated join step through the shared join layer.
+
+    The combined schema (key existence, key-type compatibility and
+    nullability) is derived exactly as the explain plan derives it; the
+    selected algorithm only produces the match relation, while expansion
+    order, outer NULL padding and result assembly are shared.
+    """
     schema = _build_joined_schema(prior.schema, new.schema, step)
     prior_idx = prior.schema.index(f"{step.prior_key}.{step.prior_col}")
     new_idx = new.schema.index(step.new_col)
-    if strategy == "sort_merge":
-        columns = _sort_merge_join_columns(prior, new, prior_idx, new_idx, step.kind)
-    else:
-        columns = _join_columns(prior, new, prior_idx, new_idx, step.kind)
-    return Table._from_storage(schema, columns)
-
-
-def _join_columns(
-    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
-) -> list:
-    """Hash equi-join preserving the required file row order."""
-    left_cols = left._columns
-    right_cols = right._columns
-    # NULL keys never match, so they stay out of the right-side index.
-    index: dict[Any, list[int]] = {}
-    for j, key in enumerate(right_cols[right_idx]):
-        if key is not None:
-            index.setdefault(key, []).append(j)
-    matches_by_left: dict[int, list[int]] = {}
-    matches_by_right: dict[int, list[int]] = {}
-    # Left rows are scanned in file order so the inverse lists keep left
-    # file order for the RIGHT / FULL unmatched-right bookkeeping.
-    for i, key in enumerate(left_cols[left_idx]):
-        if key is None:
-            continue
-        matches = index.get(key)
-        if matches:
-            matches_by_left[i] = matches
-            for j in matches:
-                matches_by_right.setdefault(j, []).append(i)
-    return _emit_join_columns(
-        left, right, matches_by_left, matches_by_right, kind
+    return _execute_join(
+        prior,
+        new,
+        prior_idx,
+        new_idx,
+        schema,
+        kind=step.kind,
+        strategy=strategy,
     )
-
-
-def _sort_merge_join_columns(
-    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
-) -> list:
-    """Sort-merge equi-join.
-
-    Both sides are stably sorted by the join key (NULLs excluded, they can
-    never match) and equal-key runs are merged.  The matches are emitted by
-    the shared :func:`_emit_join_columns` path, so the result is identical
-    to :func:`_join_columns`; the two paths differ only in how the matches
-    are found.
-    """
-    left_cols = left._columns
-    right_cols = right._columns
-    left_keys = left_cols[left_idx]
-    right_keys = right_cols[right_idx]
-    left_order = sorted(
-        (i for i in range(left.row_count) if left_keys[i] is not None),
-        key=lambda i: left_keys[i],
-    )
-    right_order = sorted(
-        (j for j in range(right.row_count) if right_keys[j] is not None),
-        key=lambda j: right_keys[j],
-    )
-
-    # Index each non-NULL right key to the run of right rows carrying it;
-    # runs are visited in sorted order and keep right-file row order.
-    right_runs: dict[Any, list[int]] = {}
-    run_order: list[Any] = []
-    for j in right_order:
-        key = right_keys[j]
-        run = right_runs.get(key)
-        if run is None:
-            run = []
-            right_runs[key] = run
-            run_order.append(key)
-        run.append(j)
-
-    matches_by_left: dict[int, list[int]] = {}
-    p = 0
-    for i in left_order:
-        key = left_keys[i]
-        while p < len(run_order) and run_order[p] < key:
-            p += 1
-        if p < len(run_order) and run_order[p] == key:
-            matches_by_left[i] = right_runs[run_order[p]]
-
-    # The inverse map lists matching left rows in left-file order; walking
-    # left rows in order (rather than the sorted order) preserves it.
-    matches_by_right: dict[int, list[int]] = {}
-    for i in range(left.row_count):
-        for j in matches_by_left.get(i, ()):
-            matches_by_right.setdefault(j, []).append(i)
-
-    return _emit_join_columns(
-        left, right, matches_by_left, matches_by_right, kind
-    )
-
-
-def _emit_join_columns(
-    left: Table,
-    right: Table,
-    matches_by_left: dict,
-    matches_by_right: dict,
-    kind: str,
-) -> list:
-    """Expand match maps into joined columns for every supported join kind.
-
-    INNER / LEFT / FULL are driven by left-file order (matched combinations
-    first, then unmatched left rows), and FULL additionally appends the
-    unmatched right rows in right-file order.  RIGHT is driven by right-file
-    order, with each right row's combinations expanded in left-file order.
-    Padding rows carry NULLs on the unmatched side.
-    """
-    left_cols = left._columns
-    right_cols = right._columns
-    left_width = len(left_cols)
-    right_width = len(right_cols)
-    out = [[] for _ in range(left_width + right_width)]
-
-    def emit_match(i: int, j: int) -> None:
-        for c in range(left_width):
-            out[c].append(left_cols[c][i])
-        for c in range(right_width):
-            out[left_width + c].append(right_cols[c][j])
-
-    def emit_unmatched_left(i: int) -> None:
-        for c in range(left_width):
-            out[c].append(left_cols[c][i])
-        for c in range(right_width):
-            out[left_width + c].append(None)
-
-    def emit_unmatched_right(j: int) -> None:
-        for c in range(left_width):
-            out[c].append(None)
-        for c in range(right_width):
-            out[left_width + c].append(right_cols[c][j])
-
-    if kind == "right":
-        for j in range(right.row_count):
-            left_matches = matches_by_right.get(j)
-            if left_matches:
-                for i in left_matches:
-                    emit_match(i, j)
-            else:
-                emit_unmatched_right(j)
-        return out
-
-    for i in range(left.row_count):
-        right_matches = matches_by_left.get(i)
-        if right_matches:
-            for j in right_matches:
-                emit_match(i, j)
-        elif kind in ("left", "full"):
-            emit_unmatched_left(i)
-    if kind == "full":
-        for j in range(right.row_count):
-            if j not in matches_by_right:
-                emit_unmatched_right(j)
-    return out
 
 
 def _run_query(table: Table, select: _Select, expected_table="input") -> Table:
@@ -4276,7 +4120,7 @@ def _build_explain(
             "right": {"table": step.new_key, "column": step.new_col},
         }
         if strategy is not None:
-            join_operator["strategy"] = _JOIN_STRATEGY_LABELS[strategy]
+            join_operator["strategy"] = _strategy_label(strategy)
         operators.append(join_operator)
 
     if bound["where"] is not None:
