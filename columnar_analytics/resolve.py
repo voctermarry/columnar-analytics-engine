@@ -276,6 +276,9 @@ def _rewrite_expr(node: tuple, resolve) -> tuple:
         return ("isnull", _rewrite_expr(node[1], resolve), node[2])
     if tag == "cmp":
         return ("cmp", node[1], _rewrite_expr(node[2], resolve), _rewrite_expr(node[3], resolve))
+    if tag == "in":
+        # Option literals carry no references and stay untouched.
+        return ("in", _rewrite_expr(node[1], resolve), node[2], node[3])
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
@@ -308,6 +311,9 @@ def _rewrite_having_expr(node: tuple, resolve) -> tuple:
             _rewrite_having_expr(node[2], resolve),
             _rewrite_having_expr(node[3], resolve),
         )
+    if tag == "in":
+        # Option literals carry no references and stay untouched.
+        return ("in", _rewrite_having_expr(node[1], resolve), node[2], node[3])
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 

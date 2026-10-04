@@ -385,6 +385,53 @@ class _Cmp(_Predicate):
         ]
 
 
+class _In(_Predicate):
+    """``operand IN (...)`` / ``operand NOT IN (...)`` over typed literals.
+
+    ``nulls`` records whether the list contains a NULL option.  The result
+    follows SQL three-valued logic: a NULL operand is UNKNOWN; a matching
+    non-NULL option makes IN TRUE and NOT IN FALSE; with no match and a NULL
+    option the result is UNKNOWN; otherwise IN is FALSE and NOT IN TRUE.
+    """
+
+    __slots__ = ("operand", "options", "negated", "nulls")
+
+    def __init__(self, operand: _Expr, options: tuple, negated: bool, nulls: bool):
+        super().__init__(operand.nullable or nulls, (operand, *options))
+        self.operand = operand
+        self.options = options
+        self.negated = negated
+        self.nulls = nulls
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "in",
+            "negated": self.negated,
+            "operand": self.operand.to_json(),
+            "options": [option.to_json() for option in self.options],
+        }
+
+    def _match(self, value) -> bool:
+        for option in self.options:
+            if option.type != "null" and value == option.value:
+                return True
+        return False
+
+    def _result(self, value):
+        if value is None:
+            return None
+        if self._match(value):
+            return False if self.negated else True
+        return None if self.nulls else (True if self.negated else False)
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        return self._result(self.operand.eval(row, agg_values))
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        values = self.operand.eval_batch(source_columns, batch, agg_values)
+        return [self._result(value) for value in values]
+
+
 class _IsNull(_Predicate):
     """IS NULL / IS NOT NULL; never itself UNKNOWN."""
 
@@ -587,7 +634,35 @@ def _bind_expr(node: tuple, schema: Schema) -> _Expr:
             )
         _check_comparison_types(op, left, right)
         return _Cmp(op, left, right)
+    if tag == "in":
+        operand = _bind_expr(node[1], schema)
+        if not operand.is_value:
+            raise QuerySyntaxError(
+                "the IN operand must be a column reference, a literal or a scalar expression"
+            )
+        options, nulls = _bind_in_options(node[2], operand)
+        return _In(operand, options, node[3], nulls)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _bind_in_options(option_nodes: tuple, operand: _Expr) -> tuple:
+    """Bind the typed option literals of an IN list against ``operand``.
+
+    Returns ``(bound_options, has_null)`` in written order.  Each non-NULL
+    option must be type-compatible with the operand under the same rules as
+    an equality comparison; an all-NULL list is legal for every operand
+    type.
+    """
+    options: list[_Expr] = []
+    has_null = False
+    for option_node in option_nodes:
+        literal = _Literal(option_node[1], option_node[2])
+        if literal.type == "null":
+            has_null = True
+        else:
+            _check_comparison_types("=", operand, literal)
+        options.append(literal)
+    return tuple(options), has_null
 
 
 def _check_comparison_types(op: str, left: _Expr, right: _Expr) -> None:

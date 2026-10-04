@@ -230,9 +230,13 @@ def _parse_number(text: str) -> int | float:
 #   ("unary", operand, negate)
 #   ("case", ((cond, result), ...), else_node|None)
 #   ("cmp", op, left_node, right_node)
+#   ("in", operand_node, options, negated)  -- [NOT] IN (literal list)
 #   ("isnull", operand, negate)
 #   ("not", operand)
 #   ("and"|"or", left, right)
+# For "in" nodes ``options`` is a non-empty tuple of typed "literal" nodes
+# in written order, each of type bool / int64 / float64 / utf8 / "null";
+# a NULL literal may appear in an option list and nowhere else.
 # The HAVING grammar additionally produces its own aggregate leaf:
 #   ("hagg", func_upper, arg_name|"" , arg_table|None, arg_table_quoted, distinct)
 # Predicate nodes are boolean-typed (three-valued at evaluation time);
@@ -738,7 +742,7 @@ class _Parser:
             self._next()
             right = self._parse_having_not_factor()
             return ("cmp", tok.value, left, right)
-        return left
+        return self._parse_in_tail(left)
 
     def _parse_having_not_factor(self) -> tuple:
         if self._accept_keyword("not"):
@@ -866,7 +870,81 @@ class _Parser:
             self._next()
             right = self._parse_not_factor()
             return ("cmp", tok.value, left, right)
-        return left
+        return self._parse_in_tail(left)
+
+    def _parse_in_tail(self, operand: tuple) -> tuple:
+        # An optional "[NOT] IN (option, ...)" predicate; IN stays an
+        # ordinary identifier elsewhere, so a column spelled "in" keeps
+        # working outside this position.  NOT is consumed only when IN
+        # follows, so a stray NOT keeps its historical parse path.
+        tok = self._peek()
+        negated = (
+            tok.kind == "keyword"
+            and tok.value == "not"
+            and self._is_word_at(self.pos + 1, "in")
+        )
+        if negated:
+            self._next()  # NOT
+        if self._accept_word("in"):
+            options = self._parse_in_options()
+            return ("in", operand, options, negated)
+        return operand
+
+    def _is_word_at(self, pos: int, word: str) -> bool:
+        candidate = self.tokens[pos]
+        return candidate.kind == "ident" and candidate.value.lower() == word
+
+    def _parse_in_options(self) -> tuple:
+        # "( option (',' option)* )" with at least one option; each option
+        # is one typed literal (bool / int64 / float64 / utf8) or NULL.
+        self._expect_op("(")
+        options: list[tuple] = []
+        options.append(self._parse_in_option())
+        while self._accept_op(","):
+            options.append(self._parse_in_option())
+        self._expect_op(")")
+        return tuple(options)
+
+    def _parse_in_option(self) -> tuple:
+        tok = self._peek()
+        if tok.kind == "keyword" and tok.value == "null":
+            self._next()
+            return ("literal", None, "null")
+        if tok.kind == "op" and tok.value in ("+", "-"):
+            nxt = self.tokens[self.pos + 1]
+            if nxt.kind != "number" or isinstance(nxt.value, bool):
+                raise QuerySyntaxError(
+                    f"IN lists only accept literal values, got {tok.text!r}"
+                )
+            self._next()
+            self._next()
+            value = nxt.value
+            if isinstance(value, int):
+                if tok.value == "-":
+                    value = -value
+                if not (_INT64_MIN <= value <= _INT64_MAX):
+                    raise QuerySyntaxError(
+                        "integer literal is outside the int64 range"
+                    )
+                return ("literal", value, "int64")
+            value = -nxt.value if tok.value == "-" else nxt.value
+            return ("literal", value, "float64")
+        if tok.kind == "number":
+            self._next()
+            value = tok.value
+            if isinstance(value, bool):
+                return ("literal", value, "bool")
+            return (
+                "literal",
+                value,
+                "int64" if isinstance(value, int) else "float64",
+            )
+        if tok.kind == "string":
+            self._next()
+            return ("literal", tok.value, "utf8")
+        raise QuerySyntaxError(
+            f"IN lists only accept literal values, got {tok.text!r}"
+        )
 
     def _parse_not_factor(self) -> tuple:
         if self._accept_keyword("not"):

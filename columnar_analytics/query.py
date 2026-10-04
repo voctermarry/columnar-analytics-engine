@@ -26,7 +26,8 @@ The accepted grammar (keywords case-insensitive)::
     expr       := or_expr
     or_expr     := and_expr (OR and_expr)*
     and_expr    := cmp_expr (AND cmp_expr)*
-    cmp_expr    := not_factor (cmp_op not_factor)?
+    cmp_expr    := not_factor (cmp_op not_factor
+                              | [NOT] IN '(' in_option (',' in_option)* ')')?
     not_factor  := NOT not_factor | postfix
     postfix     := scalar_expr (IS [NOT] NULL)?
     scalar_expr := term (('+' | '-') term)*
@@ -39,6 +40,7 @@ The accepted grammar (keywords case-insensitive)::
     operand     := ident | literal
     literal     := TRUE | FALSE | [+-]? int64 | [+-]? finite float64
                    | single-quoted utf8
+    in_option   := literal | NULL
 
 The supported aggregates are ``COUNT(*)``, ``COUNT(ident)`` and
 ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` applied to one column.  Each of
@@ -156,14 +158,39 @@ follows SQL three-valued logic: a normal
 comparison against NULL yields UNKNOWN, UNKNOWN propagates through the
 logical operators, and only TRUE rows are returned.
 
+An ``IN`` / ``NOT IN`` predicate has the shape
+``value_expression [NOT] IN (option, ...)`` with at least one option; it
+sits at comparison level and may therefore appear in WHERE and in every
+CASE WHEN condition.  The left operand is any value expression the
+context already allows (a column, a typed literal or a scalar expression
+including CASE); each option is a bool, int64, float64 or utf8 literal,
+and NULL is accepted as an option (and nowhere else).  Column references,
+scalar expressions and aggregate calls are not allowed inside the list.
+Each non-NULL option is type-checked against the operand exactly like an
+equality comparison: int64 and float64 may mix, bool and utf8 only match
+their own kind, and an incompatible option raises
+:class:`QueryValidationError`.  An all-NULL list is legal for any operand
+type and repeated options do not change the result.  With a NULL operand
+the predicate is UNKNOWN; otherwise, when a non-NULL option equals the
+operand, IN is TRUE and NOT IN is FALSE; with no equal option and a NULL
+present in the list the result is UNKNOWN; otherwise IN is FALSE and NOT
+IN is TRUE.  Operand evaluation keeps its existing division-by-zero,
+int64-overflow and non-finite-float64 :class:`QueryValidationError`
+behaviour.  A missing parenthesis, an empty list, a trailing comma, an
+illegal list item, or a NOT/IN order mistake raises
+:class:`QuerySyntaxError` before any file is opened.
+
 After WHERE, rows are grouped in GROUP BY column order (a NULL key forms
 its own group); without an explicit ORDER BY groups come out in the order
 of their first selected row.  An optional HAVING clause between GROUP BY
 and ORDER BY filters the formed groups with the same boolean expression
 grammar and three-valued logic as WHERE: its conditions combine grouping
 columns, aggregate calls and type-compatible literals with NOT / AND / OR
-/ comparisons / IS [NOT] NULL, only groups whose condition is TRUE are
-kept, and aggregates named in HAVING need not appear in SELECT.  Without
+/ comparisons / [NOT] IN / IS [NOT] NULL, only groups whose condition is
+TRUE are kept; the left side of an IN predicate in HAVING is restricted
+to a grouping column, an aggregate call or a literal exactly like a
+comparison operand, while its list keeps the same literal-only rule, and
+aggregates named in HAVING need not appear in SELECT.  Without
 GROUP BY HAVING filters the single global aggregate row (still produced
 when WHERE selected no rows); with GROUP BY an empty selection yields
 zero groups.  HAVING may not name ungrouped plain columns, ``*``, CASE,
@@ -251,10 +278,12 @@ only the column blocks its plan actually references (a join chain
 additionally reads each table's ON keys).  Single-file statements
 (:func:`query_file` and JOIN-less :func:`query_files`) and multi-file
 statements whose whole join chain is INNER push the AND-connected,
-type-compatible comparisons and IS [NOT] NULL conditions of WHERE down to
-the per-group statistics.  In a join chain only a top-level AND leaf that
-references exactly one source (a qualified column of that source compared
-to a type-compatible literal, on either side, or that column's IS [NOT]
+type-compatible comparisons, positive ``column IN (literal list)``
+predicates and IS [NOT] NULL conditions of WHERE down to the per-group
+statistics.  In a join chain only a top-level AND leaf that references
+exactly one source (a qualified column of that source compared to a
+type-compatible literal, on either side, that column's positive IN
+predicate over a type-compatible literal list, or that column's IS [NOT]
 NULL) is attributed to that source; each source's own leaves are combined
 with AND independently.  A chain containing any LEFT / RIGHT / FULL OUTER
 step performs no row-group pruning at all (an OUTER step can pad a source
@@ -263,7 +292,10 @@ in full, and in a mixed v1/v2 all-INNER chain only the v2 sources are
 pruned.
 
 A row group is skipped only when a source's statistics prove its pushed
-leaves cannot all be TRUE at once for any of the group's rows; OR, NOT,
+leaves cannot all be TRUE at once for any of the group's rows; an IN leaf
+in particular keeps a group only when one of its non-NULL options lies
+inside the column's [min, max] range (a group whose column is entirely
+NULL is always skipped).  OR, NOT, NOT IN, IN with an expression operand,
 CASE, arithmetic, column-to-column or cross-source comparisons and
 undecidable ranges are never pushed, and neither block nor replace the
 eligible leaves next to them.  Surviving rows are still filtered row by

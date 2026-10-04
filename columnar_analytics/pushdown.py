@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .expr import _Cmp, _Column, _Expr, _IsNull, _Literal, _Logic
+from .expr import _Cmp, _Column, _Expr, _In, _IsNull, _Literal, _Logic
 from .format import Schema
 
 
@@ -50,6 +50,10 @@ def _is_pushable_leaf(node: _Expr) -> bool:
         return (isinstance(left, _Column) and isinstance(right, _Literal)) or (
             isinstance(left, _Literal) and isinstance(right, _Column)
         )
+    if isinstance(node, _In):
+        # Only a positive "column IN (literals)" leaf is pushed; NOT IN and
+        # expression operands are never pruned.
+        return not node.negated and isinstance(node.operand, _Column)
     return False
 
 
@@ -90,6 +94,19 @@ def _condition_possible(cond: _Expr, group: Mapping, col_index: int) -> bool:
         if cond.negated:  # IS NOT NULL
             return stats["null_count"] < group_rows
         return stats["null_count"] > 0
+    if isinstance(cond, _In):
+        stats = group["columns"][col_index]
+        if stats["null_count"] == group_rows:
+            # All values NULL: no row can match a (non-NULL) option.
+            return False
+        minimum = stats["min"]
+        maximum = stats["max"]
+        # NULL options never make IN TRUE (only UNKNOWN), so a group is
+        # kept only when a non-NULL option falls inside its value range.
+        return any(
+            option.type != "null" and minimum <= option.value <= maximum
+            for option in cond.options
+        )
     # A column-vs-literal comparison (normalised to column OP literal).
     op = cond.op
     left, right = cond.left, cond.right
@@ -118,6 +135,8 @@ def _condition_possible(cond: _Expr, group: Mapping, col_index: int) -> bool:
 def _leaf_col_index(cond: _Expr) -> int:
     """The bound column index carried by one pushable leaf."""
     if isinstance(cond, _IsNull):
+        return cond.operand.index
+    if isinstance(cond, _In):
         return cond.operand.index
     column = cond.left if isinstance(cond.left, _Column) else cond.right
     return column.index

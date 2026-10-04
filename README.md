@@ -236,7 +236,14 @@ FROM input
            | 标量表达式 + - * / 标量表达式   （优先级：括号、一元、乘除、加减）
            | CASE WHEN 条件 THEN 标量表达式
              {WHEN 条件 THEN 标量表达式} [ELSE 标量表达式] END
+谓词 := 左侧值表达式 比较运算符 右侧值表达式
+      | 左侧值表达式 [NOT] IN (列表项 {, 列表项})
+      | 左侧值表达式 IS [NOT] NULL
+列表项 := 布尔/数值/utf8 字面量 | NULL
 ```
+
+`IN` 列表至少一项，各项为 bool、int64、float64、utf8 字面量或 NULL（NULL 只允许
+出现在列表内，可位于任意位置），选项保持书写顺序，不接受列引用、表达式或聚合调用。
 
 - 投影允许星号、逗号分隔的列名、聚合调用或带 `AS` 别名的标量表达式；算术表达式操作数须为
   数值，`CASE` 表达式还可产生 bool 或 utf8 结果。别名沿用
@@ -306,8 +313,9 @@ FROM input
   分组混用（抛 `QueryValidationError`）。分组按 GROUP BY 列顺序成键，NULL 键归为
   一组；没有 ORDER BY 时各分组按首条入选行顺序输出，筛选为空时返回零行。
 - `HAVING` 位于 GROUP BY 之后、ORDER BY 之前，对已形成的分组做三值逻辑过滤：条件
-  用现有 `NOT`、`AND`、`OR`、比较与 `IS [NOT] NULL` 语义组合**分组列、聚合调用与
-  类型兼容的字面量**，只有条件为 TRUE 的组保留，FALSE 与 UNKNOWN 均丢弃。HAVING
+  用现有 `NOT`、`AND`、`OR`、比较、`[NOT] IN` 与 `IS [NOT] NULL` 语义组合**分组列、聚合
+  调用与类型兼容的字面量**，IN 谓词的左侧与比较操作数一样只允许分组列、聚合调用或字面量，
+  列表仍只接受类型兼容的字面量与 NULL；只有条件为 TRUE 的组保留，FALSE 与 UNKNOWN 均丢弃。HAVING
   中的聚合不必出现在 SELECT（仍按聚合现有 NULL、空输入、数值异常与类型规则计算并
   参与去重）；不解析 SELECT 别名，不接受未分组普通列、星号、CASE、标量算术或嵌套
   聚合，最终条件非 bool、类型不兼容或聚合参数非法抛 `QueryValidationError`。完全
@@ -334,6 +342,19 @@ FROM input
   结果为 bool 的 `CASE`（或其他布尔表达式）可直接充当条件，数值表达式直接充当布尔条件抛
   `QueryValidationError`；
   WHERE 内不允许聚合（抛 `QueryValidationError`）。
+- `IN` / `NOT IN` 谓词写作 `左侧值表达式 [NOT] IN (列表项, ...)`，位于比较级，除 WHERE
+  外也可出现在每个 `CASE WHEN` 条件中（HAVING 中左侧仍只允许分组列、聚合调用或字面量）。
+  左侧沿用各位置既有的列、字面量与标量表达式（含 `CASE`）规则；列表至少一项，各项为
+  bool、int64、float64、utf8 字面量（数值项支持前导 `+`/`-`）或 NULL，选项保持书写顺序、
+  重复项不影响结果，不接受列引用、表达式或聚合调用。绑定时左侧与每个非 NULL 项按既有
+  等值比较规则检查类型：int64 与 float64 可混合，bool 只匹配 bool，utf8 只匹配 utf8，
+  不兼容抛 `QueryValidationError`；全 NULL 列表对任意左侧类型均合法。三值逻辑：左侧为
+  NULL 时结果为 UNKNOWN；左侧非 NULL 且与某个非 NULL 项相等时，`IN` 为 TRUE、`NOT IN`
+  为 FALSE；无相等项但列表含 NULL 时结果为 UNKNOWN；其余情况 `IN` 为 FALSE、`NOT IN` 为
+  TRUE。WHERE 与 HAVING 仍只保留 TRUE，CASE WHEN 遇 FALSE 或 UNKNOWN 继续后续分支；左侧
+  表达式既有的除零、int64 溢出与非有限 float64 结果仍抛 `QueryValidationError`。缺括号、
+  空列表、尾随逗号、非法列表项或 `NOT` 与 `IN` 次序错误均在访问文件前抛
+  `QuerySyntaxError`。
 - int64 与 float64 可互比，utf8 只与 utf8 比较，bool 只支持 `=`/`!=`；
   不兼容组合抛 `QueryValidationError`。
 - 遵循 SQL 三值逻辑：普通比较遇到 NULL 得 UNKNOWN，逻辑运算继续传播 UNKNOWN，
@@ -415,11 +436,14 @@ SELECT ... FROM 起始表
 返回 v2 各组行数与 schema 顺序的列统计（v1 返回空列表）。读取 v2 时只解压、
 解码实际请求的列块；单文件查询、不含 JOIN 的多文件查询以及整条连接链均为
 INNER JOIN 的多文件查询，还会把 WHERE 顶层 AND 中只引用一个来源的合格叶子
-（限定列与类型兼容字面量间的 `=`/`!=`/`<`/`<=`/`>`/`>=`，字面量在任一侧等价，
-以及该限定列的 `IS [NOT] NULL`）按来源分别下推到组统计——同一来源的多个叶子按
+（限定列与类型兼容字面量间的 `=`/`!=`/`<`/`<=`/`>`/`>=`，字面量在任一侧等价；
+该限定列的正向 `IN (类型兼容字面量列表)`；以及该限定列的 `IS [NOT] NULL`）
+按来源分别下推到组统计——同一来源的多个叶子按
 AND 合并，仅当统计能证明它们不可能在该组某行同时为 TRUE 时才跳过整组
-（OR、NOT、CASE、算术、列间或跨来源比较、统计无法判定的范围不参与裁剪，也不阻止
-同级合格叶子下推）；链中含任一 LEFT/RIGHT/FULL OUTER JOIN 时不做行组裁剪，
+（IN 叶子仅当某非 NULL 项落在该列 [min, max] 区间内才保留组，整组为 NULL 时跳过；
+OR、NOT、`NOT IN`、表达式左侧 IN、CASE、算术、列间或跨来源比较、统计无法判定的范围
+不参与裁剪，也不阻止同级合格叶子下推）；链中含任一 LEFT/RIGHT/FULL OUTER JOIN 时
+不做行组裁剪，
 v1 源始终完整读取，混合 v1/v2 的全 INNER 链只裁剪 v2 源。被排除的行组即使其
 数据块损坏也不会被读取，入选组的损坏块抛 `ColumnarFormatError`；两种版本对同一
 数据和语句返回完全相同的结果，完整 WHERE 仍对连接结果逐行求值。explain 计划中
@@ -433,7 +457,8 @@ v1 源始终完整读取，混合 v1/v2 的全 INNER 链只裁剪 v2 源。被�
 - 单文件 SQL 查询：`SELECT`（可选 `DISTINCT` 行去重；星号/列名/单层聚合/带 `AS`
   别名的标量表达式，标量表达式含
   数值算术与 searched `CASE`）+
-  固定表名 `input` + 可选 `WHERE`、`GROUP BY`、`HAVING`（仅限分组列/聚合/字面量条件）、
+  固定表名 `input` + 可选 `WHERE`（比较、`IS [NOT] NULL`、`[NOT] IN (常量列表)`、
+  `NOT`/`AND`/`OR` 与 searched CASE）、`GROUP BY`、`HAVING`（仅限分组列/聚合/字面量条件）、
   `ORDER BY`、`LIMIT`；DISTINCT 不与 `GROUP BY`/`HAVING`/聚合投影组合，不支持
   simple CASE、
   裸列或聚合的别名、SELECT 别名用于 HAVING、聚合嵌套、WHERE 内聚合、HAVING 内标量
