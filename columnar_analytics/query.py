@@ -547,22 +547,28 @@ def _parse_number(text: str) -> int | float:
 # ---------------------------------------------------------------------------
 # Parsed expression tree
 #
-# Node tuples:
+# The parser emits plain tuples; qualifiers are resolved textually by the
+# rewrite pass before binding.  Node tuples (pre-binding shape):
 #   ("literal", python_value, type_name)
-#   ("column", name, table|None, table_quoted)        -- as parsed
-#   ("column", name, index, type_name, nullable)      -- after binding
-#   ("arith", op, left_node, right_node)              -- as parsed (+ - * /)
-#   ("arith", op, left_node, right_node, type_name)   -- after binding
-#   ("unary", operand, negate)                        -- as parsed
-#   ("unary", operand, negate, type_name)             -- after binding
-#   ("case", ((cond, result), ...), else_node|None)   -- as parsed
-#   ("case", ((cond, result), ...), else_node|None, type_name) -- after binding
+#   ("column", name, table|None, table_quoted)
+#   ("arith", op, left_node, right_node)              -- + - * /
+#   ("unary", operand, negate)
+#   ("case", ((cond, result), ...), else_node|None)
 #   ("cmp", op, left_node, right_node)
 #   ("isnull", operand, negate)
 #   ("not", operand)
 #   ("and"|"or", left, right)
+# The HAVING grammar additionally produces its own aggregate leaf:
+#   ("hagg", func_upper, arg_name|"" , arg_table|None, arg_table_quoted, distinct)
 # Predicate nodes are boolean-typed (three-valued at evaluation time);
-# "literal"/"column"/"arith"/"unary" nodes are value nodes.
+# "literal"/"column"/"arith"/"unary"/"case" nodes are value nodes.
+#
+# Binding turns those tuples into the single bound expression IR defined
+# below (the :class:`_Expr` hierarchy).  Every later stage -- type and
+# nullability derivation, dependency collection, plan rendering, predicate
+# pushdown, the row-wise and the batched evaluator -- walks one bound node
+# through the node's own declared fields, so a single bound expression is
+# the consistent source of truth in single-table and join queries alike.
 #
 # Projection / ORDER BY reference items:
 #   ("column_ref", name)                 -- a plain column name
@@ -1424,18 +1430,10 @@ def _bind_select(select: _Select, schema: Schema, expected_table="input") -> dic
             )
 
     where = _bind_expr(select.where, schema) if select.where is not None else None
-    if where is not None and where[0] in (
-        "literal",
-        "column",
-        "arith",
-        "unary",
-        "case",
-    ):
-        type_name = _expr_type(where)
-        if type_name != "bool":
-            raise QueryValidationError(
-                f"WHERE clause must be boolean, got {type_name}"
-            )
+    if where is not None and where.type != "bool":
+        raise QueryValidationError(
+            f"WHERE clause must be boolean, got {where.type}"
+        )
 
     if select.distinct and select.is_aggregate_query:
         raise QueryValidationError(
@@ -1491,11 +1489,11 @@ def _bind_plain(select: _Select, schema: Schema, where) -> dict:
                 )
             else:  # "expr"
                 expr = _bind_expr(item.expr, schema)
-                out_type = _expr_type(expr)
+                out_type = expr.type
                 # Arithmetic scalar expressions stay numeric-only; a CASE
                 # expression may additionally yield bool or utf8 results
                 # (its own WHEN/ELSE type consistency is checked at binding).
-                if expr[0] == "case":
+                if isinstance(expr, _Case):
                     allowed_types = ("int64", "float64", "bool", "utf8")
                 else:
                     allowed_types = ("int64", "float64")
@@ -1513,7 +1511,7 @@ def _bind_plain(select: _Select, schema: Schema, where) -> dict:
                         output_name=alias,
                         expr=expr,
                         out_type=out_type,
-                        nullable=_expr_nullable(expr),
+                        nullable=expr.nullable,
                     )
                 )
     aliases = {
@@ -1708,7 +1706,7 @@ def _bind_aggregate(select: _Select, schema: Schema, where) -> dict:
         having = _bind_having(
             select.having, schema, group_index_set, agg_order, require_aggregate
         )
-        _require_having_boolean(having, "HAVING clause")
+        _require_boolean(having, "HAVING clause")
 
     order_by = _bind_aggregate_order_by(
         select.order_by, bound_items, schema
@@ -1747,10 +1745,10 @@ def _bind_having(
     group_index_set: set[int],
     agg_order: list[_BoundItem],
     require_aggregate,
-) -> tuple:
+) -> _Expr:
     tag = node[0]
     if tag == "literal":
-        return node
+        return _Literal(node[1], node[2])
     if tag == "column":
         name = node[1]
         try:
@@ -1762,17 +1760,29 @@ def _bind_having(
                 f"HAVING column {name!r} must appear in GROUP BY or be wrapped in an aggregate"
             )
         col = schema.columns[col_index]
-        return ("column", name, col_index, col.type, col.nullable)
+        return _Column(name, col_index, col.type, col.nullable)
     if tag == "hagg":
         slot = require_aggregate(node[1], node[2], node[5])
         agg_item = agg_order[slot]
-        return ("hagg", slot, agg_item.out_type, agg_item.nullable)
+        arg_name = (
+            None
+            if agg_item.arg_index < 0
+            else schema.columns[agg_item.arg_index].name
+        )
+        return _Aggregate(
+            agg_item.func,
+            slot,
+            arg_name,
+            agg_item.distinct,
+            agg_item.out_type,
+            agg_item.nullable,
+        )
     if tag == "not":
         operand = _bind_having(
             node[1], schema, group_index_set, agg_order, require_aggregate
         )
-        _require_having_boolean(operand, "NOT")
-        return ("not", operand)
+        _require_boolean(operand, "NOT")
+        return _Not(operand)
     if tag in ("and", "or"):
         left = _bind_having(
             node[1], schema, group_index_set, agg_order, require_aggregate
@@ -1780,18 +1790,18 @@ def _bind_having(
         right = _bind_having(
             node[2], schema, group_index_set, agg_order, require_aggregate
         )
-        _require_having_boolean(left, tag.upper())
-        _require_having_boolean(right, tag.upper())
-        return (tag, left, right)
+        _require_boolean(left, tag.upper())
+        _require_boolean(right, tag.upper())
+        return _Logic(tag, left, right)
     if tag == "isnull":
         operand = _bind_having(
             node[1], schema, group_index_set, agg_order, require_aggregate
         )
-        if operand[0] not in ("literal", "column", "hagg"):
+        if not operand.is_having_leaf:
             raise QuerySyntaxError(
                 "IS NULL operand must be a group column, an aggregate or a literal"
             )
-        return ("isnull", operand, node[2])
+        return _IsNull(operand, node[2])
     if tag == "cmp":
         op = node[1]
         left = _bind_having(
@@ -1800,56 +1810,13 @@ def _bind_having(
         right = _bind_having(
             node[3], schema, group_index_set, agg_order, require_aggregate
         )
-        if left[0] not in ("literal", "column", "hagg") or right[0] not in (
-            "literal",
-            "column",
-            "hagg",
-        ):
+        if not (left.is_having_leaf and right.is_having_leaf):
             raise QuerySyntaxError(
                 "comparison operands must be group columns, aggregates or literals"
             )
-        left_t = _having_value_type(left)
-        right_t = _having_value_type(right)
-        if "bool" in (left_t, right_t):
-            if left_t != "bool" or right_t != "bool":
-                raise QueryValidationError(
-                    f"bool can only be compared to bool, got {left_t} and {right_t}"
-                )
-            if op not in ("=", "!="):
-                raise QueryValidationError(f"bool only supports = and !=, not {op!r}")
-        elif "utf8" in (left_t, right_t):
-            if left_t != "utf8" or right_t != "utf8":
-                raise QueryValidationError(
-                    f"utf8 can only be compared to utf8, got {left_t} and {right_t}"
-                )
-        elif not {left_t, right_t} <= {"int64", "float64"}:
-            raise QueryValidationError(
-                f"cannot compare values of type {left_t} and {right_t}"
-            )
-        return ("cmp", op, left, right)
+        _check_comparison_types(op, left, right)
+        return _Cmp(op, left, right)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
-
-
-def _having_value_type(node: tuple) -> str:
-    """The static value type of a bound HAVING leaf."""
-    tag = node[0]
-    if tag == "literal":
-        return node[2]
-    if tag == "column":
-        return node[3]
-    if tag == "hagg":
-        return node[2]
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
-
-
-def _require_having_boolean(node: tuple, context: str) -> None:
-    if node[0] in ("cmp", "isnull", "not", "and", "or"):
-        return
-    type_name = _having_value_type(node)
-    if type_name != "bool":
-        raise QueryValidationError(
-            f"{context} requires a boolean operand, got {type_name}"
-        )
 
 
 def _agg_result_type(func: str, arg_col: ColumnSchema | None) -> tuple[str, bool]:
@@ -1968,10 +1935,499 @@ def _bind_aggregate_order_by(
     return tuple(bound_order)
 
 
-def _bind_expr(node: tuple, schema: Schema) -> tuple:
+# ---------------------------------------------------------------------------
+# Bound expression IR -- one node hierarchy for every later stage
+# ---------------------------------------------------------------------------
+#
+# Binding resolves a parsed tuple tree against one :class:`Schema` and
+# produces :class:`_Expr` nodes.  Each node carries, once and for all:
+#
+# * ``type``     -- its static result type (``int64`` / ``float64`` /
+#                   ``bool`` / ``utf8``); predicates are ``bool``;
+# * ``nullable`` -- whether the node may yield NULL, derived while binding
+#                   from the participating columns and the node kind;
+# * ``columns()``-- every bound source-column index referenced anywhere in
+#                   the subtree (multiplicity and in-tree order preserved);
+# * ``children`` -- the node's direct bound subexpressions in fixed order,
+#                   so generic traversals never re-switch on a node tag;
+# * ``to_json()``-- its explain-plan condition / projection tree.
+#
+# Single-table statements and join chains bind against the same kind of
+# (combined) :class:`Schema`, then share these exact nodes, rules and
+# evaluators; adding an expression node later means adding one class here
+# rather than teaching several parallel tuple-shape branches about it.
+
+
+class _Expr:
+    """One bound scalar value or boolean condition."""
+
+    __slots__ = ("type", "nullable", "children")
+
+    # Value node (literal / column / aggregate / unary / arith / case);
+    # boolean predicates set this to False.
+    is_value: bool = True
+    # Accepted as a HAVING comparison / IS NULL operand (leaf references).
+    is_having_leaf: bool = False
+
+    def __init__(self, type_name: str, nullable: bool, children: tuple = ()):
+        self.type = type_name
+        self.nullable = nullable
+        self.children = children
+
+    def columns(self) -> list:
+        """Bound source-column indices referenced in this subtree, in order."""
+        indices: list = []
+        for child in self.children:
+            indices.extend(child.columns())
+        return indices
+
+    def to_json(self) -> dict:
+        raise NotImplementedError  # pragma: no cover - concrete nodes override
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        """Evaluate on one row (HAVING also passes the group's agg values)."""
+        raise NotImplementedError  # pragma: no cover - concrete nodes override
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        """Evaluate on one index batch; defaults to the row-wise semantics."""
+        return [
+            self.eval(_row_values(source_columns, i), agg_values) for i in batch
+        ]
+
+
+class _Literal(_Expr):
+    """A typed literal constant."""
+
+    __slots__ = ("value",)
+
+    is_having_leaf = True
+
+    def __init__(self, value, type_name: str):
+        super().__init__(type_name, False)
+        self.value = value
+
+    def to_json(self) -> dict:
+        return {"kind": "literal", "type": self.type, "value": self.value}
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        return self.value
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        return [self.value] * len(batch)
+
+
+class _Column(_Expr):
+    """A column reference resolved to a combined-schema column index."""
+
+    __slots__ = ("name", "index")
+
+    is_having_leaf = True
+
+    def __init__(self, name: str, index: int, type_name: str, nullable: bool):
+        super().__init__(type_name, nullable)
+        self.name = name
+        self.index = index
+
+    def columns(self) -> list:
+        return [self.index]
+
+    def to_json(self) -> dict:
+        return {"kind": "column", "name": self.name}
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        return row[self.index]
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        column = source_columns[self.index]
+        return [column[i] for i in batch]
+
+
+class _Aggregate(_Expr):
+    """A HAVING aggregate leaf pointing at one shared aggregate slot.
+
+    The aggregate itself is registered (and computed) with SELECT and
+    ORDER BY; this node only reads the slot's value for the bound group.
+    """
+
+    __slots__ = ("func", "slot", "arg_name", "distinct_flag")
+
+    is_having_leaf = True
+
+    def __init__(
+        self,
+        func: str,
+        slot: int,
+        arg_name: str | None,
+        distinct: bool,
+        type_name: str,
+        nullable: bool,
+    ):
+        super().__init__(type_name, nullable)
+        self.func = func
+        self.slot = slot
+        self.arg_name = arg_name
+        self.distinct_flag = distinct
+
+    def to_json(self) -> dict:
+        leaf = {
+            "kind": "aggregate",
+            "function": self.func,
+            "argument": self.arg_name,
+            "type": self.type,
+            "nullable": self.nullable,
+        }
+        if self.distinct_flag:
+            # Kept last, exactly as the historical leaf ordering.
+            leaf["distinct"] = True
+        return leaf
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        return agg_values[self.slot]
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        value = agg_values[self.slot]
+        return [value] * len(batch)
+
+
+class _Unary(_Expr):
+    """Unary ``+`` (kept) or ``-`` (type-preserving) on a numeric operand."""
+
+    __slots__ = ("negate", "operand")
+
+    def __init__(self, operand: _Expr, negate: bool):
+        super().__init__(operand.type, operand.nullable, (operand,))
+        self.negate = negate
+        self.operand = operand
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "unary",
+            "operator": "-" if self.negate else "+",
+            "operands": [self.operand.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        value = self.operand.eval(row, agg_values)
+        if value is None:
+            return None
+        if not self.negate:  # unary plus keeps the value
+            return value
+        return _negate_value(value)
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        values = self.operand.eval_batch(source_columns, batch, agg_values)
+        if not self.negate:  # unary plus keeps the value
+            return values
+        return [None if value is None else _negate_value(value) for value in values]
+
+
+class _Arith(_Expr):
+    """Binary ``+`` / ``-`` / ``*`` / ``/`` with the bound result type."""
+
+    __slots__ = ("op", "left", "right")
+
+    def __init__(self, op: str, left: _Expr, right: _Expr, type_name: str):
+        super().__init__(
+            type_name, left.nullable or right.nullable, (left, right)
+        )
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "arithmetic",
+            "operator": self.op,
+            "operands": [self.left.to_json(), self.right.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        left = self.left.eval(row, agg_values)
+        right = self.right.eval(row, agg_values)
+        if left is None or right is None:
+            return None
+        return _arith_value(self.op, left, right)
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        left = self.left.eval_batch(source_columns, batch, agg_values)
+        right = self.right.eval_batch(source_columns, batch, agg_values)
+        op = self.op
+        return [
+            None if lval is None or rval is None else _arith_value(op, lval, rval)
+            for lval, rval in zip(left, right)
+        ]
+
+
+class _Case(_Expr):
+    """A searched CASE: ordered (condition, result) branches and an ELSE."""
+
+    __slots__ = ("branches", "else_node")
+
+    def __init__(self, branches: tuple, else_node: _Expr | None, type_name: str):
+        children = tuple(
+            child for condition, result in branches for child in (condition, result)
+        )
+        if else_node is not None:
+            children += (else_node,)
+        nullable = else_node is None or any(
+            result.nullable for _condition, result in branches
+        ) or (else_node is not None and else_node.nullable)
+        super().__init__(type_name, nullable, children)
+        self.branches = branches
+        self.else_node = else_node
+
+    def to_json(self) -> dict:
+        # Written order is preserved; an omitted ELSE is rendered as null,
+        # which also marks the implicit result nullable in the output schema.
+        return {
+            "kind": "case",
+            "cases": [
+                {"when": condition.to_json(), "then": result.to_json()}
+                for condition, result in self.branches
+            ],
+            "else": None if self.else_node is None else self.else_node.to_json(),
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        # Conditions are tried in written order; only TRUE matches.  FALSE
+        # and UNKNOWN fall through, so unhit results are never evaluated:
+        # their division-by-zero, int64 overflow or non-finite float64
+        # cannot raise.  The chosen result alone is evaluated.
+        for condition, result in self.branches:
+            if condition.eval(row, agg_values) is True:
+                value = result.eval(row, agg_values)
+                break
+        else:
+            value = (
+                None
+                if self.else_node is None
+                else self.else_node.eval(row, agg_values)
+            )
+        if value is None:
+            return None
+        if self.type == "float64" and isinstance(value, int) and not isinstance(
+            value, bool
+        ):
+            return float(value)
+        return value
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        # Each result expression is evaluated only on the sub-batch of rows
+        # routed to it, so an error inside an unhit branch never raises;
+        # rows no branch claimed fall through to ELSE (or NULL).
+        result: list = [None] * len(batch)
+        remaining = list(range(len(batch)))
+        for condition, result_node in self.branches:
+            if not remaining:
+                break
+            cond_values = condition.eval_batch(
+                source_columns, [batch[k] for k in remaining], agg_values
+            )
+            taken = [k for k, cond in zip(remaining, cond_values) if cond is True]
+            remaining = [
+                k for k, cond in zip(remaining, cond_values) if cond is not True
+            ]
+            if taken:
+                values = result_node.eval_batch(
+                    source_columns, [batch[k] for k in taken], agg_values
+                )
+                for k, value in zip(taken, values):
+                    result[k] = value
+        if remaining and self.else_node is not None:
+            values = self.else_node.eval_batch(
+                source_columns, [batch[k] for k in remaining], agg_values
+            )
+            for k, value in zip(remaining, values):
+                result[k] = value
+        if self.type == "float64":
+            # int64/float64 results unify to float64; ints become floats.
+            return [self._unify_float(value) for value in result]
+        return result
+
+    @staticmethod
+    def _unify_float(value):
+        if value is None:
+            return None
+        # int64/float64 results unify to float64; ints become floats.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return float(value)
+        return value
+
+
+class _Predicate(_Expr):
+    """Base class for the three-valued boolean conditions."""
+
+    __slots__ = ()
+
+    is_value = False
+
+    def __init__(self, nullable: bool, children: tuple = ()):
+        super().__init__("bool", nullable, children)
+
+
+class _Cmp(_Predicate):
+    """A comparison of two value nodes (UNKNOWN when either side is NULL)."""
+
+    __slots__ = ("op", "left", "right")
+
+    def __init__(self, op: str, left: _Expr, right: _Expr):
+        super().__init__(left.nullable or right.nullable, (left, right))
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "comparison",
+            "operator": self.op,
+            "operands": [self.left.to_json(), self.right.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        left = self.left.eval(row, agg_values)
+        right = self.right.eval(row, agg_values)
+        if left is None or right is None:
+            return None
+        return _compare_values(self.op, left, right)
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        left = self.left.eval_batch(source_columns, batch, agg_values)
+        right = self.right.eval_batch(source_columns, batch, agg_values)
+        op = self.op
+        return [
+            None if lval is None or rval is None else _compare_values(op, lval, rval)
+            for lval, rval in zip(left, right)
+        ]
+
+
+class _IsNull(_Predicate):
+    """IS NULL / IS NOT NULL; never itself UNKNOWN."""
+
+    __slots__ = ("operand", "negated")
+
+    def __init__(self, operand: _Expr, negated: bool):
+        super().__init__(False, (operand,))
+        self.operand = operand
+        self.negated = negated
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "is_null",
+            "operator": "IS NOT NULL" if self.negated else "IS NULL",
+            "operands": [self.operand.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        value = self.operand.eval(row, agg_values)
+        result = value is None
+        return not result if self.negated else result
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        values = self.operand.eval_batch(source_columns, batch, agg_values)
+        if self.negated:  # IS NOT NULL
+            return [value is not None for value in values]
+        return [value is None for value in values]
+
+
+class _Not(_Predicate):
+    __slots__ = ("operand",)
+
+    def __init__(self, operand: _Expr):
+        super().__init__(operand.nullable, (operand,))
+        self.operand = operand
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "not",
+            "operator": "NOT",
+            "operands": [self.operand.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        value = self.operand.eval(row, agg_values)
+        return None if value is None else (not value)
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        values = self.operand.eval_batch(source_columns, batch, agg_values)
+        return [None if value is None else (not value) for value in values]
+
+
+class _Logic(_Predicate):
+    """AND / OR; UNKNOWN propagates through either side."""
+
+    __slots__ = ("op", "left", "right")
+
+    def __init__(self, op: str, left: _Expr, right: _Expr):
+        super().__init__(left.nullable or right.nullable, (left, right))
+        self.op = op
+        self.left = left
+        self.right = right
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "logic",
+            "operator": self.op.upper(),
+            "operands": [self.left.to_json(), self.right.to_json()],
+        }
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        # Short-circuit SQL semantics; UNKNOWN propagates only when needed.
+        left = self.left.eval(row, agg_values)
+        if self.op == "and":
+            if left is False:
+                return False
+            right = self.right.eval(row, agg_values)
+            if right is False:
+                return False
+            if left is None or right is None:
+                return None
+            return True
+        if left is True:
+            return True
+        right = self.right.eval(row, agg_values)
+        if right is True:
+            return True
+        if left is None or right is None:
+            return None
+        return False
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        left = self.left.eval_batch(source_columns, batch, agg_values)
+        # Rows the left operand already decided (FALSE for AND, TRUE for
+        # OR) never evaluate the right operand, exactly as row-wise
+        # short-circuiting; the rest form the sub-batch evaluated next.
+        if self.op == "and":
+            undecided = [k for k, value in enumerate(left) if value is not False]
+        else:
+            undecided = [k for k, value in enumerate(left) if value is not True]
+        result = list(left)
+        if undecided:
+            right = self.right.eval_batch(
+                source_columns,
+                [batch[k] for k in undecided],
+                agg_values,
+            )
+            for k, rval in zip(undecided, right):
+                lval = left[k]
+                if self.op == "and":
+                    result[k] = (
+                        False
+                        if rval is False
+                        else (None if lval is None or rval is None else True)
+                    )
+                else:
+                    result[k] = (
+                        True
+                        if rval is True
+                        else (None if lval is None or rval is None else False)
+                    )
+        return result
+
+
+def _bind_expr(node: tuple, schema: Schema) -> _Expr:
     tag = node[0]
     if tag == "literal":
-        return node
+        return _Literal(node[1], node[2])
     if tag == "column":
         name = node[1]
         try:
@@ -1979,37 +2435,37 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
         except KeyError:
             raise QueryValidationError(f"unknown column: {name!r}") from None
         col = schema.columns[index]
-        return ("column", name, index, col.type, col.nullable)
+        return _Column(name, index, col.type, col.nullable)
     if tag == "not":
         operand = _bind_expr(node[1], schema)
         _require_boolean(operand, "NOT")
-        return ("not", operand)
+        return _Not(operand)
     if tag in ("and", "or"):
         left = _bind_expr(node[1], schema)
         right = _bind_expr(node[2], schema)
         _require_boolean(left, tag.upper())
         _require_boolean(right, tag.upper())
-        return (tag, left, right)
+        return _Logic(tag, left, right)
     if tag == "isnull":
         operand = _bind_expr(node[1], schema)
-        if operand[0] not in ("literal", "column", "arith", "unary", "case"):
+        if not operand.is_value:
             raise QuerySyntaxError(
                 "IS NULL operand must be a column reference or a literal"
             )
-        return ("isnull", operand, node[2])
+        return _IsNull(operand, node[2])
     if tag == "unary":
         operand = _bind_expr(node[1], schema)
-        type_name = _expr_type(operand)
+        type_name = operand.type
         if type_name not in ("int64", "float64"):
             raise QueryValidationError(
                 f"unary +/- requires a numeric operand, got {type_name}"
             )
-        return ("unary", operand, node[2], type_name)
+        return _Unary(operand, node[2])
     if tag == "arith":
         left = _bind_expr(node[2], schema)
         right = _bind_expr(node[3], schema)
-        left_t = _expr_type(left)
-        right_t = _expr_type(right)
+        left_t = left.type
+        right_t = right.type
         if left_t not in ("int64", "float64") or right_t not in ("int64", "float64"):
             raise QueryValidationError(
                 f"arithmetic requires numeric operands, got {left_t} and {right_t}"
@@ -2020,7 +2476,7 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
             if op == "/" or "float64" in (left_t, right_t)
             else "int64"
         )
-        return ("arith", op, left, right, out_type)
+        return _Arith(op, left, right, out_type)
     if tag == "case":
         bound_branches = []
         result_types: list[str] = []
@@ -2029,41 +2485,46 @@ def _bind_expr(node: tuple, schema: Schema) -> tuple:
             _require_boolean(cond, "WHEN")
             result = _bind_expr(result_node, schema)
             bound_branches.append((cond, result))
-            result_types.append(_expr_type(result))
+            result_types.append(result.type)
         else_bound = None
         if node[2] is not None:
             else_bound = _bind_expr(node[2], schema)
-            result_types.append(_expr_type(else_bound))
+            result_types.append(else_bound.type)
         out_type = _unify_case_types(result_types)
-        return ("case", tuple(bound_branches), else_bound, out_type)
+        return _Case(tuple(bound_branches), else_bound, out_type)
     if tag == "cmp":
         op = node[1]
         left = _bind_expr(node[2], schema)
         right = _bind_expr(node[3], schema)
-        if left[0] not in (
-            "literal", "column", "arith", "unary", "case"
-        ) or right[0] not in ("literal", "column", "arith", "unary", "case"):
-            raise QuerySyntaxError("comparison operands must be column references or literals")
-        left_t = _expr_type(left)
-        right_t = _expr_type(right)
-        if "bool" in (left_t, right_t):
-            if left_t != "bool" or right_t != "bool":
-                raise QueryValidationError(
-                    f"bool can only be compared to bool, got {left_t} and {right_t}"
-                )
-            if op not in ("=", "!="):
-                raise QueryValidationError(f"bool only supports = and !=, not {op!r}")
-        elif "utf8" in (left_t, right_t):
-            if left_t != "utf8" or right_t != "utf8":
-                raise QueryValidationError(
-                    f"utf8 can only be compared to utf8, got {left_t} and {right_t}"
-                )
-        elif not {left_t, right_t} <= {"int64", "float64"}:
-            raise QueryValidationError(
-                f"cannot compare values of type {left_t} and {right_t}"
+        if not (left.is_value and right.is_value):
+            raise QuerySyntaxError(
+                "comparison operands must be column references or literals"
             )
-        return ("cmp", op, left, right)
+        _check_comparison_types(op, left, right)
+        return _Cmp(op, left, right)
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _check_comparison_types(op: str, left: _Expr, right: _Expr) -> None:
+    """Validate the static operand types of one comparison (WHERE and HAVING)."""
+    left_t = left.type
+    right_t = right.type
+    if "bool" in (left_t, right_t):
+        if left_t != "bool" or right_t != "bool":
+            raise QueryValidationError(
+                f"bool can only be compared to bool, got {left_t} and {right_t}"
+            )
+        if op not in ("=", "!="):
+            raise QueryValidationError(f"bool only supports = and !=, not {op!r}")
+    elif "utf8" in (left_t, right_t):
+        if left_t != "utf8" or right_t != "utf8":
+            raise QueryValidationError(
+                f"utf8 can only be compared to utf8, got {left_t} and {right_t}"
+            )
+    elif not {left_t, right_t} <= {"int64", "float64"}:
+        raise QueryValidationError(
+            f"cannot compare values of type {left_t} and {right_t}"
+        )
 
 
 def _unify_case_types(types: list[str]) -> str:
@@ -2083,135 +2544,23 @@ def _unify_case_types(types: list[str]) -> str:
     )
 
 
-def _expr_type(node: tuple) -> str:
-    """The static type of a bound value node."""
-    tag = node[0]
-    if tag == "literal":
-        return node[2]
-    if tag == "column":
-        return node[3]
-    if tag == "unary":
-        return node[3]
-    if tag == "arith":
-        return node[4]
-    if tag == "case":
-        return node[3]
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
-
-
-def _expr_nullable(node: tuple) -> bool:
-    """Whether a bound value node can yield NULL (derived from its columns)."""
-    tag = node[0]
-    if tag == "literal":
-        return False
-    if tag == "column":
-        return node[4]
-    if tag == "unary":
-        return _expr_nullable(node[1])
-    if tag == "arith":
-        return _expr_nullable(node[2]) or _expr_nullable(node[3])
-    if tag == "case":
-        # The value is NULL only when a reachable result yields NULL, or
-        # every WHEN fails/UNKNOWN and no ELSE was given (implicit NULL).
-        # A NULL condition merely routes the row elsewhere and never makes
-        # a non-NULL result nullable.
-        if node[2] is None:
-            return True
-        return any(_expr_nullable(result) for _cond, result in node[1]) or _expr_nullable(
-            node[2]
+def _require_boolean(node: _Expr, context: str) -> None:
+    if node.type != "bool":
+        raise QueryValidationError(
+            f"{context} requires a boolean operand, got {node.type}"
         )
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
-
-
-def _require_boolean(node: tuple, context: str) -> None:
-    if node[0] in ("cmp", "isnull", "not", "and", "or"):
-        return
-    type_name = _expr_type(node)
-    if type_name != "bool":
-        raise QueryValidationError(f"{context} requires a boolean operand, got {type_name}")
 
 
 # ---------------------------------------------------------------------------
 # Three-valued-logic evaluation
 # ---------------------------------------------------------------------------
 #
-# ``_eval`` is the row-at-a-time reference semantics: every batched path
-# below visits exactly the same (row, subexpression) pairs, and the batch
-# drivers fall back to ``_eval`` to reproduce the historical first error of
-# a batch whenever the vectorised walk raises.
-
-
-def _eval(node: tuple, row: tuple) -> bool | None:
-    tag = node[0]
-    if tag == "literal":
-        return node[1]
-    if tag == "column":
-        return row[node[2]]
-    if tag == "unary":
-        value = _eval(node[1], row)
-        if value is None:
-            return None
-        if not node[2]:  # unary plus keeps the value
-            return value
-        return _negate_value(value)
-    if tag == "arith":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
-        if left is None or right is None:
-            return None
-        return _arith_value(node[1], left, right)
-    if tag == "case":
-        # Conditions are tried in written order; only TRUE matches.  FALSE
-        # and UNKNOWN fall through, so unhit results are never evaluated:
-        # their division-by-zero, int64 overflow or non-finite float64
-        # cannot raise.  The chosen result alone is evaluated.
-        for condition, result in node[1]:
-            if _eval(condition, row) is True:
-                value = _eval(result, row)
-                break
-        else:
-            value = None if node[2] is None else _eval(node[2], row)
-        if value is None:
-            return None
-        # int64/float64 results unify to float64; ints become floats.
-        if node[3] == "float64" and isinstance(value, int) and not isinstance(value, bool):
-            return float(value)
-        return value
-    if tag == "isnull":
-        value = _eval(node[1], row)
-        result = value is None
-        return (not result) if node[2] else result
-    if tag == "not":
-        value = _eval(node[1], row)
-        return None if value is None else (not value)
-    if tag in ("and", "or"):
-        # Short-circuit SQL semantics; UNKNOWN propagates only when needed.
-        if tag == "and":
-            left = _eval(node[1], row)
-            if left is False:
-                return False
-            right = _eval(node[2], row)
-            if right is False:
-                return False
-            if left is None or right is None:
-                return None
-            return True
-        left = _eval(node[1], row)
-        if left is True:
-            return True
-        right = _eval(node[2], row)
-        if right is True:
-            return True
-        if left is None or right is None:
-            return None
-        return False
-    if tag == "cmp":
-        left = _eval(node[2], row)
-        right = _eval(node[3], row)
-        if left is None or right is None:
-            return None
-        return _compare_values(node[1], left, right)
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+# The per-row semantics live on the bound expression nodes themselves
+# (:meth:`_Expr.eval`); a batch failure falls back to that same row-at-a-
+# time method (see :func:`_eval_batch`) so the reported first error keeps
+# its historical row order.  The batched semantics
+# (:meth:`_Expr.eval_batch`) visit exactly the same
+# (row, subexpression) pairs.
 
 
 def _compare_values(op: str, left, right) -> bool:
@@ -2284,14 +2633,13 @@ def _arith_value(op: str, left, right):
 # indices; an expression is evaluated one *batch* of rows at a time against
 # the source columns and yields one vector of result values aligned with
 # the batch, instead of re-entering the row-at-a-time control flow for
-# every row.  The semantics are exactly those of :func:`_eval`: NULL
-# propagation, three-valued logic, per-row CASE short-circuit (a result
-# expression is only ever evaluated for the rows routed to its branch) and
-# the int64 / float64 error rules are unchanged.  Because the batched walk
-# visits the same (row, subexpression) pairs as the row-wise walk, any
-# batch that contains a failing row raises; the drivers then re-run that
-# batch row by row so the reported error is byte-identical to the
-# historical one.
+# every row.  The vectorised walk is the node's own ``eval_batch``; its
+# semantics are exactly those of :meth:`_Expr.eval` (NULL propagation,
+# three-valued logic, per-row CASE short-circuit, the int64 / float64
+# error rules).  Because the batched walk visits the same
+# (row, subexpression) pairs as the row-wise walk, any batch that contains
+# a failing row raises; the driver then re-runs that batch row by row so
+# the reported error is byte-identical to the historical one.
 
 _EVAL_BATCH_SIZE = 2048
 
@@ -2302,7 +2650,7 @@ def _iter_batches(indices, size=_EVAL_BATCH_SIZE):
         yield indices[start : start + size]
 
 
-def _eval_batch(node, source_columns, batch) -> list:
+def _eval_batch(node: _Expr, source_columns, batch, agg_values: tuple | None = None) -> list:
     """Evaluate one batch of a bound expression, returning a value vector.
 
     ``batch`` is the current valid-row set (row indices into
@@ -2312,12 +2660,12 @@ def _eval_batch(node, source_columns, batch) -> list:
     error (and its row order) surfaces.
     """
     try:
-        return _eval_batch_node(node, source_columns, batch)
+        return node.eval_batch(source_columns, batch, agg_values)
     except QueryValidationError:
         # The batched walk visits the same (row, subexpression) pairs as
-        # _eval, so this row-wise pass raises the same first error the
+        # the row-wise one, so this re-run raises the same first error the
         # pre-vectorised engine reported for these rows.
-        return [_eval(node, _row_values(source_columns, i)) for i in batch]
+        return [node.eval(_row_values(source_columns, i), agg_values) for i in batch]
 
 
 def _eval_expr_selection(node, source_columns, selected) -> list:
@@ -2332,7 +2680,7 @@ def _eval_expr_selection(node, source_columns, selected) -> list:
     return values
 
 
-def _filter_rows(where: tuple, source_columns, row_count: int) -> list[int]:
+def _filter_rows(where: _Expr, source_columns, row_count: int) -> list[int]:
     """The row indices whose WHERE condition evaluates to TRUE.
 
     Batched counterpart of the historical row loop: rows are evaluated
@@ -2343,122 +2691,6 @@ def _filter_rows(where: tuple, source_columns, row_count: int) -> list[int]:
         mask = _eval_batch(where, source_columns, batch)
         selected.extend(i for i, keep in zip(batch, mask) if keep is True)
     return selected
-
-
-def _eval_batch_node(node: tuple, source_columns, batch) -> list:
-    """The batched semantics shared by every row-processing stage.
-
-    Evaluates the bound expression ``node`` for the row indices of ``batch``
-    and returns one value per batch row.  Short-circuiting nodes restrict
-    the rows their operands are evaluated on: AND / OR evaluate the right
-    operand only for rows the left operand did not decide, and CASE
-    evaluates each result expression only for the rows routed to it, so an
-    error inside an unhit branch or a decided-away operand never surfaces.
-    """
-    tag = node[0]
-    if tag == "literal":
-        return [node[1]] * len(batch)
-    if tag == "column":
-        column = source_columns[node[2]]
-        return [column[i] for i in batch]
-    if tag == "unary":
-        values = _eval_batch_node(node[1], source_columns, batch)
-        if not node[2]:  # unary plus keeps the value
-            return values
-        return [None if value is None else _negate_value(value) for value in values]
-    if tag == "arith":
-        left = _eval_batch_node(node[2], source_columns, batch)
-        right = _eval_batch_node(node[3], source_columns, batch)
-        op = node[1]
-        return [
-            None if lval is None or rval is None else _arith_value(op, lval, rval)
-            for lval, rval in zip(left, right)
-        ]
-    if tag == "not":
-        values = _eval_batch_node(node[1], source_columns, batch)
-        return [None if value is None else (not value) for value in values]
-    if tag == "isnull":
-        values = _eval_batch_node(node[1], source_columns, batch)
-        if node[2]:  # IS NOT NULL
-            return [value is not None for value in values]
-        return [value is None for value in values]
-    if tag in ("and", "or"):
-        left = _eval_batch_node(node[1], source_columns, batch)
-        # Rows the left operand already decided (FALSE for AND, TRUE for
-        # OR) never evaluate the right operand, exactly as row-wise
-        # short-circuiting; the rest form the sub-batch evaluated next.
-        if tag == "and":
-            undecided = [k for k, value in enumerate(left) if value is not False]
-        else:
-            undecided = [k for k, value in enumerate(left) if value is not True]
-        result = list(left)
-        if undecided:
-            right = _eval_batch_node(
-                node[2], source_columns, [batch[k] for k in undecided]
-            )
-            for k, rval in zip(undecided, right):
-                lval = left[k]
-                if tag == "and":
-                    result[k] = (
-                        False
-                        if rval is False
-                        else (None if lval is None or rval is None else True)
-                    )
-                else:
-                    result[k] = (
-                        True
-                        if rval is True
-                        else (None if lval is None or rval is None else False)
-                    )
-        return result
-    if tag == "cmp":
-        left = _eval_batch_node(node[2], source_columns, batch)
-        right = _eval_batch_node(node[3], source_columns, batch)
-        op = node[1]
-        return [
-            None if lval is None or rval is None else _compare_values(op, lval, rval)
-            for lval, rval in zip(left, right)
-        ]
-    if tag == "case":
-        # Conditions are tried in written order; only TRUE routes a row to
-        # the branch result.  Each result expression is evaluated on the
-        # sub-batch of rows routed to it, so division by zero, int64
-        # overflow or a non-finite float64 inside an unhit branch never
-        # raises; rows no branch claimed fall through to ELSE (or NULL).
-        result: list = [None] * len(batch)
-        remaining = list(range(len(batch)))
-        for condition, result_node in node[1]:
-            if not remaining:
-                break
-            cond_values = _eval_batch_node(
-                condition, source_columns, [batch[k] for k in remaining]
-            )
-            taken = [k for k, cond in zip(remaining, cond_values) if cond is True]
-            remaining = [
-                k for k, cond in zip(remaining, cond_values) if cond is not True
-            ]
-            if taken:
-                values = _eval_batch_node(
-                    result_node, source_columns, [batch[k] for k in taken]
-                )
-                for k, value in zip(taken, values):
-                    result[k] = value
-        if remaining and node[2] is not None:
-            values = _eval_batch_node(
-                node[2], source_columns, [batch[k] for k in remaining]
-            )
-            for k, value in zip(remaining, values):
-                result[k] = value
-        if node[3] == "float64":
-            # int64/float64 results unify to float64; ints become floats.
-            return [
-                float(value)
-                if isinstance(value, int) and not isinstance(value, bool)
-                else value
-                for value in result
-            ]
-        return result
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -2564,20 +2796,19 @@ def _distinct_values(col, arg_type: str, rows) -> list:
 _FLIP_CMP_OP = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
 
-def _is_pushable_leaf(node: tuple) -> bool:
+def _is_pushable_leaf(node: _Expr) -> bool:
     """Whether a bound WHERE leaf can be checked against column statistics."""
-    tag = node[0]
-    if tag == "isnull":
-        return node[1][0] == "column"
-    if tag == "cmp":
-        left, right = node[2], node[3]
-        return (left[0] == "column" and right[0] == "literal") or (
-            left[0] == "literal" and right[0] == "column"
+    if isinstance(node, _IsNull):
+        return isinstance(node.operand, _Column)
+    if isinstance(node, _Cmp):
+        left, right = node.left, node.right
+        return (isinstance(left, _Column) and isinstance(right, _Literal)) or (
+            isinstance(left, _Literal) and isinstance(right, _Column)
         )
     return False
 
 
-def _walk_top_and_leaves(node: tuple, sink) -> None:
+def _walk_top_and_leaves(node: _Expr, sink) -> None:
     """Feed the top-level AND-connected pushable leaves to ``sink``.
 
     Only the AND spine at the root is unfolded; leaves nested under OR,
@@ -2585,14 +2816,14 @@ def _walk_top_and_leaves(node: tuple, sink) -> None:
     sitting directly on the AND spine are simply skipped, so they neither
     prune groups nor block the pushdown of their eligible siblings.
     """
-    if node[0] == "and":
-        _walk_top_and_leaves(node[1], sink)
-        _walk_top_and_leaves(node[2], sink)
+    if isinstance(node, _Logic) and node.op == "and":
+        _walk_top_and_leaves(node.left, sink)
+        _walk_top_and_leaves(node.right, sink)
     elif _is_pushable_leaf(node):
         sink(node)
 
 
-def _extract_pushable(where: tuple | None) -> list:
+def _extract_pushable(where: _Expr | None) -> list:
     """The AND-connected pushable leaves of a bound WHERE tree, in order."""
     conditions: list = []
     if where is not None:
@@ -2600,7 +2831,7 @@ def _extract_pushable(where: tuple | None) -> list:
     return conditions
 
 
-def _condition_possible(cond: tuple, group: Mapping, col_index: int) -> bool:
+def _condition_possible(cond: _Expr, group: Mapping, col_index: int) -> bool:
     """Whether ``cond`` could be TRUE for some row of ``group``.
 
     Only a provable "cannot be TRUE" returns False; anything undecidable
@@ -2609,21 +2840,21 @@ def _condition_possible(cond: tuple, group: Mapping, col_index: int) -> bool:
     local in the single-file case and translated by the caller for joins).
     """
     group_rows = group["row_count"]
-    if cond[0] == "isnull":
+    if isinstance(cond, _IsNull):
         stats = group["columns"][col_index]
-        if cond[2]:  # IS NOT NULL
+        if cond.negated:  # IS NOT NULL
             return stats["null_count"] < group_rows
         return stats["null_count"] > 0
     # A column-vs-literal comparison (normalised to column OP literal).
-    op = cond[1]
-    left, right = cond[2], cond[3]
-    if left[0] != "column":
+    op = cond.op
+    left, right = cond.left, cond.right
+    if not isinstance(left, _Column):
         op = _FLIP_CMP_OP[op]
     stats = group["columns"][col_index]
     if stats["null_count"] == group_rows:
         # All values NULL: a comparison is never TRUE.
         return False
-    literal = right[1] if left[0] == "column" else left[1]
+    literal = right.value if isinstance(left, _Column) else left.value
     minimum = stats["min"]
     maximum = stats["max"]
     if op == "=":
@@ -2639,12 +2870,12 @@ def _condition_possible(cond: tuple, group: Mapping, col_index: int) -> bool:
     return maximum >= literal  # ">="
 
 
-def _leaf_col_index(cond: tuple) -> int:
+def _leaf_col_index(cond: _Expr) -> int:
     """The bound column index carried by one pushable leaf."""
-    column = cond[1] if cond[0] == "isnull" else (
-        cond[2] if cond[2][0] == "column" else cond[3]
-    )
-    return column[2]
+    if isinstance(cond, _IsNull):
+        return cond.operand.index
+    column = cond.left if isinstance(cond.left, _Column) else cond.right
+    return column.index
 
 
 def _select_row_groups(groups: list, pushed: list, col_indices: list) -> list[int]:
@@ -2674,10 +2905,10 @@ def _pushed_condition_json(pushed: list) -> dict | None:
     """Render the pushed-down condition set as one condition tree (or null)."""
     if not pushed:
         return None
-    node = pushed[0]
+    node: _Expr = pushed[0]
     for cond in pushed[1:]:
-        node = ("and", node, cond)
-    return _expr_json(node)
+        node = _Logic("and", node, cond)
+    return node.to_json()
 
 
 def _source_column_spans(schemas: Mapping, table_keys: tuple) -> dict:
@@ -3418,7 +3649,7 @@ def _project_item_batch(items, source_columns, batch) -> list[tuple]:
         columns = [
             [source_columns[item.col_index][i] for i in batch]
             if item.kind == "column"
-            else _eval_batch_node(item.expr, source_columns, batch)
+            else item.expr.eval_batch(source_columns, batch, None)
             for item in items
         ]
     except QueryValidationError:
@@ -3427,7 +3658,7 @@ def _project_item_batch(items, source_columns, batch) -> list[tuple]:
             tuple(
                 source_columns[item.col_index][i]
                 if item.kind == "column"
-                else _eval(item.expr, _row_values(source_columns, i))
+                else item.expr.eval(_row_values(source_columns, i), None)
                 for item in items
             )
             for i in batch
@@ -3539,63 +3770,19 @@ def _run_aggregate(table: Table, select: _Select, bound, selected: list[int]) ->
 
 
 def _eval_having(
-    node: tuple,
+    node: _Expr,
     source_columns: tuple[tuple, ...],
     rows: tuple[int, ...],
     agg_values: tuple,
 ) -> bool | None:
-    """Three-valued evaluation of a bound HAVING condition for one group."""
-    tag = node[0]
-    if tag == "literal":
-        return node[1]
-    if tag == "column":
-        # Bound HAVING columns are always grouping columns; groups are never
-        # empty (and the global aggregate case carries no column nodes).
-        return source_columns[node[2]][rows[0]]
-    if tag == "hagg":
-        return agg_values[node[1]]
-    if tag == "isnull":
-        value = _eval_having(node[1], source_columns, rows, agg_values)
-        result = value is None
-        return (not result) if node[2] else result
-    if tag == "not":
-        value = _eval_having(node[1], source_columns, rows, agg_values)
-        return None if value is None else (not value)
-    if tag in ("and", "or"):
-        # Short-circuit SQL semantics; UNKNOWN propagates only when needed.
-        left = _eval_having(node[1], source_columns, rows, agg_values)
-        right = _eval_having(node[2], source_columns, rows, agg_values)
-        if tag == "and":
-            if left is False or right is False:
-                return False
-            if left is None or right is None:
-                return None
-            return True
-        if left is True or right is True:
-            return True
-        if left is None or right is None:
-            return None
-        return False
-    if tag == "cmp":
-        left = _eval_having(node[2], source_columns, rows, agg_values)
-        right = _eval_having(node[3], source_columns, rows, agg_values)
-        if left is None or right is None:
-            return None
-        op = node[1]
-        if op == "=":
-            result = left == right
-        elif op == "!=":
-            result = left != right
-        elif op == "<":
-            result = left < right
-        elif op == "<=":
-            result = left <= right
-        elif op == ">":
-            result = left > right
-        else:  # ">="
-            result = left >= right
-        return bool(result)
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+    """Three-valued evaluation of a bound HAVING condition for one group.
+
+    The bound tree is the same expression IR as WHERE; grouping columns
+    are read from the group's first selected row, which is always present
+    for a group node (the global aggregate case carries no columns).
+    """
+    row = _row_values(source_columns, rows[0]) if rows else ()
+    return node.eval(row, agg_values)
 
 
 def _build_groups(
@@ -3850,36 +4037,15 @@ def _source_description(key: str, metadata: Mapping) -> dict:
     }
 
 
-def _collect_expr_columns(node: tuple, indices: set) -> None:
-    tag = node[0]
-    if tag == "literal":
-        return
-    if tag == "column":
-        indices.add(node[2])
-        return
-    if tag in ("not", "isnull", "unary"):
-        _collect_expr_columns(node[1], indices)
-        return
-    if tag in ("and", "or"):
-        _collect_expr_columns(node[1], indices)
-        _collect_expr_columns(node[2], indices)
-        return
-    if tag == "arith":
-        _collect_expr_columns(node[2], indices)
-        _collect_expr_columns(node[3], indices)
-        return
-    if tag == "case":
-        for condition, result in node[1]:
-            _collect_expr_columns(condition, indices)
-            _collect_expr_columns(result, indices)
-        if node[2] is not None:
-            _collect_expr_columns(node[2], indices)
-        return
-    if tag == "cmp":
-        _collect_expr_columns(node[2], indices)
-        _collect_expr_columns(node[3], indices)
-        return
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+def _collect_expr_columns(node: _Expr, indices: set) -> None:
+    """Add every source-column index referenced by one bound expression.
+
+    One traversal for WHERE, SELECT expressions, ORDER BY aliases and the
+    HAVING tree: the node hierarchy itself owns the walk.  HAVING
+    aggregate leaves reference no source column here -- their arguments
+    are scanned separately through the aggregate registry.
+    """
+    indices.update(node.columns())
 
 
 def _collect_required_indices(bound: Mapping) -> set:
@@ -3900,7 +4066,7 @@ def _collect_required_indices(bound: Mapping) -> set:
         if item.arg_index >= 0:
             indices.add(item.arg_index)
     if bound.get("having") is not None:
-        _collect_having_columns(bound["having"], indices)
+        _collect_expr_columns(bound["having"], indices)
     for entry in bound["order_by"] or ():
         if entry[0] == "col":
             indices.add(entry[1])
@@ -3911,145 +4077,15 @@ def _collect_required_indices(bound: Mapping) -> set:
     return indices
 
 
-def _collect_having_columns(node: tuple, indices: set) -> None:
-    """Column indices referenced by a bound HAVING tree (agg args excluded)."""
-    tag = node[0]
-    if tag in ("literal", "hagg"):
-        return
-    if tag == "column":
-        indices.add(node[2])
-        return
-    if tag in ("not", "isnull"):
-        _collect_having_columns(node[1], indices)
-        return
-    if tag in ("and", "or"):
-        _collect_having_columns(node[1], indices)
-        _collect_having_columns(node[2], indices)
-        return
-    if tag == "cmp":
-        _collect_having_columns(node[2], indices)
-        _collect_having_columns(node[3], indices)
-        return
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+def _expr_json(node: _Expr) -> dict:
+    """Render a bound expression as its explain-plan JSON tree.
 
-
-def _expr_json(node: tuple) -> dict:
-    """Render a bound expression as a recursive JSON-serialisable tree.
-
-    Internal nodes carry ``kind`` / ``operator`` / ``operands``; leaves are
-    typed literals or bound column names.
+    Every bound node -- WHERE conditions, SELECT expressions and the HAVING
+    tree including its aggregate leaves -- owns its rendering via
+    :meth:`_Expr.to_json`, so plan JSON and the executable expression can
+    never disagree.
     """
-    tag = node[0]
-    if tag == "literal":
-        return {"kind": "literal", "type": node[2], "value": node[1]}
-    if tag == "column":
-        return {"kind": "column", "name": node[1]}
-    if tag == "unary":
-        operator = "-" if node[2] else "+"
-        return {
-            "kind": "unary",
-            "operator": operator,
-            "operands": [_expr_json(node[1])],
-        }
-    if tag == "arith":
-        return {
-            "kind": "arithmetic",
-            "operator": node[1],
-            "operands": [_expr_json(node[2]), _expr_json(node[3])],
-        }
-    if tag == "case":
-        # Written order is preserved; an omitted ELSE is rendered as null,
-        # which also marks the implicit result nullable in the output schema.
-        return {
-            "kind": "case",
-            "cases": [
-                {"when": _expr_json(cond), "then": _expr_json(result)}
-                for cond, result in node[1]
-            ],
-            "else": None if node[2] is None else _expr_json(node[2]),
-        }
-    if tag == "cmp":
-        return {
-            "kind": "comparison",
-            "operator": node[1],
-            "operands": [_expr_json(node[2]), _expr_json(node[3])],
-        }
-    if tag == "isnull":
-        return {
-            "kind": "is_null",
-            "operator": "IS NOT NULL" if node[2] else "IS NULL",
-            "operands": [_expr_json(node[1])],
-        }
-    if tag == "not":
-        return {
-            "kind": "not",
-            "operator": "NOT",
-            "operands": [_expr_json(node[1])],
-        }
-    if tag in ("and", "or"):
-        return {
-            "kind": "logic",
-            "operator": tag.upper(),
-            "operands": [_expr_json(node[1]), _expr_json(node[2])],
-        }
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
-
-
-def _having_expr_json(node: tuple, schema: Schema, aggregates: tuple) -> dict:
-    """Render a bound HAVING condition as a recursive JSON-serialisable tree.
-
-    The boolean structure mirrors :func:`_expr_json`; value leaves are typed
-    literals, bound grouping columns or aggregate calls (the aggregate leaf
-    additionally carries its static ``type`` and ``nullable`` flag).
-    """
-    tag = node[0]
-    if tag == "literal":
-        return {"kind": "literal", "type": node[2], "value": node[1]}
-    if tag == "column":
-        return {"kind": "column", "name": node[1]}
-    if tag == "hagg":
-        agg = aggregates[node[1]]
-        leaf = {
-            "kind": "aggregate",
-            "function": agg.func,
-            "argument": None if agg.arg_index < 0 else schema.columns[agg.arg_index].name,
-            "type": agg.out_type,
-            "nullable": agg.nullable,
-        }
-        if agg.distinct:
-            leaf["distinct"] = True
-        return leaf
-    if tag == "cmp":
-        return {
-            "kind": "comparison",
-            "operator": node[1],
-            "operands": [
-                _having_expr_json(node[2], schema, aggregates),
-                _having_expr_json(node[3], schema, aggregates),
-            ],
-        }
-    if tag == "isnull":
-        return {
-            "kind": "is_null",
-            "operator": "IS NOT NULL" if node[2] else "IS NULL",
-            "operands": [_having_expr_json(node[1], schema, aggregates)],
-        }
-    if tag == "not":
-        return {
-            "kind": "not",
-            "operator": "NOT",
-            "operands": [_having_expr_json(node[1], schema, aggregates)],
-        }
-    if tag in ("and", "or"):
-        return {
-            "kind": "logic",
-            "operator": tag.upper(),
-            "operands": [
-                _having_expr_json(node[1], schema, aggregates),
-                _having_expr_json(node[2], schema, aggregates),
-            ],
-        }
-    raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover
+    return node.to_json()
 
 
 def _aggregate_json(item, schema: Schema) -> dict:
@@ -4147,9 +4183,7 @@ def _build_explain(
             operators.append(
                 {
                     "operator": "Having",
-                    "condition": _having_expr_json(
-                        bound["having"], schema, bound["aggregates"]
-                    ),
+                    "condition": _expr_json(bound["having"]),
                 }
             )
 
