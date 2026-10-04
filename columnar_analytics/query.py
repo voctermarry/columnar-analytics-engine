@@ -353,20 +353,13 @@ _AGG_NAMES = frozenset(("count", "sum", "avg", "min", "max"))
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
-# Optional join strategies for multi-file (join-chain) queries.  ``None``
-# keeps the implicit historical path (a right-key hash lookup).  ``HASH`` is that same path
-# requested explicitly; ``SORT_MERGE`` sorts both sides on the join key and
-# merges the runs.  Both produce byte-identical results; only the explicit
-# spellings surface in the explain plan.
-_JOIN_STRATEGIES = frozenset(("hash", "sort_merge"))
-_JOIN_STRATEGY_LABELS = {"hash": "HASH", "sort_merge": "SORT_MERGE"}
-
-
 def _validate_join_strategy(join_strategy: Any) -> str | None:
     """Validate the optional ``join_strategy`` argument.
 
     Returns the canonical lowercase strategy name, or ``None`` when the
-    caller did not request one.  Any other value (including a non-string)
+    caller did not request one.  The accepted names are exactly the
+    algorithms registered in :data:`_JOIN_ALGORITHMS` (see the join
+    execution section below).  Any other value (including a non-string)
     raises :class:`ValueError`; callers run this before opening any file.
     """
     if join_strategy is None:
@@ -3255,6 +3248,33 @@ def _rewrite_having_expr(node: tuple, resolve) -> tuple:
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 
+# ---------------------------------------------------------------------------
+# Join execution
+# ---------------------------------------------------------------------------
+#
+# A join step runs through one common pipeline; only the match-finding
+# stage is algorithm-specific:
+#
+# * schema assembly (:func:`_build_joined_schema`) validates the ON keys
+#   and derives the combined schema, including the nullability each outer
+#   join kind forces on the padded side;
+# * match finding (one of the functions registered in
+#   :data:`_JOIN_ALGORITHMS`) computes only the match relation -- which
+#   left rows pair with which right rows;
+# * result assembly (:func:`_emit_join_columns`) expands the relation into
+#   the joined columns, applying the join kind's expansion order and the
+#   outer-join NULL padding.
+#
+# Every algorithm is handed the two key columns as ``(row index, key)``
+# entry lists in file order with NULL keys already removed (NULL keys
+# never match) and returns ``matches_by_left``: a mapping of left row
+# index to its matching right row indices in right-file order.  Key
+# extraction, the inverse match map, the expansion, the padding and the
+# deterministic row order all live in the common path, so adding an
+# algorithm means writing one match function and one registry entry --
+# the query stages before and after the join never change.
+
+
 def _build_joined_schema(
     prior_schema: Schema,
     new_schema: Schema,
@@ -3313,80 +3333,92 @@ def _build_joined_schema(
     return Schema(combined_columns)
 
 
+@dataclass(frozen=True)
+class _JoinMatches:
+    """The match relation of one equi-join step.
+
+    ``by_left`` maps a left row index to its matching right row indices in
+    right-file order; ``by_right`` is the inverse relation, mapping a
+    right row index to its matching left row indices in left-file order.
+    Rows absent from a map are unmatched on that side.
+    """
+
+    by_left: Mapping
+    by_right: Mapping
+
+
 def _execute_join_step(
     prior: Table,
     new: Table,
     step: _JoinStep,
     strategy: str | None = None,
 ) -> Table:
+    """Execute one join step: schema, match relation, result assembly."""
     schema = _build_joined_schema(prior.schema, new.schema, step)
-    prior_idx = prior.schema.index(f"{step.prior_key}.{step.prior_col}")
-    new_idx = new.schema.index(step.new_col)
-    if strategy == "sort_merge":
-        columns = _sort_merge_join_columns(prior, new, prior_idx, new_idx, step.kind)
-    else:
-        columns = _join_columns(prior, new, prior_idx, new_idx, step.kind)
+    matches = _match_join_step(prior, new, step, strategy)
+    columns = _emit_join_columns(prior, new, matches, step.kind)
     return Table._from_storage(schema, columns)
 
 
-def _join_columns(
-    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
-) -> list:
-    """Hash equi-join preserving the required file row order."""
-    left_cols = left._columns
-    right_cols = right._columns
-    # NULL keys never match, so they stay out of the right-side index.
-    index: dict[Any, list[int]] = {}
-    for j, key in enumerate(right_cols[right_idx]):
-        if key is not None:
-            index.setdefault(key, []).append(j)
-    matches_by_left: dict[int, list[int]] = {}
-    matches_by_right: dict[int, list[int]] = {}
-    # Left rows are scanned in file order so the inverse lists keep left
-    # file order for the RIGHT / FULL unmatched-right bookkeeping.
-    for i, key in enumerate(left_cols[left_idx]):
-        if key is None:
-            continue
-        matches = index.get(key)
-        if matches:
-            matches_by_left[i] = matches
-            for j in matches:
-                matches_by_right.setdefault(j, []).append(i)
-    return _emit_join_columns(
-        left, right, matches_by_left, matches_by_right, kind
-    )
+def _match_join_step(
+    prior: Table, new: Table, step: _JoinStep, strategy: str | None
+) -> _JoinMatches:
+    """Run the selected algorithm and derive the full match relation.
 
-
-def _sort_merge_join_columns(
-    left: Table, right: Table, left_idx: int, right_idx: int, kind: str
-) -> list:
-    """Sort-merge equi-join.
-
-    Both sides are stably sorted by the join key (NULLs excluded, they can
-    never match) and equal-key runs are merged.  The matches are emitted by
-    the shared :func:`_emit_join_columns` path, so the result is identical
-    to :func:`_join_columns`; the two paths differ only in how the matches
-    are found.
+    The algorithm sees only the non-NULL key entries and reports matches
+    by left row; the inverse relation (each right row's matching left
+    rows, in left-file order) is derived here by walking the left rows in
+    file order, identically for every algorithm.
     """
-    left_cols = left._columns
-    right_cols = right._columns
-    left_keys = left_cols[left_idx]
-    right_keys = right_cols[right_idx]
-    left_order = sorted(
-        (i for i in range(left.row_count) if left_keys[i] is not None),
-        key=lambda i: left_keys[i],
+    prior_idx = prior.schema.index(f"{step.prior_key}.{step.prior_col}")
+    new_idx = new.schema.index(step.new_col)
+    find_matches = _JOIN_ALGORITHMS[strategy or _DEFAULT_JOIN_ALGORITHM]
+    by_left = find_matches(
+        _non_null_key_entries(prior._columns[prior_idx]),
+        _non_null_key_entries(new._columns[new_idx]),
     )
-    right_order = sorted(
-        (j for j in range(right.row_count) if right_keys[j] is not None),
-        key=lambda j: right_keys[j],
-    )
+    by_right: dict[int, list[int]] = {}
+    for i in range(prior.row_count):
+        for j in by_left.get(i, ()):
+            by_right.setdefault(j, []).append(i)
+    return _JoinMatches(by_left, by_right)
 
-    # Index each non-NULL right key to the run of right rows carrying it;
-    # runs are visited in sorted order and keep right-file row order.
+
+def _non_null_key_entries(keys) -> list:
+    """The ``(row index, key)`` pairs of one key column, NULL keys removed.
+
+    NULL keys never match, so no algorithm ever sees them; the entries
+    keep the column's file order.
+    """
+    return [(index, key) for index, key in enumerate(keys) if key is not None]
+
+
+def _hash_join_matches(left_entries: list, right_entries: list) -> dict:
+    """Hash equi-join: index the right keys, probe with each left key."""
+    index: dict[Any, list[int]] = {}
+    for j, key in right_entries:
+        index.setdefault(key, []).append(j)
+    matches: dict[int, list[int]] = {}
+    for i, key in left_entries:
+        hit = index.get(key)
+        if hit:
+            matches[i] = hit
+    return matches
+
+
+def _sort_merge_join_matches(left_entries: list, right_entries: list) -> dict:
+    """Sort-merge equi-join: sort both sides on the key and merge the runs.
+
+    The sort is stable, so each equal-key run keeps its side's file order;
+    the merge visits the right-key runs in sorted key order.
+    """
+    left_order = sorted(left_entries, key=lambda entry: entry[1])
+    right_order = sorted(right_entries, key=lambda entry: entry[1])
+
+    # Index each right key to the run of right rows carrying it.
     right_runs: dict[Any, list[int]] = {}
     run_order: list[Any] = []
-    for j in right_order:
-        key = right_keys[j]
+    for j, key in right_order:
         run = right_runs.get(key)
         if run is None:
             run = []
@@ -3394,35 +3426,41 @@ def _sort_merge_join_columns(
             run_order.append(key)
         run.append(j)
 
-    matches_by_left: dict[int, list[int]] = {}
+    matches: dict[int, list[int]] = {}
     p = 0
-    for i in left_order:
-        key = left_keys[i]
+    for i, key in left_order:
         while p < len(run_order) and run_order[p] < key:
             p += 1
         if p < len(run_order) and run_order[p] == key:
-            matches_by_left[i] = right_runs[run_order[p]]
+            matches[i] = right_runs[run_order[p]]
+    return matches
 
-    # The inverse map lists matching left rows in left-file order; walking
-    # left rows in order (rather than the sorted order) preserves it.
-    matches_by_right: dict[int, list[int]] = {}
-    for i in range(left.row_count):
-        for j in matches_by_left.get(i, ()):
-            matches_by_right.setdefault(j, []).append(i)
 
-    return _emit_join_columns(
-        left, right, matches_by_left, matches_by_right, kind
-    )
+# The join algorithm registry: strategy name -> match function with the
+# contract described above.  ``None`` (join_strategy omitted) selects the
+# default algorithm without naming it in the explain plan; ``"hash"`` is
+# that same algorithm requested explicitly.  Adding an algorithm takes one
+# match function and one entry here (plus its explain-plan label); result
+# assembly, nullability and row order stay with the common path.
+_JOIN_ALGORITHMS = {
+    "hash": _hash_join_matches,
+    "sort_merge": _sort_merge_join_matches,
+}
+_DEFAULT_JOIN_ALGORITHM = "hash"
+
+# The strategy names accepted by the public entry points (exactly the
+# registered algorithms) and the label each carries in the explain plan.
+_JOIN_STRATEGIES = frozenset(_JOIN_ALGORITHMS)
+_JOIN_STRATEGY_LABELS = {"hash": "HASH", "sort_merge": "SORT_MERGE"}
 
 
 def _emit_join_columns(
     left: Table,
     right: Table,
-    matches_by_left: dict,
-    matches_by_right: dict,
+    matches: _JoinMatches,
     kind: str,
 ) -> list:
-    """Expand match maps into joined columns for every supported join kind.
+    """Expand a match relation into joined columns for every join kind.
 
     INNER / LEFT / FULL are driven by left-file order (matched combinations
     first, then unmatched left rows), and FULL additionally appends the
@@ -3456,7 +3494,7 @@ def _emit_join_columns(
 
     if kind == "right":
         for j in range(right.row_count):
-            left_matches = matches_by_right.get(j)
+            left_matches = matches.by_right.get(j)
             if left_matches:
                 for i in left_matches:
                     emit_match(i, j)
@@ -3465,7 +3503,7 @@ def _emit_join_columns(
         return out
 
     for i in range(left.row_count):
-        right_matches = matches_by_left.get(i)
+        right_matches = matches.by_left.get(i)
         if right_matches:
             for j in right_matches:
                 emit_match(i, j)
@@ -3473,7 +3511,7 @@ def _emit_join_columns(
             emit_unmatched_left(i)
     if kind == "full":
         for j in range(right.row_count):
-            if j not in matches_by_right:
+            if j not in matches.by_right:
                 emit_unmatched_right(j)
     return out
 
