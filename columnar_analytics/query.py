@@ -156,6 +156,29 @@ follows SQL three-valued logic: a normal
 comparison against NULL yields UNKNOWN, UNKNOWN propagates through the
 logical operators, and only TRUE rows are returned.
 
+Discrete set membership is expressed with ``operand [NOT] IN (list)`` in
+WHERE and CASE WHEN conditions; in HAVING the operand stays limited to
+grouping columns, aggregate calls and literals.  The list is non-empty and
+holds bool, int64, float64 or utf8 literals plus a NULL allowed only inside
+the list -- no column references, expressions or aggregate calls; missing
+parentheses, an empty list, a trailing comma, an illegal item or a NOT/IN
+ordering error are :class:`QuerySyntaxError` raised before any file is
+opened.  The operand is type-checked against every non-NULL option with
+the comparison rules (int64 and float64 may mix; bool and utf8 match only
+their own family), so an incompatible list raises
+:class:`QueryValidationError`; an all-NULL list is legal.  A NULL operand
+is UNKNOWN; otherwise a match on a non-NULL option is TRUE for IN / FALSE
+for NOT IN, and with no match the predicate is UNKNOWN when the list
+contains NULL and FALSE / TRUE otherwise.  Operand division-by-zero,
+int64 overflow and non-finite float64 results raise
+:class:`QueryValidationError` just like other scalar expressions.  The
+explain tree renders the predicate as ``{"kind": "in", "negated": ...,
+"operand": ..., "options": [...]}`` with options in written order.  For
+single-source and all-INNER-chain v2 scans a top-level AND ``column IN
+(constants)`` leaf joins the statistics pushdown: a group is skipped when
+its statistics prove no non-NULL candidate can occur there; NOT IN and
+expression operands are never pushed.
+
 After WHERE, rows are grouped in GROUP BY column order (a NULL key forms
 its own group); without an explicit ORDER BY groups come out in the order
 of their first selected row.  An optional HAVING clause between GROUP BY

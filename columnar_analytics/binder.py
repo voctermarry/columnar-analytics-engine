@@ -22,12 +22,14 @@ from .expr import (
     _Column,
     _Cmp,
     _Expr,
+    _In,
     _IsNull,
     _Literal,
     _Logic,
     _Not,
     _bind_expr,
     _check_comparison_types,
+    _check_in_types,
     _require_boolean,
 )
 from .format import ColumnSchema, Schema
@@ -377,6 +379,10 @@ def _having_tree_has_aggregate(node: tuple) -> bool:
         return _having_tree_has_aggregate(node[2]) or _having_tree_has_aggregate(
             node[3]
         )
+    if tag == "in":
+        # Options are parser-restricted to constants; only the operand can
+        # name an aggregate.
+        return _having_tree_has_aggregate(node[1])
     return _having_tree_has_aggregate(node[1]) or _having_tree_has_aggregate(node[2])
 
 
@@ -457,6 +463,22 @@ def _bind_having(
             )
         _check_comparison_types(op, left, right)
         return _Cmp(op, left, right)
+    if tag == "in":
+        operand = _bind_having(
+            node[1], schema, group_index_set, agg_order, require_aggregate
+        )
+        if not operand.is_having_leaf:
+            raise QuerySyntaxError(
+                "IN operand must be a group column, an aggregate or a literal"
+            )
+        options = tuple(
+            _bind_having(
+                option, schema, group_index_set, agg_order, require_aggregate
+            )
+            for option in node[3]
+        )
+        _check_in_types(operand, options)
+        return _In(operand, options, node[2])
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
 
 

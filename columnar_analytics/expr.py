@@ -385,6 +385,58 @@ class _Cmp(_Predicate):
         ]
 
 
+class _In(_Predicate):
+    """An ``operand [NOT] IN (constant list)`` predicate.
+
+    The options stay literal-only (NULL is legal inside the list); the
+    operand is any bound value expression.  Three-valued result: a NULL
+    operand is UNKNOWN; a non-NULL operand equal to a non-NULL option is
+    TRUE for IN / FALSE for NOT IN; with no match the predicate is
+    UNKNOWN when the list contains NULL and FALSE / TRUE otherwise.
+    """
+
+    __slots__ = ("operand", "negated", "options", "_option_values", "_has_null")
+
+    def __init__(self, operand: _Expr, options: tuple, negated: bool):
+        nullable = operand.nullable or any(option.value is None for option in options)
+        super().__init__(nullable, (operand, *options))
+        self.operand = operand
+        self.negated = negated
+        self.options = options
+        self._option_values = tuple(
+            option.value for option in options if option.value is not None
+        )
+        self._has_null = len(self._option_values) != len(options)
+
+    def to_json(self) -> dict:
+        return {
+            "kind": "in",
+            "negated": self.negated,
+            "operand": self.operand.to_json(),
+            "options": [option.to_json() for option in self.options],
+        }
+
+    def _match(self, value) -> bool:
+        for candidate in self._option_values:
+            if _compare_values("=", value, candidate):
+                # IN -> TRUE; NOT IN -> FALSE.
+                return not self.negated
+        if self._has_null:
+            return None
+        # No match and no NULL option: IN -> FALSE; NOT IN -> TRUE.
+        return self.negated
+
+    def eval(self, row: tuple, agg_values: tuple | None):
+        value = self.operand.eval(row, agg_values)
+        if value is None:
+            return None
+        return self._match(value)
+
+    def eval_batch(self, source_columns, batch, agg_values: tuple | None) -> list:
+        values = self.operand.eval_batch(source_columns, batch, agg_values)
+        return [None if value is None else self._match(value) for value in values]
+
+
 class _IsNull(_Predicate):
     """IS NULL / IS NOT NULL; never itself UNKNOWN."""
 
@@ -587,7 +639,31 @@ def _bind_expr(node: tuple, schema: Schema) -> _Expr:
             )
         _check_comparison_types(op, left, right)
         return _Cmp(op, left, right)
+    if tag == "in":
+        operand = _bind_expr(node[1], schema)
+        if not operand.is_value:
+            raise QuerySyntaxError(
+                "IN operand must be a value expression"
+            )
+        # Options are parser-restricted to literals (NULL carries type None);
+        # the generic literal binder builds each one.
+        options = tuple(_bind_expr(option, schema) for option in node[3])
+        _check_in_types(operand, options)
+        return _In(operand, options, node[2])
     raise QuerySyntaxError(f"unsupported expression: {tag}")  # pragma: no cover - defensive
+
+
+def _check_in_types(operand: _Expr, options) -> None:
+    """Validate the IN operand against every non-NULL list option.
+
+    The options follow the comparison rules one by one, so int64/float64
+    may mix while bool and utf8 only match their own family; an all-NULL
+    list imposes no type constraint.
+    """
+    for option in options:
+        if option.type is None:  # the list-only NULL marker
+            continue
+        _check_comparison_types("=", operand, option)
 
 
 def _check_comparison_types(op: str, left: _Expr, right: _Expr) -> None:

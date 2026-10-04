@@ -32,6 +32,7 @@ _KEYWORDS = frozenset(
         "or",
         "is",
         "null",
+        "in",
         "true",
         "false",
         "order",
@@ -231,6 +232,9 @@ def _parse_number(text: str) -> int | float:
 #   ("case", ((cond, result), ...), else_node|None)
 #   ("cmp", op, left_node, right_node)
 #   ("isnull", operand, negate)
+#   ("in", operand, negate, (option_node, ...))
+#        -- [NOT] IN over one or more literal options; an all-NULL option
+#        is spelled ("literal", None, None) and is legal only inside this list
 #   ("not", operand)
 #   ("and"|"or", left, right)
 # The HAVING grammar additionally produces its own aggregate leaf:
@@ -738,6 +742,11 @@ class _Parser:
             self._next()
             right = self._parse_having_not_factor()
             return ("cmp", tok.value, left, right)
+        if self._accept_keyword("not"):
+            self._expect_keyword("in")
+            return ("in", left, True, self._parse_in_options())
+        if self._accept_keyword("in"):
+            return ("in", left, False, self._parse_in_options())
         return left
 
     def _parse_having_not_factor(self) -> tuple:
@@ -866,7 +875,71 @@ class _Parser:
             self._next()
             right = self._parse_not_factor()
             return ("cmp", tok.value, left, right)
+        if self._accept_keyword("not"):
+            # NOT only keeps its postfix-predicate meaning as part of
+            # "operand NOT IN (...)"; anything else after it is an error.
+            self._expect_keyword("in")
+            return ("in", left, True, self._parse_in_options())
+        if self._accept_keyword("in"):
+            return ("in", left, False, self._parse_in_options())
         return left
+
+    def _parse_in_options(self) -> tuple:
+        # A non-empty, comma-separated list of constant literals enclosed in
+        # parentheses; NULL is accepted only as an option here.  A missing
+        # parenthesis, an empty list, a trailing comma or any non-literal
+        # item (a column, an expression, an aggregate) is a syntax error
+        # raised before any file is opened.
+        self._expect_op("(")
+        options = [self._parse_in_option()]
+        while self._accept_op(","):
+            options.append(self._parse_in_option())
+        self._expect_op(")")
+        return tuple(options)
+
+    def _parse_in_option(self) -> tuple:
+        tok = self._peek()
+        if tok.kind == "keyword" and tok.value == "null":
+            self._next()
+            # The NULL-only list marker: type None marks the list-only NULL.
+            return ("literal", None, None)
+        if tok.kind == "op" and tok.value in ("+", "-"):
+            nxt = self.tokens[self.pos + 1]
+            if nxt.kind == "number" and not isinstance(nxt.value, bool):
+                self._next()
+                self._next()
+                value = nxt.value
+                if isinstance(value, int):
+                    if tok.value == "-":
+                        value = -value
+                    if not (_INT64_MIN <= value <= _INT64_MAX):
+                        raise QuerySyntaxError(
+                            "integer literal is outside the int64 range"
+                        )
+                    return ("literal", value, "int64")
+                value = -value if tok.value == "-" else value
+                return ("literal", value, "float64")
+            raise QuerySyntaxError(
+                f"IN list only allows constant literals, got {tok.text!r}"
+            )
+        if tok.kind == "number":
+            self._next()
+            value = tok.value
+            if isinstance(value, bool):
+                return ("literal", value, "bool")
+            if isinstance(value, int):
+                if value > _INT64_MAX:
+                    raise QuerySyntaxError(
+                        "integer literal is outside the int64 range"
+                    )
+                return ("literal", value, "int64")
+            return ("literal", value, "float64")
+        if tok.kind == "string":
+            self._next()
+            return ("literal", tok.value, "utf8")
+        raise QuerySyntaxError(
+            f"IN list only allows constant literals, got {tok.text!r}"
+        )
 
     def _parse_not_factor(self) -> tuple:
         if self._accept_keyword("not"):

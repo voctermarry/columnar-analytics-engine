@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .expr import _Cmp, _Column, _Expr, _IsNull, _Literal, _Logic
+from .expr import _Cmp, _Column, _Expr, _In, _IsNull, _Literal, _Logic
 from .format import Schema
 
 
@@ -21,10 +21,12 @@ from .format import Schema
 # ---------------------------------------------------------------------------
 #
 # For row-group-partitioned (v2) files the AND-connected, type-compatible
-# comparisons and IS [NOT] NULL conditions of a WHERE clause are evaluated
+# comparisons, IS [NOT] NULL conditions and positive IN-lists of a WHERE
+# clause are evaluated
 # against each group's per-column statistics.  A group is skipped only when
 # its statistics prove the pushed condition can never be TRUE for any of its
-# rows; anything else (OR, NOT, CASE, arithmetic, column-to-column or
+# rows; anything else (OR, NOT, CASE, NOT IN, an IN with an expression
+# operand, arithmetic, column-to-column or
 # cross-source comparisons, or simply undecidable ranges) keeps the group,
 # and the surviving rows are still filtered row by row with the full WHERE
 # condition.
@@ -50,6 +52,11 @@ def _is_pushable_leaf(node: _Expr) -> bool:
         return (isinstance(left, _Column) and isinstance(right, _Literal)) or (
             isinstance(left, _Literal) and isinstance(right, _Column)
         )
+    if isinstance(node, _In):
+        # Only a positive IN whose left side is one bound column and whose
+        # options are constants can be checked against statistics; NOT IN
+        # and expression operands stay out of the pushdown.
+        return not node.negated and isinstance(node.operand, _Column)
     return False
 
 
@@ -90,15 +97,24 @@ def _condition_possible(cond: _Expr, group: Mapping, col_index: int) -> bool:
         if cond.negated:  # IS NOT NULL
             return stats["null_count"] < group_rows
         return stats["null_count"] > 0
+    stats = group["columns"][col_index]
+    if stats["null_count"] == group_rows:
+        # All values NULL: neither a comparison nor an IN list can match.
+        return False
+    if isinstance(cond, _In):
+        # NULL options can never make IN TRUE; the group is possible iff
+        # the [min, max] range meets at least one non-NULL candidate.
+        minimum = stats["min"]
+        maximum = stats["max"]
+        return any(
+            option.value is not None and minimum <= option.value <= maximum
+            for option in cond.options
+        )
     # A column-vs-literal comparison (normalised to column OP literal).
     op = cond.op
     left, right = cond.left, cond.right
     if not isinstance(left, _Column):
         op = _FLIP_CMP_OP[op]
-    stats = group["columns"][col_index]
-    if stats["null_count"] == group_rows:
-        # All values NULL: a comparison is never TRUE.
-        return False
     literal = right.value if isinstance(left, _Column) else left.value
     minimum = stats["min"]
     maximum = stats["max"]
@@ -118,6 +134,8 @@ def _condition_possible(cond: _Expr, group: Mapping, col_index: int) -> bool:
 def _leaf_col_index(cond: _Expr) -> int:
     """The bound column index carried by one pushable leaf."""
     if isinstance(cond, _IsNull):
+        return cond.operand.index
+    if isinstance(cond, _In):
         return cond.operand.index
     column = cond.left if isinstance(cond.left, _Column) else cond.right
     return column.index
