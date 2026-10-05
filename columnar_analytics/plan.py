@@ -70,25 +70,34 @@ def _build_explain(
     steps: tuple[_JoinStep, ...] = (),
     strategy: str | None = None,
     scan_extras: Mapping | None = None,
+    required_columns: Mapping | None = None,
 ) -> dict:
-    referenced = _collect_required_indices(bound)
-    for step in steps:
-        # The ON keys feed the join even when neither is projected.
-        referenced.add(schema.index(f"{step.prior_key}.{step.prior_col}"))
-        referenced.add(schema.index(f"{step.new_key}.{step.new_col}"))
+    if required_columns is None:
+        # Direct callers (e.g. the stage-boundary tests) get the same
+        # required-column derivation the preparation pass shares.
+        referenced = _collect_required_indices(bound)
+        for step in steps:
+            # The ON keys feed the join even when neither is projected.
+            referenced.add(schema.index(f"{step.prior_key}.{step.prior_col}"))
+            referenced.add(schema.index(f"{step.new_key}.{step.new_col}"))
+        referenced_names = {schema.columns[i].name for i in referenced}
+        required_columns = {}
+        if not steps:
+            required_columns[sources[0][0]] = [
+                col.name for col in schema.columns if col.name in referenced_names
+            ]
+        else:
+            for key, _metadata, source_schema in sources:
+                prefix = f"{key}."
+                required_columns[key] = [
+                    col.name
+                    for col in source_schema.columns
+                    if f"{prefix}{col.name}" in referenced_names
+                ]
 
     operators: list = []
-    referenced_names = {schema.columns[i].name for i in referenced}
     for key, _metadata, source_schema in sources:
-        if not steps:
-            required = [col.name for col in schema.columns if col.name in referenced_names]
-        else:
-            prefix = f"{key}."
-            required = [
-                col.name
-                for col in source_schema.columns
-                if f"{prefix}{col.name}" in referenced_names
-            ]
+        required = list(required_columns[key])
         scan_operator = {"operator": "Scan", "source": key, "required_columns": required}
         if scan_extras is not None and key in scan_extras:
             # An eligible v2 (row-group-partitioned) scan reports the

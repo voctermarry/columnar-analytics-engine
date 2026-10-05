@@ -82,6 +82,7 @@ def test_stage_modules_have_no_import_cycles():
         "binder": 3,
         "resolve": 3,
         "pushdown": 4,
+        "prepare": 5,
         "executor": 5,
         "plan": 5,
         "query": 6,

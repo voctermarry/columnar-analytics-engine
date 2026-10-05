@@ -12,9 +12,8 @@ from __future__ import annotations
 
 import math
 from functools import cmp_to_key
-from typing import Any
 
-from .binder import _bind_select, _collect_required_indices
+from .binder import _bind_select
 from .errors import QueryValidationError
 from .expr import (
     _eval_expr_selection,
@@ -28,26 +27,11 @@ from .format import (
     Schema,
     Table,
     _read_partitioned_table,
-    inspect_file,
-    inspect_row_groups,
     read_file,
 )
 from .join import _execute_join
 from .parser import _INT64_MAX, _INT64_MIN, _Select
-from .pushdown import (
-    _extract_pushable,
-    _pushed_col_indices,
-    _pushable_leaves_by_source,
-    _select_row_groups,
-    _source_column_spans,
-    _source_scan_info,
-)
-from .resolve import (
-    _JoinStep,
-    _build_joined_schema,
-    _qualify_table,
-    _schema_from_metadata,
-)
+from .resolve import _JoinStep, _build_joined_schema, _qualify_table
 
 
 # ---------------------------------------------------------------------------
@@ -126,86 +110,49 @@ def _distinct_values(col, arg_type: str, rows) -> list:
             seen.add(key)
             values.append(value)
     return values
-def _query_partitioned(
-    path: Any, select: _Select, schema: Schema, expected_table
-) -> Table:
-    """Execute a single-source statement against a v2 (partitioned) file.
+def _execute_prepared(prepared) -> Table:
+    """Run one shared prepared statement over its referenced sources.
 
-    Only the columns the bound plan references are decoded, and only the
-    row groups whose statistics do not exclude them.
+    ``prepared`` is the result of the shared preparation pass
+    (:mod:`columnar_analytics.prepare`); it already carries the combined
+    schema, the bound plan, each source's required local columns and the
+    selected v2 row groups -- the exact columns and groups the explain plan
+    reports.  Every source is read restricted to those columns: a v2 source
+    additionally reads only the selected groups (a v1 source, or a chain
+    containing an OUTER step, reads in full).  WHERE / GROUP BY / HAVING /
+    projection / DISTINCT / ORDER BY / LIMIT run only after the whole chain
+    has been built.
     """
-    bound = _bind_select(select, schema, expected_table=expected_table)
-    required = _collect_required_indices(bound)
-    groups = inspect_row_groups(path)
-    pushed = _extract_pushable(bound["where"])
-    selected = _select_row_groups(groups, pushed, _pushed_col_indices(pushed))
-    columns = {schema.columns[i].name for i in required}
-    table = _read_partitioned_table(path, columns=columns, row_groups=selected)
-    return _run_query(table, select, expected_table=expected_table)
-def _run_join_chain_partitioned(
-    paths, rewritten: _Select, from_key: str, steps, strategy, table_keys
-) -> Table:
-    """Join chain with at least one v2 (partitioned) source.
-
-    Every source is read restricted to the columns the plan actually
-    references (its join keys included); v1 sources keep the historical
-    full read.  When every join step is INNER, each v2 source additionally
-    reads only the row groups that the top-level AND leaves referencing
-    that source alone cannot rule out; a chain containing any OUTER step
-    reads every group.  WHERE still runs in full over the joined rows.
-    """
-    schemas = {}
-    versions = {}
-    for key in table_keys:
-        metadata = inspect_file(paths[key])
-        schemas[key] = _schema_from_metadata(metadata)
-        versions[key] = metadata["format_version"]
-    combined_schema = Schema(
-        tuple(
-            ColumnSchema(f"{from_key}.{col.name}", col.type, col.nullable)
-            for col in schemas[from_key].columns
-        )
-    )
-    for step in steps:
-        combined_schema = _build_joined_schema(
-            combined_schema, schemas[step.new_key], step
-        )
-    bound = _bind_select(rewritten, combined_schema, expected_table=None)
-    referenced = _collect_required_indices(bound)
-    for step in steps:
-        referenced.add(combined_schema.index(f"{step.prior_key}.{step.prior_col}"))
-        referenced.add(combined_schema.index(f"{step.new_key}.{step.new_col}"))
-    referenced_names = {combined_schema.columns[i].name for i in referenced}
-
-    all_inner = all(step.kind == "inner" for step in steps)
-    if all_inner:
-        spans = _source_column_spans(schemas, table_keys)
-        leaves_by_source = _pushable_leaves_by_source(
-            bound["where"], spans, table_keys
-        )
-        group_selection: dict = {}
-        for key in table_keys:
-            if versions[key] == FORMAT_VERSION_PARTITIONED:
-                groups = inspect_row_groups(paths[key])
-                info = _source_scan_info(groups, leaves_by_source[key], spans[key])
-                group_selection[key] = info["selected_groups"]
-    else:
-        # An OUTER step can pad a source's rows with NULLs, so no source
-        # group can be proven absent from the join result.
-        group_selection = {}
+    paths = prepared.paths
+    rewritten = prepared.rewritten
+    steps = prepared.steps
+    strategy = prepared.strategy
+    from_key = prepared.from_key
+    versions = {
+        key: metadata["format_version"] for key, metadata, _schema in prepared.sources
+    }
 
     def read_source(key: str) -> Table:
+        required = prepared.required_columns[key]
         if versions[key] != FORMAT_VERSION_PARTITIONED:
+            # v1 sources keep the historical full read.
             return read_file(paths[key])
-        required = [
-            col.name
-            for col in schemas[key].columns
-            if f"{key}.{col.name}" in referenced_names
-        ]
-        selected = group_selection.get(key)
-        return _read_partitioned_table(
+        selected = prepared.group_selection.get(key)
+        table = _read_partitioned_table(
             paths[key], columns=set(required), row_groups=selected
-        ).project(required)
+        )
+        if not required:
+            # A column-free statement such as SELECT COUNT(*) decodes no
+            # columns at all; the full-schema placeholder table still carries
+            # the selected groups' row count, which is all the plan reads.
+            return table
+        # The reader returns the full schema with unread placeholders; keep
+        # only the referenced columns in the bound plan's schema order.
+        return table.project(required)
+
+    if not steps:
+        table = read_source(from_key)
+        return _run_query(table, rewritten, expected_table=prepared.expected_table)
 
     combined = _qualify_table(read_source(from_key), from_key)
     for step in steps:
@@ -213,6 +160,8 @@ def _run_join_chain_partitioned(
             combined, read_source(step.new_key), step, strategy
         )
     return _run_query(combined, rewritten, expected_table=None)
+
+
 def _execute_join_step(
     prior: Table,
     new: Table,

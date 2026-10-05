@@ -319,60 +319,33 @@ parsing (:mod:`columnar_analytics.parser`), source and table-name
 resolution (:mod:`columnar_analytics.resolve`), schema binding
 (:mod:`columnar_analytics.binder`) over the shared bound expression IR
 (:mod:`columnar_analytics.expr`), row-group statistics pushdown
-(:mod:`columnar_analytics.pushdown`), execution
+(:mod:`columnar_analytics.pushdown`), the shared query-preparation pass
+(:mod:`columnar_analytics.prepare`), execution
 (:mod:`columnar_analytics.executor`) and explain-plan construction
 (:mod:`columnar_analytics.plan`).  This module keeps only the public
-orchestration: every entry point parses first, then binds the referenced
-sources' metadata, and lets the one bound result drive planning or
-execution, so the single-file, multi-file, explain and export paths can
-never drift apart.
+orchestration: :mod:`columnar_analytics.prepare` runs -- once per
+statement, for every entry point -- parsing, source selection, metadata
+binding, required-column collection and row-group selection, and hands
+both the executor and the explain plan that single prepared result.  The
+single-file, multi-file, explain and export paths therefore share every
+preparation rule and can never drift apart on the columns and row groups
+a query reads versus what its plan reports.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .binder import _bind_select
 from .errors import QuerySyntaxError, QueryValidationError
-from .executor import (
-    _execute_join_step,
-    _query_partitioned,
-    _run_join_chain_partitioned,
-    _run_query,
-)
-from .format import (
-    FORMAT_VERSION_PARTITIONED,
-    ColumnSchema,
-    Schema,
-    Table,
-    inspect_file,
-    inspect_row_groups,
-    read_file,
-)
+from .executor import _execute_prepared, _run_query
+from .format import Table
 from .parser import _Parser, _tokenize
 from .plan import _build_explain
-from .pushdown import (
-    _pushable_leaves_by_source,
-    _scan_pushdown_fields,
-    _scan_pushdown_info,
-    _source_column_spans,
-    _source_scan_info,
-)
+from .prepare import prepare_mapped, prepare_single
 
-# Compatibility re-exports: the export layer resolves the referenced source
-# paths and the public entry points through this module, exactly as before
-# the stage split.
-from .resolve import (
-    _build_joined_schema,
-    _multi_table_resolver,
-    _peek_format_version,
-    _qualify_table,
-    _referenced_source_paths,
-    _resolve_statement,
-    _rewrite_select,
-    _schema_from_metadata,
-    _single_table_resolver,
-)
+# Compatibility re-export: the export layer resolves the referenced source
+# paths through this module, exactly as before the stage split.
+from .resolve import _referenced_source_paths
 
 __all__ = [
     "QuerySyntaxError",
@@ -382,8 +355,6 @@ __all__ = [
     "query_file",
     "query_files",
 ]
-
-_SINGLE_TABLE_NAME = "input"
 
 
 # ---------------------------------------------------------------------------
@@ -397,27 +368,19 @@ def query_file(path: Any, sql: str) -> Table:
     Returns a :class:`~columnar_analytics.format.Table` with columns in
     projection order.  Rows are filtered by WHERE, then grouped (aggregate
     queries may drop groups via HAVING) or sorted by ORDER BY, then capped
-    by LIMIT, then projected; without ORDER BY the file's original row
-    order (or the first-selected-row group order) is kept.  The statement
-    is parsed before the file is touched, so purely grammatical errors
-    surface as :class:`QuerySyntaxError` regardless of whether ``path``
-    exists.  Unknown columns, duplicate result columns, the wrong table
-    name, type-incompatible predicates, ungrouped columns, illegal
-    aggregate arguments, invalid HAVING conditions or int64 SUM overflow
-    raise :class:`QueryValidationError`;
-    malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
-    other I/O failures propagate as :class:`OSError`.
+    by LIMIT, then projected; without ORDER BY the file's original row order
+    (or the first-selected-row group order) is kept.  The statement is
+    parsed before the file is touched, so purely grammatical errors surface
+    as :class:`QuerySyntaxError` regardless of whether ``path`` exists.
+    Unknown columns, duplicate result columns, the wrong table name,
+    type-incompatible predicates, ungrouped columns, illegal aggregate
+    arguments, invalid HAVING conditions or int64 SUM overflow raise
+    :class:`QueryValidationError`; malformed files raise
+    :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
+    failures propagate as :class:`OSError`.
     """
-    tokens = _tokenize(sql)
-    select = _Parser(tokens).parse()
-    metadata = inspect_file(path)
-    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-        # Row-group-partitioned file: decode only the referenced columns
-        # and the row groups their statistics cannot exclude.
-        schema = _schema_from_metadata(metadata)
-        return _query_partitioned(path, select, schema, _SINGLE_TABLE_NAME)
-    table = read_file(path)
-    return _run_query(table, select)
+    prepared = prepare_single(path, sql)
+    return _execute_prepared(prepared)
 
 
 def query_table(table: Table, sql: str) -> Table:
@@ -457,49 +420,8 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
     failures propagate as :class:`OSError`.
     """
-    paths, select, strategy, from_key, steps = _resolve_statement(
-        sources, sql, join_strategy
-    )
-    if not steps:
-        rewritten = _rewrite_select(select, _single_table_resolver(from_key))
-        metadata = inspect_file(paths[from_key])
-        if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-            # Row-group-partitioned file: decode only the referenced
-            # columns and the row groups their statistics cannot exclude.
-            schema = _schema_from_metadata(metadata)
-            return _query_partitioned(
-                paths[from_key], rewritten, schema, expected_table=None
-            )
-        table = read_file(paths[from_key])
-        return _run_query(table, rewritten, expected_table=None)
-
-    table_keys = (from_key, *(step.new_key for step in steps))
-    # Qualifier checks (unqualified / unknown-table column references) do
-    # not need the files and run before any read.
-    rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
-
-    # The partitioned read path applies as soon as one source is a v2
-    # file; the version peek only reads the 5-byte prefix and treats an
-    # unreadable or unrecognisable prefix as v1, so all-v1 chains keep the
-    # historical read order and error behaviour exactly.
-    if any(
-        _peek_format_version(paths[key]) == FORMAT_VERSION_PARTITIONED
-        for key in table_keys
-    ):
-        return _run_join_chain_partitioned(
-            paths, rewritten, from_key, steps, strategy, table_keys
-        )
-
-    # Each step takes the materialised intermediate result as its left input
-    # and the one freshly introduced table as its right input; WHERE /
-    # GROUP BY / HAVING / projection / DISTINCT / ORDER BY / LIMIT run only
-    # after the whole chain has been built.  The FROM table is qualified up
-    # front so every step sees uniformly "table.column" column names.
-    combined = _qualify_table(read_file(paths[from_key]), from_key)
-    for step in steps:
-        new_table = read_file(paths[step.new_key])
-        combined = _execute_join_step(combined, new_table, step, strategy)
-    return _run_query(combined, rewritten, expected_table=None)
+    prepared = prepare_mapped(sources, sql, join_strategy)
+    return _execute_prepared(prepared)
 
 
 # ---------------------------------------------------------------------------
@@ -522,19 +444,7 @@ def explain_file(path: Any, sql: str) -> dict:
     :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
     failures propagate as :class:`OSError`.
     """
-    tokens = _tokenize(sql)
-    select = _Parser(tokens).parse()
-    metadata = inspect_file(path)
-    schema = _schema_from_metadata(metadata)
-    sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
-    bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    scan_extras = None
-    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-        info = _scan_pushdown_info(inspect_row_groups(path), bound, schema)
-        scan_extras = {_SINGLE_TABLE_NAME: _scan_pushdown_fields(info)}
-    return _build_explain(
-        sources, schema, select, bound, steps=(), scan_extras=scan_extras
-    )
+    return _explain_prepared(prepare_single(path, sql))
 
 
 def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
@@ -573,75 +483,24 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     mismatch raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
     """
-    paths, select, strategy, from_key, steps = _resolve_statement(
-        sources, sql, join_strategy
-    )
-    table_keys = (from_key, *(step.new_key for step in steps))
-    if not steps:
-        rewritten = _rewrite_select(select, _single_table_resolver(from_key))
-        from_metadata = inspect_file(paths[from_key])
-        from_schema = _schema_from_metadata(from_metadata)
-        sources = ((from_key, from_metadata, from_schema),)
-        bound = _bind_select(rewritten, from_schema, expected_table=None)
-        scan_extras = None
-        if from_metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-            info = _scan_pushdown_info(
-                inspect_row_groups(paths[from_key]), bound, from_schema
-            )
-            scan_extras = {from_key: _scan_pushdown_fields(info)}
-        return _build_explain(
-            sources, from_schema, rewritten, bound, steps=(), scan_extras=scan_extras
-        )
+    return _explain_prepared(prepare_mapped(sources, sql, join_strategy))
 
-    # Qualifier checks (unqualified / unknown-table column references) do
-    # not need the files and run before any metadata is read.
-    rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
 
-    # Metadata is read for the referenced sources only, in FROM/JOIN order;
-    # each step validates its ON keys against the intermediate schema and
-    # derives the combined schema exactly as execution would.
-    source_entries = []
-    from_metadata = inspect_file(paths[from_key])
-    current_schema = _schema_from_metadata(from_metadata)
-    source_entries.append((from_key, from_metadata, current_schema))
-    current_schema = Schema(
-        tuple(
-            ColumnSchema(f"{from_key}.{col.name}", col.type, col.nullable)
-            for col in current_schema.columns
-        )
-    )
-    for step in steps:
-        metadata = inspect_file(paths[step.new_key])
-        new_schema = _schema_from_metadata(metadata)
-        source_entries.append((step.new_key, metadata, new_schema))
-        current_schema = _build_joined_schema(current_schema, new_schema, step)
+def _explain_prepared(prepared) -> dict:
+    """Render the shared prepared statement as its explain plan.
 
-    bound = _bind_select(rewritten, current_schema, expected_table=None)
-
-    # Statistics pushdown is restricted to all-INNER chains; a chain with
-    # any OUTER step keeps every Scan operator's historical shape.  In an
-    # eligible chain each v2 Scan reports its group counts and the leaves
-    # attributed to that source (selected == total, pushed_condition null
-    # when no leaf qualifies); v1 Scans stay unchanged.
-    scan_extras = None
-    if all(step.kind == "inner" for step in steps):
-        bare_schemas = {key: source_schema for key, _m, source_schema in source_entries}
-        spans = _source_column_spans(bare_schemas, table_keys)
-        leaves_by_source = _pushable_leaves_by_source(
-            bound["where"], spans, table_keys
-        )
-        scan_extras = {}
-        for key, metadata, _source_schema in source_entries:
-            if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-                groups = inspect_row_groups(paths[key])
-                info = _source_scan_info(groups, leaves_by_source[key], spans[key])
-                scan_extras[key] = _scan_pushdown_fields(info)
+    The plan reuses the preparation pass's source metadata, bound tree,
+    required columns and row-group selections, so the Scans it describes
+    are exactly the columns and groups the executor reads.
+    """
     return _build_explain(
-        tuple(source_entries),
-        current_schema,
-        rewritten,
-        bound,
-        steps=steps,
-        strategy=strategy,
-        scan_extras=scan_extras,
+        prepared.sources,
+        prepared.schema,
+        prepared.rewritten,
+        prepared.bound,
+        steps=prepared.steps,
+        strategy=prepared.strategy,
+        scan_extras=prepared.scan_extras,
+        required_columns=prepared.required_columns,
     )
+
