@@ -70,17 +70,26 @@ def _build_explain(
     steps: tuple[_JoinStep, ...] = (),
     strategy: str | None = None,
     scan_extras: Mapping | None = None,
+    required_by_source: Mapping | None = None,
 ) -> dict:
-    referenced = _collect_required_indices(bound)
-    for step in steps:
-        # The ON keys feed the join even when neither is projected.
-        referenced.add(schema.index(f"{step.prior_key}.{step.prior_col}"))
-        referenced.add(schema.index(f"{step.new_key}.{step.new_col}"))
+    if required_by_source is None:
+        # Default derivation (also used by direct callers that bind a
+        # statement against one in-memory schema): the bound indices plus
+        # every ON key, attributed per source.  The shared preparation path
+        # passes the already-collected columns, so query and explain never
+        # compute this rule twice.
+        referenced = _collect_required_indices(bound)
+        for step in steps:
+            # The ON keys feed the join even when neither is projected.
+            referenced.add(schema.index(f"{step.prior_key}.{step.prior_col}"))
+            referenced.add(schema.index(f"{step.new_key}.{step.new_col}"))
+        referenced_names = {schema.columns[i].name for i in referenced}
 
     operators: list = []
-    referenced_names = {schema.columns[i].name for i in referenced}
     for key, _metadata, source_schema in sources:
-        if not steps:
+        if required_by_source is not None:
+            required = list(required_by_source[key])
+        elif not steps:
             required = [col.name for col in schema.columns if col.name in referenced_names]
         else:
             prefix = f"{key}."

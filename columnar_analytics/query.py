@@ -1,4 +1,4 @@
-"""Single-file SQL query layer.
+"""Single-file and multi-file SQL query layer (public orchestration).
 
 Public API:
 
@@ -11,6 +11,14 @@ Public API:
 * :class:`QuerySyntaxError` -- lexical / grammatical errors
 * :class:`QueryValidationError` -- unknown columns, wrong table name,
   type-incompatible comparisons, invalid aggregate use
+
+Every entry point shares one preparation pipeline
+(:mod:`columnar_analytics.prepare`): statement parsing, source resolution
+in FROM/JOIN order, referenced-source metadata, schema binding,
+required-column collection and v2 row-group selection all run once and
+drive both execution (:mod:`columnar_analytics.executor`) and the explain
+plan (:mod:`columnar_analytics.plan`).  This module only orchestrates:
+prepare, then either read and run, or render the plan.
 
 The accepted grammar (keywords case-insensitive)::
 
@@ -85,13 +93,13 @@ WHERE, then compute the sort keys, stably sort, apply LIMIT and only
 then evaluate the SELECT expressions, so filtered or truncated rows
 never trigger division-by-zero or overflow in the projection; a
 DISTINCT query instead evaluates the projection right after WHERE,
-deduplicates the result rows, and only then sorts and applies LIMIT.  ORDER BY
-may name a SELECT alias (an alias shadows an input column of the same
-name) and sorts on the expression's result type with the usual NULL
-placement and stability rules.  Aggregate queries do not accept scalar
-expressions: GROUP BY keys and aggregate arguments stay plain column
-references, and mixing a scalar expression into an aggregate query
-raises :class:`QueryValidationError`.
+deduplicates the result rows, and only then sorts and applies LIMIT.
+ORDER BY may name a SELECT alias (an alias shadows an input column of
+the same name) and sorts on the expression's result type with the usual
+NULL placement and stability rules.  Aggregate queries do not accept
+scalar expressions: GROUP BY keys and aggregate arguments stay plain
+column references, and mixing a scalar expression into an aggregate
+query raises :class:`QueryValidationError`.
 
 ``SELECT DISTINCT`` removes duplicate rows from a non-aggregate query:
 the projection may be a star, plain columns or ``AS``-aliased scalar
@@ -257,8 +265,8 @@ The algorithm selection is decoupled from everything described here:
 :mod:`columnar_analytics.join` owns the strategy registry and validation,
 the per-algorithm match lookup, key semantics, match expansion, outer NULL
 padding, deterministic row order and post-step nullability.  Each algorithm
-only produces a match relation; the join layer assembles the result and
-the query layer keeps parsing, qualified-name binding, key/type validation,
+only produces a match relation; the join layer assembles the result and the
+query layer keeps parsing, qualified-name binding, key/type validation,
 grouping, sorting, plan description and export.  Adding an algorithm is a
 registry entry there -- no part of the query, explain or export path is
 copied or changed.
@@ -313,66 +321,38 @@ pushed leaf selected equals total).  v1 Scan operators and the Scan
 operators of a chain containing an OUTER step keep their historical
 shape; the reported counts always match the groups execution reads.
 
-Internally the query layer is split into single-responsibility stages,
-each in its own module and depending only on earlier stages: pure SQL
-parsing (:mod:`columnar_analytics.parser`), source and table-name
-resolution (:mod:`columnar_analytics.resolve`), schema binding
-(:mod:`columnar_analytics.binder`) over the shared bound expression IR
-(:mod:`columnar_analytics.expr`), row-group statistics pushdown
-(:mod:`columnar_analytics.pushdown`), execution
+Internally the query layer is split into single-responsibility stages:
+pure SQL parsing (:mod:`columnar_analytics.parser`), source and
+table-name resolution (:mod:`columnar_analytics.resolve`), schema
+binding (:mod:`columnar_analytics.binder`) over the shared bound
+expression IR (:mod:`columnar_analytics.expr`), row-group statistics
+pushdown (:mod:`columnar_analytics.pushdown`), the shared preparation
+pipeline (:mod:`columnar_analytics.prepare`) that ties parsing, source
+selection, referenced-metadata binding, required-column collection and
+row-group selection into one result, execution
 (:mod:`columnar_analytics.executor`) and explain-plan construction
 (:mod:`columnar_analytics.plan`).  This module keeps only the public
-orchestration: every entry point parses first, then binds the referenced
-sources' metadata, and lets the one bound result drive planning or
-execution, so the single-file, multi-file, explain and export paths can
-never drift apart.
+orchestration: every entry point -- query, explain and, through them,
+export -- first runs that one preparation and then lets the one prepared
+result drive the data reads or the plan, so the single-file,
+multi-file, explain and export paths can never drift apart.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .binder import _bind_select
 from .errors import QuerySyntaxError, QueryValidationError
-from .executor import (
-    _execute_join_step,
-    _query_partitioned,
-    _run_join_chain_partitioned,
-    _run_query,
-)
-from .format import (
-    FORMAT_VERSION_PARTITIONED,
-    ColumnSchema,
-    Schema,
-    Table,
-    inspect_file,
-    inspect_row_groups,
-    read_file,
-)
+from .executor import _execute_prepared, _run_query
+from .format import Table
 from .parser import _Parser, _tokenize
 from .plan import _build_explain
-from .pushdown import (
-    _pushable_leaves_by_source,
-    _scan_pushdown_fields,
-    _scan_pushdown_info,
-    _source_column_spans,
-    _source_scan_info,
-)
+from .prepare import _prepare_multi, _prepare_single
 
-# Compatibility re-exports: the export layer resolves the referenced source
-# paths and the public entry points through this module, exactly as before
-# the stage split.
-from .resolve import (
-    _build_joined_schema,
-    _multi_table_resolver,
-    _peek_format_version,
-    _qualify_table,
-    _referenced_source_paths,
-    _resolve_statement,
-    _rewrite_select,
-    _schema_from_metadata,
-    _single_table_resolver,
-)
+# Compatibility re-export: the export layer resolves the referenced source
+# paths through this module (a parse-only step that opens no file), exactly
+# as before the preparation split.
+from .resolve import _referenced_source_paths
 
 __all__ = [
     "QuerySyntaxError",
@@ -383,11 +363,9 @@ __all__ = [
     "query_files",
 ]
 
-_SINGLE_TABLE_NAME = "input"
-
 
 # ---------------------------------------------------------------------------
-# Public entry points
+# Public query entry points
 # ---------------------------------------------------------------------------
 
 
@@ -408,16 +386,8 @@ def query_file(path: Any, sql: str) -> Table:
     malformed files raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
     """
-    tokens = _tokenize(sql)
-    select = _Parser(tokens).parse()
-    metadata = inspect_file(path)
-    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-        # Row-group-partitioned file: decode only the referenced columns
-        # and the row groups their statistics cannot exclude.
-        schema = _schema_from_metadata(metadata)
-        return _query_partitioned(path, select, schema, _SINGLE_TABLE_NAME)
-    table = read_file(path)
-    return _run_query(table, select)
+    prepared = _prepare_single(path, sql)
+    return _execute_prepared(prepared)
 
 
 def query_table(table: Table, sql: str) -> Table:
@@ -455,51 +425,10 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
     earlier one, unknown or unqualified columns, and type-incompatible join
     keys raise :class:`QueryValidationError`; malformed files raise
     :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
-    failures propagate as :class:`OSError`.
+    failures propagate :class:`OSError`.
     """
-    paths, select, strategy, from_key, steps = _resolve_statement(
-        sources, sql, join_strategy
-    )
-    if not steps:
-        rewritten = _rewrite_select(select, _single_table_resolver(from_key))
-        metadata = inspect_file(paths[from_key])
-        if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-            # Row-group-partitioned file: decode only the referenced
-            # columns and the row groups their statistics cannot exclude.
-            schema = _schema_from_metadata(metadata)
-            return _query_partitioned(
-                paths[from_key], rewritten, schema, expected_table=None
-            )
-        table = read_file(paths[from_key])
-        return _run_query(table, rewritten, expected_table=None)
-
-    table_keys = (from_key, *(step.new_key for step in steps))
-    # Qualifier checks (unqualified / unknown-table column references) do
-    # not need the files and run before any read.
-    rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
-
-    # The partitioned read path applies as soon as one source is a v2
-    # file; the version peek only reads the 5-byte prefix and treats an
-    # unreadable or unrecognisable prefix as v1, so all-v1 chains keep the
-    # historical read order and error behaviour exactly.
-    if any(
-        _peek_format_version(paths[key]) == FORMAT_VERSION_PARTITIONED
-        for key in table_keys
-    ):
-        return _run_join_chain_partitioned(
-            paths, rewritten, from_key, steps, strategy, table_keys
-        )
-
-    # Each step takes the materialised intermediate result as its left input
-    # and the one freshly introduced table as its right input; WHERE /
-    # GROUP BY / HAVING / projection / DISTINCT / ORDER BY / LIMIT run only
-    # after the whole chain has been built.  The FROM table is qualified up
-    # front so every step sees uniformly "table.column" column names.
-    combined = _qualify_table(read_file(paths[from_key]), from_key)
-    for step in steps:
-        new_table = read_file(paths[step.new_key])
-        combined = _execute_join_step(combined, new_table, step, strategy)
-    return _run_query(combined, rewritten, expected_table=None)
+    prepared = _prepare_multi(sources, sql, join_strategy)
+    return _execute_prepared(prepared)
 
 
 # ---------------------------------------------------------------------------
@@ -510,11 +439,12 @@ def query_files(sources: Any, sql: str, join_strategy: Any = None) -> Table:
 def explain_file(path: Any, sql: str) -> dict:
     """Produce the query plan for ``sql`` against one columnar file.
 
-    Like :func:`query_file` for parsing and binding, but only the file
-    metadata is read: the data section is never read, decompressed or
-    decoded, so data CRCs and value-level statistics are not verified.
-    The returned value is a JSON-serialisable ordered dict with the fixed
-    top-level keys ``sources``, ``operators`` and ``output``.
+    Like :func:`query_file` for parsing, source selection and binding, but
+    only the file metadata is read: the data section is never read,
+    decompressed or decoded, so data CRCs and value-level statistics are
+    not verified.  The returned value is a JSON-serialisable ordered dict
+    with the fixed top-level keys ``sources``, ``operators`` and
+    ``output``.
 
     :class:`QuerySyntaxError` is raised before the file is touched;
     binding problems raise :class:`QueryValidationError`; malformed
@@ -522,18 +452,15 @@ def explain_file(path: Any, sql: str) -> dict:
     :class:`~columnar_analytics.format.ColumnarFormatError`; other I/O
     failures propagate as :class:`OSError`.
     """
-    tokens = _tokenize(sql)
-    select = _Parser(tokens).parse()
-    metadata = inspect_file(path)
-    schema = _schema_from_metadata(metadata)
-    sources = ((_SINGLE_TABLE_NAME, metadata, schema),)
-    bound = _bind_select(select, schema, expected_table=_SINGLE_TABLE_NAME)
-    scan_extras = None
-    if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-        info = _scan_pushdown_info(inspect_row_groups(path), bound, schema)
-        scan_extras = {_SINGLE_TABLE_NAME: _scan_pushdown_fields(info)}
+    prepared = _prepare_single(path, sql)
     return _build_explain(
-        sources, schema, select, bound, steps=(), scan_extras=scan_extras
+        prepared.source_tuples(),
+        prepared.schema,
+        prepared.select,
+        prepared.bound,
+        steps=(),
+        scan_extras=prepared.scan_extras,
+        required_by_source=prepared.required_by_source(),
     )
 
 
@@ -573,75 +500,14 @@ def explain_files(sources: Any, sql: str, join_strategy: Any = None) -> dict:
     mismatch raise :class:`~columnar_analytics.format.ColumnarFormatError`;
     other I/O failures propagate as :class:`OSError`.
     """
-    paths, select, strategy, from_key, steps = _resolve_statement(
-        sources, sql, join_strategy
-    )
-    table_keys = (from_key, *(step.new_key for step in steps))
-    if not steps:
-        rewritten = _rewrite_select(select, _single_table_resolver(from_key))
-        from_metadata = inspect_file(paths[from_key])
-        from_schema = _schema_from_metadata(from_metadata)
-        sources = ((from_key, from_metadata, from_schema),)
-        bound = _bind_select(rewritten, from_schema, expected_table=None)
-        scan_extras = None
-        if from_metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-            info = _scan_pushdown_info(
-                inspect_row_groups(paths[from_key]), bound, from_schema
-            )
-            scan_extras = {from_key: _scan_pushdown_fields(info)}
-        return _build_explain(
-            sources, from_schema, rewritten, bound, steps=(), scan_extras=scan_extras
-        )
-
-    # Qualifier checks (unqualified / unknown-table column references) do
-    # not need the files and run before any metadata is read.
-    rewritten = _rewrite_select(select, _multi_table_resolver(table_keys))
-
-    # Metadata is read for the referenced sources only, in FROM/JOIN order;
-    # each step validates its ON keys against the intermediate schema and
-    # derives the combined schema exactly as execution would.
-    source_entries = []
-    from_metadata = inspect_file(paths[from_key])
-    current_schema = _schema_from_metadata(from_metadata)
-    source_entries.append((from_key, from_metadata, current_schema))
-    current_schema = Schema(
-        tuple(
-            ColumnSchema(f"{from_key}.{col.name}", col.type, col.nullable)
-            for col in current_schema.columns
-        )
-    )
-    for step in steps:
-        metadata = inspect_file(paths[step.new_key])
-        new_schema = _schema_from_metadata(metadata)
-        source_entries.append((step.new_key, metadata, new_schema))
-        current_schema = _build_joined_schema(current_schema, new_schema, step)
-
-    bound = _bind_select(rewritten, current_schema, expected_table=None)
-
-    # Statistics pushdown is restricted to all-INNER chains; a chain with
-    # any OUTER step keeps every Scan operator's historical shape.  In an
-    # eligible chain each v2 Scan reports its group counts and the leaves
-    # attributed to that source (selected == total, pushed_condition null
-    # when no leaf qualifies); v1 Scans stay unchanged.
-    scan_extras = None
-    if all(step.kind == "inner" for step in steps):
-        bare_schemas = {key: source_schema for key, _m, source_schema in source_entries}
-        spans = _source_column_spans(bare_schemas, table_keys)
-        leaves_by_source = _pushable_leaves_by_source(
-            bound["where"], spans, table_keys
-        )
-        scan_extras = {}
-        for key, metadata, _source_schema in source_entries:
-            if metadata["format_version"] == FORMAT_VERSION_PARTITIONED:
-                groups = inspect_row_groups(paths[key])
-                info = _source_scan_info(groups, leaves_by_source[key], spans[key])
-                scan_extras[key] = _scan_pushdown_fields(info)
+    prepared = _prepare_multi(sources, sql, join_strategy)
     return _build_explain(
-        tuple(source_entries),
-        current_schema,
-        rewritten,
-        bound,
-        steps=steps,
-        strategy=strategy,
-        scan_extras=scan_extras,
+        prepared.source_tuples(),
+        prepared.schema,
+        prepared.select,
+        prepared.bound,
+        steps=prepared.steps,
+        strategy=prepared.strategy,
+        scan_extras=prepared.scan_extras,
+        required_by_source=prepared.required_by_source(),
     )

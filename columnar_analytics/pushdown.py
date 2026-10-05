@@ -159,11 +159,6 @@ def _select_row_groups(groups: list, pushed: list, col_indices: list) -> list[in
     ]
 
 
-def _pushed_col_indices(pushed: list) -> list[int]:
-    """The bound column index carried by each pushable leaf."""
-    return [_leaf_col_index(cond) for cond in pushed]
-
-
 def _pushed_condition_json(pushed: list) -> dict | None:
     """Render the pushed-down condition set as one condition tree (or null)."""
     if not pushed:

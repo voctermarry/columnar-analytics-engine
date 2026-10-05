@@ -5,10 +5,8 @@ sources without ever reading table data: ``sources`` argument validation,
 join-strategy validation (shared with the join layer), table-name
 resolution, the qualified-name rewrite that canonicalises every column
 reference, the joined-schema derivation shared by execution and explain,
-and the metadata-to-schema helpers.  Unreferenced sources are never
-opened; the only bytes read here are the 5-byte format-version prefix
-peek, which treats anything unreadable as v1 so the historical read order
-and error behaviour are preserved.
+and the metadata-to-schema helper.  Unreferenced sources are never
+opened; no data is read here.
 """
 
 from __future__ import annotations
@@ -24,20 +22,6 @@ from .join import _derive_step_schema, _validate_join_strategy
 from .parser import _Parser, _RefItem, _Select, _tokenize
 
 
-def _peek_format_version(path: Any) -> int | None:
-    """Best-effort read of a file's format version byte (no validation).
-
-    Returns ``None`` for unreadable or unrecognisable files; callers treat
-    that as "not v2" so the legacy read path reports the proper error.
-    """
-    try:
-        with open(path, "rb") as handle:
-            prefix = handle.read(5)
-    except OSError:
-        return None
-    if len(prefix) < 5 or prefix[:4] != b"CAEF":
-        return None
-    return prefix[4]
 def _qualify_table(table: Table, key: str) -> Table:
     """Re-wrap ``table`` naming every column ``key.column`` (values unchanged)."""
     qualified = Schema(
